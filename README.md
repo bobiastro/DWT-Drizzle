@@ -67,6 +67,12 @@ python main.py --cli --photos "D:/M81/calibrated" --out "D:/M81/out" --tag m81 \
        --cfa auto --drizzle --drizzle-scale 2 --drizzle-pix 1.0 --gpu auto
 ```
 
+### 在 PixInsight WBPP 中使用 Rust 后端
+
+Windows 运行 `.\core-rs\wbpp\install.ps1`，macOS 运行 `bash core-rs/wbpp/install.sh`。
+脚本会安装 Rust 后端和 WBPP Pipeline Builder。在 WBPP 的 **Pipeline → Pipeline scripting → Pipeline builder**
+中启用并选择安装后显示的 `pipeline-builder-ui.js`。[安装与使用说明](core-rs/wbpp/README.md)
+
 ---
 
 ## 成品
