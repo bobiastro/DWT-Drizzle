@@ -1799,7 +1799,8 @@ def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
 
 def stack_strip(D: np.ndarray, W: np.ndarray, R: Optional[np.ndarray] = None,
                 sky: float = 0.0, rej_k: float = REJ_K,
-                rej_max_frac: float = REJ_MAX_FRAC
+                rej_max_frac: float = REJ_MAX_FRAC,
+                frame_sig: Optional[np.ndarray] = None
                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """排异 + 唯一一次加权平均：S = Σ W·D / Σ W
 
@@ -1823,6 +1824,11 @@ def stack_strip(D: np.ndarray, W: np.ndarray, R: Optional[np.ndarray] = None,
     if rej_k > 0:
         anchor = np.median(D, axis=0)
         dev = np.abs(D - anchor[None])
+        if frame_sig is not None:
+            # 月光/薄云下帧间噪声可差 5 倍：把偏差换算到「各帧自己的 σ 单位」再判，
+            # 否则 MAD 会被噪声大的帧撑大、干净的帧被误剔（这也是 moon 数据剔除率高的一因）
+            _s = np.maximum(np.asarray(frame_sig, np.float32).reshape(n, 1, 1), 1e-12)
+            dev = dev / _s
         mad = 1.4826 * np.median(dev, axis=0).astype(np.float32)
         if R is None:
             thr = rej_k * mad
@@ -1835,8 +1841,9 @@ def stack_strip(D: np.ndarray, W: np.ndarray, R: Optional[np.ndarray] = None,
                 m = float(np.median(ratio))
             else:
                 m = 0.0
-            thr = rej_k * mad + m * (R * sig)
-        bad = dev > thr[None]
+            thr = rej_k * mad + (m * (R * sig) / _s[:, 0, 0].reshape(-1, 1, 1)
+                                  if frame_sig is not None else m * (R * sig))
+        bad = dev > thr   # thr 可能是 (h,w) 或逐帧 (n,h,w)，两者都能正确广播
         nbad = bad.sum(axis=0)
         expected = n * math.erfc(rej_k / 2.0 ** 0.5)   # 噪声期望误排数（κ 以 σ 为单位）
         bad &= (nbad - expected <= max(1.0, rej_max_frac * n))[None]     # 剔除比例上限
@@ -1996,11 +2003,12 @@ def _task_trail(job) -> Tuple[int, float, float]:
 
 def _task_strip(job):
     """一条带的权重 + 排异 + 加权平均（与串行的三段调用完全同序同式）"""
-    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp, beta = job
+    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp, beta, sig = job
     W = strip_weights(C, S, Rr, A, B, T=T, fp=fp, beta=float(beta))
     mm, off = _MEM['mm'], _MEM['off']
     D = np.stack([mm[i, y0:y1] - np.float32(off[i]) for i in range(len(C))])
-    s, ne, rr = stack_strip(D, W, Rr, sky0, rej_k=rej_k, rej_max_frac=rej_gate)
+    s, ne, rr = stack_strip(D, W, Rr, sky0, rej_k=rej_k, rej_max_frac=rej_gate,
+                            frame_sig=sig)
     return s, ne, rr, float(W.max(axis=0).mean())
 
 
@@ -4624,7 +4632,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     _beta_st = float(_detail_beta(p))
                     jobs = ((y0, min(h, y0 + strip), R[y0:y0 + strip],
                              band_cfield(C, C_tiles, y0, min(h, y0 + strip), h, w), S, A, B, rej_k,
-                             fs.sky0, rej_gate, T, fp, _beta_st)
+                             fs.sky0, rej_gate, T, fp, _beta_st,
+                             (fs.sigma if bool(getattr(p, 'rej_z', False)) else None))
                             for y0 in range(0, h, strip))
                     for k, (s, ne, rr, wm) in enumerate(ex.map(_task_strip, jobs, chunksize=1)):
                         _check_cancel()
@@ -4651,12 +4660,14 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     _check_cancel()
                     y1 = min(h, y0 + strip)
                     _beta = _detail_beta(p)
+                    _rej_z = bool(getattr(p, 'rej_z', False))
                     if _S_field is None or _sf_mod is None:
                         W = strip_weights(band_cfield(C, C_tiles, y0, y1, h, w),
                                           S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
                         D = fs.stack_strips(y0, y1)
                         s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,
-                                                rej_max_frac=rej_gate)
+                                                rej_max_frac=rej_gate,
+                                                frame_sig=(fs.sigma if _rej_z else None))
                         Stk[y0:y1] = s
                         neff[y0:y1] = ne
                         cnt = float(s.size)
@@ -4682,7 +4693,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 D_full = fs.stack_strips(y0, y1)
                             s, ne, rr = stack_strip(D_full[:, :, x0:x1], W,
                                                     R[y0:y1, x0:x1], fs.sky0,
-                                                    rej_k=rej_k, rej_max_frac=rej_gate)
+                                                    rej_k=rej_k, rej_max_frac=rej_gate,
+                                                    frame_sig=(fs.sigma if _rej_z else None))
                             Stk[y0:y1, x0:x1] = s
                             neff[y0:y1, x0:x1] = ne
                             cnt = float(s.size)
@@ -5060,6 +5072,11 @@ def build_parser() -> argparse.ArgumentParser:
         default = getattr(base, prm.key)
         if prm.kind == 'check':
             ap.add_argument(flag, action='store_true', default=default, help=text)
+            if default is True:
+                # 默认开启的开关要给一个否定形式，否则命令行无法关掉
+                ap.add_argument('--no-' + flag.lstrip('-'), dest=prm.key,
+                                action='store_false', default=True,
+                                help='关闭「%s」' % prm.label)
         elif prm.kind == 'float':
             ap.add_argument(flag, type=float, default=default, help=text)
         elif prm.kind == 'int':

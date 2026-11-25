@@ -269,6 +269,8 @@ def _argv_common(c) -> list:
         argv += ["--kernel", c["kernel"], "--psf-target", str(c.get("psf_target") or "50")]
     if str(c.get("cache", "1")) != "1":
         argv += ["--cache", "0"]
+    if str(c.get("rej_z", "1")) != "1":
+        argv += ["--no-rej-z"]
     if str(c.get("two_pass", "0")) == "1":
         argv += ["--two-pass", "1"]
     if float(c.get("detail_snr", "0") or 0) > 0:
@@ -693,6 +695,12 @@ class App(tk.Tk):
             variable=self.v_cache),
              "默认开：换素材/裁剪/参考帧会自动失效重测；关掉＝每次强制重测"
              "（怀疑配准有问题时用）")
+        self.v_rejz = tk.BooleanVar(value=True)
+        arow(32, "排异按噪声归一", ttk.Checkbutton(
+            adv, text="把偏差换成各帧自己的 σ 再判（月光/薄云下少误剔）",
+            variable=self.v_rejz),
+             "默认开：帧间噪声差大时（月光、薄云、短曝光混拍）效果最明显；"
+             "只在 drizzle 走 CPU 时生效，GPU 内核仍用标准排异")
         self.v_jobs = tk.StringVar()
         self.v_refk = tk.StringVar()
         _sp_refk = ttk.Spinbox(adv, from_=0, to=64, increment=1, width=6, textvariable=self.v_refk)
@@ -769,7 +777,7 @@ class App(tk.Tk):
             values=["关（推荐）", "开"]),
              "第一遍出图后按 64px 块估局部锐度再叠一遍；实测收益 <1%、耗时 +40%")
 
-        # ---- R 场包络（2.7.106-D 起可见）----
+        # ---- R 场包络（2.7.107-D 起可见）----
         # 这三个数决定「细节掩膜 R」的形状：哪算结构、结构边缘多宽、空白天压得多狠。
         # 默认值是标定过的，只有在特定目标上（暗弱大结构被压掉 / 星点外有硬边）才动。
         self.v_envw = tk.StringVar(value="2.0")
@@ -948,6 +956,7 @@ class App(tk.Tk):
         self.v_tunea.set(c.get("tune_a", "10,14,20"))
         self.v_1x.set(str(c.get("native_1x", "0")) == "1")
         self.v_cache.set(str(c.get("cache", "1")) not in ("0", "", "False"))
+        self.v_rejz.set(str(c.get("rej_z", "1")) not in ("0", "", "False"))
         self.v_aligned.set(str(c.get("aligned", "0")) == "1")
         self.v_cfa.set({"off": "关", "auto": "自动识别"}.get(c.get("cfa", "off"),
                                                        c.get("cfa", "off") or "关"))
@@ -1012,6 +1021,7 @@ class App(tk.Tk):
             "tune_a": self.v_tunea.get().strip() or "10,14,20",
             "native_1x": "1" if bool(self.v_1x.get()) else "0",
             "cache": "1" if bool(self.v_cache.get()) else "0",
+            "rej_z": "1" if bool(self.v_rejz.get()) else "0",
             "aligned": "1" if bool(self.v_aligned.get()) else "0",
             "cfa_ref": self.v_cfa_ref.get().strip(),
             "cfa_raw": {"自动": "auto", "强制开": "on",
@@ -1431,7 +1441,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.106-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.107-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""

@@ -145,11 +145,12 @@
  from concurrent.futures import ProcessPoolExecutor
  from pathlib import Path
  from typing import Dict, List, Optional, Tuple
-@@ -49,6 +67,12 @@
+@@ -49,6 +67,13 @@
  
  from DWT_DetailCore import EXPTIME_REF, read_frame                      # noqa: E402
  from pws_params import PARAMS, PwsParams, cli_flag                      # noqa: E402
 +import bggrad
++import xnml
 +import cropcover                                                          # noqa: E402
 +try:                                                                   # noqa: E402
 +    import matchref
@@ -158,7 +159,7 @@
  
  # ---------------------------------------------------------------------------
  # 引擎参数（与界面同源，唯一定义见 pws_params.PARAMS）
-@@ -81,6 +105,7 @@
+@@ -81,6 +106,7 @@
  TRAIL_QUANTILE = 90.0      # 自动外扩取"逐帧拖线长度"的该百分位：瞄准最糊的那几帧
                             #   （漏进星点分区的正是它们；取中位会被大量好帧稀释）
  R_FLOOR = 0.0        # R 的全局下限：R_eff = R_FLOOR + (1−R_FLOOR)·R
@@ -166,7 +167,7 @@
                       #   用于抑制星周亮度平台（"亮—暗—亮"伪影环）。环的幅度取决于
                       #   两区有效 PSF 之差：加全局下限使空白天区也保留部分清晰度偏好，
                       #   糊帧在全图被压低 → 两区 PSF 差缩小 → 环变浅。代价是空白天区
-@@ -90,8 +115,11 @@
+@@ -90,8 +116,11 @@
                       #   κ 以 σ 为单位（1.4826·MAD = σ 估计）；2 更严，1 会成批误排噪声尾
  REJ_MAX_FRAC = 1 / 3  # 剔除比例上限：超额被剔帧数 > 该比例 × 总帧数 → 判为共有结构而非
                        #   孤立离群，该像素不排异
@@ -179,7 +180,7 @@
  
  # 各阶段的并行进程上限（实际进程数还受"核数−1"与内存预算约束，见 plan_workers）
  #   叠加：每进程持一条条带的临时量，内存随进程数倍增 → 上限保守
-@@ -99,6 +127,18 @@
+@@ -99,6 +128,18 @@
  #   测星点：每帧仅取星点小窗（约 0.5 MiB），几乎不占内存 → 上限可放宽到核数量级
  CAP_WORKERS = 8
  CAP_FWHM = 12
@@ -198,7 +199,7 @@
  
  
  # ---------------------------------------------------------------------------
-@@ -135,6 +175,24 @@
+@@ -135,6 +176,24 @@
      _GROUP[2] = f'[{label}] ' if label else ''
  
  
@@ -223,7 +224,7 @@
  def log(msg: str = '') -> None:
      """引擎唯一输出口：界面接管后写成日志行，未接管则打 stdout（回调异常也退回）。
      多滤镜分组时自动带组前缀（空行不加）——否则几十上百行日志分不清是哪组滤镜的。"""
-@@ -143,12 +201,12 @@
+@@ -143,12 +202,12 @@
          msg = f'{pre}{msg}'
      sink = _LOG_SINK[0]
      if sink is None:
@@ -238,7 +239,7 @@
  
  
  def _emit(phase: str, frac: float, text: str = '') -> None:
-@@ -197,10 +255,67 @@
+@@ -197,10 +256,67 @@
  # 阶段 0：帧加载与帧级归一
  # ---------------------------------------------------------------------------
  
@@ -307,7 +308,7 @@
      """把素材声明展开成帧文件列表（多源：目录与单张可混用，用 ; 分隔）
  
      目录按**递归**收集：深空数据常按 目标/日期/滤镜 分级存放，子文件夹里的帧也收。
-@@ -253,7 +368,78 @@
+@@ -253,7 +369,78 @@
      if not files:
          raise SystemExit('素材里没有帧')
      files.sort(key=lambda f: str(f).lower())
@@ -386,7 +387,7 @@
  
  
  def group_frames_by_filter(files: List[Path]) -> Dict[str, List[Path]]:
-@@ -274,6 +460,11 @@
+@@ -274,6 +461,11 @@
              name = read_filter_hint(f)
          except Exception:
              pass
@@ -398,7 +399,7 @@
          groups.setdefault(name, []).append(f)
      log(f'[分组] 读头 {len(files)} 帧 {time.perf_counter() - t0:.1f}s → '
          f'{len(groups)} 组：'
-@@ -282,6 +473,22 @@
+@@ -282,6 +474,22 @@
          log('[分组] 注意：以上帧的文件头没有滤镜信息（FILTER / Instrument:Filter:Name），'
              '已单独成组')
      return groups
@@ -421,7 +422,7 @@
  
  
  def _safe_seg(s: str) -> str:
-@@ -311,27 +518,86 @@
+@@ -311,27 +519,86 @@
      if not crop or crop <= 0 or center is not None:
          return center
      from DWT_DetailCore import locate_extended_source
@@ -515,7 +516,7 @@
      if getattr(sys, 'frozen', False):
          # 打包版以软件所在位置为先（与源码版一致）：用 exe 所在目录而非 __file__
          #   （后者在 onedir 下会落进 _internal 依赖目录）
-@@ -379,6 +645,8 @@
+@@ -379,6 +646,8 @@
                  continue
              log(f'[memmap] 帧文件目录 {p}（该盘余量 {free / 2 ** 30:.1f} GiB，'
                  f'需 {need / 2 ** 30:.1f} GiB）')
@@ -524,7 +525,7 @@
              return p
      raise SystemExit(f'没有任何盘能放下 {need / 2 ** 30:.1f} GiB 的 memmap 帧文件'
                       f'（需要 1.25× 余量）。请用 --frames-dir 指到大盘。')
-@@ -419,21 +687,60 @@
+@@ -419,21 +688,80 @@
          self.off = np.zeros(n, dtype=np.float64)
          self.sky0 = 0.0            # 平移后的公共天空水平（排异信号项的零点）
          self.metas: List[Dict] = []
@@ -537,6 +538,9 @@
 +        self.bgshape = (int(shape[0]), int(shape[1]))
 +        # 读帧时顺手量的逐帧星点 FWHM（C 权重）；NaN = 这帧没量出来
 +        self.fwhms: Optional[np.ndarray] = None
++        # 实测块中位背景场（LN 风格）：(n, GH, GW)，None = 不用
++        self.bgtiles = None
++        self.bgtile_block = 32
  
      def __len__(self) -> int:
          return self.n
@@ -579,7 +583,14 @@
 +        return d
 +
 +    def bg_model(self, i: int, y0: int, y1: int, w: int):
-+        """第 i 帧 [y0,y1)×w 的背景梯度模型（None = 不校正）"""
++        """第 i 帧 [y0,y1)×w 的背景梯度模型（None = 不校正）
++
++        bgtiles 非空时用「实测块中位」代替低阶多项式：块是真实测量，能吃到
++        月光/薄云这类不规则大尺度梯度（多项式一阶/二阶跟不上），这就是 PI 的
++        LocalNormalization 那套思路的本土版。
++        """
++        if self.bgtiles is not None:
++            return self._tile_field(i, y0, y1, w)
 +        if self.bgcoef is None or self.bgdeg <= 0:
 +            return None
 +        _rc = None
@@ -587,10 +598,20 @@
 +            _rc = self.bgrcoef[int(i)]
 +        return bggrad.model_strip(self.bgcoef[i], self.bgdeg, y0, y1, w,
 +                                  self.bgshape[0], rcoef=_rc)
++
++    def _tile_field(self, i: int, y0: int, y1: int, w: int) -> np.ndarray:
++        """把第 i 帧的块中位场放大到 [y0,y1)×w（块内常数，网格已 3×3 平滑）"""
++        g = self.bgtiles[int(i)]                    # (GH, GW)，已减去自身中位
++        gh, gw = g.shape
++        H = int(self.bgshape[0])
++        # 网格行号 → 输出行：块中心对齐
++        yy = np.clip(((np.arange(y0, y1) + 0.5) * gh / max(H, 1)).astype(np.int32), 0, gh - 1)
++        xx = np.clip(((np.arange(w) + 0.5) * gw / max(w, 1)).astype(np.int32), 0, gw - 1)
++        return np.asarray(g[yy][:, xx], np.float32)
  
      def stack_strips(self, y0: int, y1: int) -> np.ndarray:
          """条带内所有帧堆成 (n, y1-y0, W) —— 排异与加权平均的唯一输入"""
-@@ -476,6 +783,10 @@
+@@ -476,6 +804,10 @@
              盘都放不下、退回父进程内存 list 时，它记的是进程自己的占用。
          """
          return self.n * self.shape[0] * self.shape[1] * 4 if self.resident else 0
@@ -601,7 +622,7 @@
  
      def close(self, keep: bool = False) -> None:
          if self.mm is not None:
-@@ -491,10 +802,40 @@
+@@ -491,10 +823,41 @@
                  log(f'[memmap] 删除失败（可手动删）：{self.path}  {e}')
  
  
@@ -639,11 +660,12 @@
                     limit: Optional[int] = None, frames_dir: str = '',
 -                   mem_frac: float = 0.55, keep_frames: bool = False) -> FrameSet:
 +                   mem_frac: float = 0.55, keep_frames: bool = False,
-+                   bgdeg: int = 0, bg_r: int = 0, star_n: int = 0) -> FrameSet:
++                   bgdeg: int = 0, bg_r: int = 0, star_n: int = 0,
++                   bg_tiles: int = 0, ln_xnml: int = 0) -> FrameSet:
      """读帧 → 裁剪 → float32 → **曝光归一**（×EXPTIME_REF/t_i），
      同时逐帧量天空中位与噪声尺度；按内存预算自动决定驻留还是落 memmap。
  
-@@ -524,13 +865,16 @@
+@@ -524,13 +887,16 @@
          x0 = max(0, min(cx - half, fw - crop))
      else:
          y0 = x0 = 0
@@ -665,7 +687,7 @@
  
      # 一律落盘 memmap（见 FrameSet 文档：页文件支撑的共享段在 Windows 上按整段大小
      #   记入提交量，装不下就 1450/1455；文件支撑的映射不进提交量，页仍在系统缓存里）。
-@@ -541,18 +885,48 @@
+@@ -541,18 +907,48 @@
      mmpath = None
      arrays: Optional[List[np.ndarray]] = None
      try:
@@ -717,14 +739,18 @@
      t0 = time.perf_counter()
      # 逐帧独立（各读各的源文件、各写各的槽位）→ 可分给多进程。
      #   工作进程各自只读打开同一个帧文件，直接写自己那一格，
-@@ -562,24 +936,35 @@
+@@ -562,24 +958,38 @@
      #   + median 内部副本（np.median 对浮点数组会先复制一份）。
      ini_rw, ini_rw_args = fs.writer
      nw = 0 if (not fs.parallelable or _no_parallel()) \
 -        else plan_workers(fh * fw * 4 * 3, '读帧')
 +        else plan_workers(fh * fw * 4 * 4 + (512 << 20), '读帧')
++    _ln_ok = [0]
++    _ln_bad = [0]
++    _ln_miss = [0]
      try:
-         if nw > 1:
+-        if nw > 1:
++        if nw > 1 and not int(ln_xnml or 0):
              fs.metas = [None] * n
 +            fs.names = [Path(str(f)).name for f in files]
              ex = ProcessPoolExecutor(max_workers=nw, initializer=ini_rw,
@@ -756,7 +782,7 @@
          else:
              for i, f in enumerate(files):
                  _check_cancel()                     # 读帧阶段也要能终止
-@@ -588,18 +973,37 @@
+@@ -588,24 +998,59 @@
                  d = np.ascontiguousarray(data[y0:y0 + h, x0:x0 + w]).astype(np.float32)
                  del data
                  d *= np.float32(EXPTIME_REF / float(meta['exptime']))
@@ -765,6 +791,17 @@
 +                    d = _cfa.plane(d, _CFA['pattern'], _CFA['ch'])
 +                if _ROWFPN:
 +                    _strip_rowfpn(d)
++                if int(ln_xnml or 0):
++                    _xn = xnml.sibling_path(str(f))
++                    if os.path.exists(_xn):
++                        _fld = xnml.load_fields(_xn)
++                        if _fld is not None:
++                            xnml.apply_to(d, _fld)
++                            _ln_ok[0] += 1
++                        else:
++                            _ln_bad[0] += 1
++                    else:
++                        _ln_miss[0] += 1
 +                _smp = d[::4, ::4]
 +                med = float(np.median(_smp))
 +                del _smp
@@ -796,7 +833,18 @@
      except BaseException:
          # 读帧半途失败（终止 / 工作进程异常 / 盘满）都要把半成品临时帧文件清掉，
          #   否则一块几十 GiB 的文件会一直占着盘；清完再把异常往上抛
-@@ -618,6 +1022,20 @@
+         fs.close(keep=keep_frames)
+         raise
+ 
++    if int(ln_xnml or 0):
++        log(f'[LN] WBPP 本地归一化：已应用 {_ln_ok[0]} 帧（乘 Scale + 加 ZeroOffset，'
++            f'网格双线性插值），缺 .xnml {_ln_miss[0]} 帧，解析失败 {_ln_bad[0]} 帧')
++        if _ln_ok[0] == 0:
++            log('[LN] 没有任何帧找到 .xnml，本次按原样叠加')
+     # 天空加性平移：基准帧 = 天空最接近全体帧中位的那一帧。memmap 后端只记 off_i、
+     #   读出时减（见 FrameSet.strip）；父进程内存后端则在建集时就地烘焙（见下）。
+     anchor = int(np.argmin(np.abs(fs.skies - np.median(fs.skies))))
+@@ -618,6 +1063,37 @@
          fs.off[:] = 0.0            # 已就地烘焙，读出时不再减
      if mmpath is not None:
          mm.flush()
@@ -813,11 +861,28 @@
 +            fs.bg_stats = bstats
 +        else:
 +            log('[背景] 梯度拟合不可用（块数不足），按不校正处理')
++    # ---- 实测块中位背景场（--bg-tiles 1）：比多项式更贴不规则梯度 ----
++    if int(bg_tiles or 0) and bg_grids is not None:
++        try:
++            from scipy.ndimage import gaussian_filter as _gf
++            _G = [g for g in bg_grids if g is not None]
++            if len(_G) == n:
++                _st = np.stack([np.asarray(g, np.float32) for g in _G])
++                _med = np.median(_st.reshape(n, -1), axis=1).reshape(n, 1, 1)
++                _st = _st - _med                       # 只留形状，常数已被天空平移吸收
++                _st = np.stack([_gf(t, 1.0, mode='nearest') for t in _st])
++                fs.bgtiles = _st.astype(np.float32)
++                fs.bgtile_block = int(bggrad.BG_BLOCK)
++                log(f'[背景] 用实测块中位场（{_st.shape[1]}×{_st.shape[2]} 格 × '
++                    f'{fs.bgtile_block}px）代替多项式：逐帧减自身中位后 3×3 平滑')
++        except Exception as _e:
++            fs.bgtiles = None
++            log(f'[背景] 块场构造失败，按多项式处理：{_e}')
 +    bg_grids = None
      span = float(fs.skies.max() - fs.skies.min())
      log(f'[帧] 耗时 {time.perf_counter() - t0:.1f}s  '
          f'{"父进程内存 " + f"{fs.resident_bytes / 2 ** 30:.2f} GiB" if mm is None else f"盘上 {need / 2 ** 30:.2f} GiB（{mmpath.parent}）"}')
-@@ -654,7 +1072,9 @@
+@@ -654,7 +1130,9 @@
      sky = float(np.median(ref))
      nz = 1.4826 * float(np.median(np.abs(ref - sky)))
      fwhm0 = 6.0
@@ -828,7 +893,7 @@
      if tbl is None or len(tbl) == 0:
          return []
      names = tbl.colnames
-@@ -691,7 +1111,7 @@
+@@ -691,7 +1169,7 @@
  
  
  def _fwhm_each(kut, stars: List[Tuple[int, int]], fwhm_guess: float,
@@ -837,7 +902,7 @@
      """逐星量高斯 PSF FWHM 的公共实现；kut(xi,yi) 给一颗星的小窗（越界给 None）
  
      小窗来源有两处（整帧切片 / 帧后端直接取），两者的数值路径完全相同：
-@@ -699,22 +1119,27 @@
+@@ -699,22 +1177,27 @@
      """
      from photutils.psf import fit_fwhm
      out = np.full(len(stars), np.nan, dtype=np.float64)
@@ -881,7 +946,7 @@
  
  
  def measure_fwhm_each(img: np.ndarray, stars: List[Tuple[int, int]],
-@@ -739,7 +1164,7 @@
+@@ -739,7 +1222,7 @@
  
  def measure_fwhm_frame(mm: np.ndarray, i: int, off: np.ndarray,
                         stars: List[Tuple[int, int]], fwhm_guess: float = 6.0,
@@ -890,7 +955,7 @@
      """从帧后端（memmap）直接取星点小窗量 FWHM 中位 —— **不物化整帧**
  
      一帧 244 MiB，而 120 颗星的小窗合起来才 ~0.5 MiB。先 mm[i] − off 物化整帧
-@@ -756,12 +1181,97 @@
+@@ -756,12 +1239,97 @@
              return None
          return mm[i, yi - half:yi + half + 1, xi - half:xi + half + 1] - offi
  
@@ -994,7 +1059,7 @@
  
  def measure_fwhm(img: np.ndarray, stars: List[Tuple[int, int]],
                   fwhm_guess: float = 6.0, half: int = 16,
-@@ -772,6 +1282,42 @@
+@@ -772,6 +1340,42 @@
      if len(v) < 5:
          return float('nan')
      return float(np.median(v))
@@ -1037,7 +1102,7 @@
  
  
  # ---------------------------------------------------------------------------
-@@ -854,7 +1400,9 @@
+@@ -854,7 +1458,9 @@
  # ---------------------------------------------------------------------------
  
  def _r_envelope(sref: np.ndarray, sigma_psf: float, env_win_mult: float = 2.0,
@@ -1048,7 +1113,7 @@
      """R = **亮度归一包络**：E = (I−sky) / local_max(I−sky, 窗≈4σ_psf)
  
      包络规格由以下约束唯一确定 —— **R 必须在 ≲4σ_psf 内从 1 落到 0**：
-@@ -883,7 +1431,48 @@
+@@ -883,7 +1489,48 @@
      dm = np.maximum(d - sky, 0.0)
      half = int(max(1, round(float(env_win_mult) * max(float(sigma_psf), 0.5))))
      win = 2 * half + 1
@@ -1098,7 +1163,7 @@
      E = dm / (loc + float(env_eps) * max(sig, 1e-30))
      E = np.clip(E, 0.0, 1.0)
      if env_p and abs(float(env_p) - 1.0) > 1e-9:
-@@ -905,8 +1494,8 @@
+@@ -905,8 +1552,8 @@
      h = int(round(float(radius_px)))
      if h <= 0:
          return R
@@ -1109,7 +1174,7 @@
      return np.clip(d, 0.0, 1.0).astype(np.float32)
  
  
-@@ -954,10 +1543,84 @@
+@@ -954,10 +1601,84 @@
      return np.clip(out, 0.0, 1.0)
  
  
@@ -1195,7 +1260,7 @@
                    ) -> Tuple[np.ndarray, Dict]:
      """分区权重 R ∈ [0,1]：此处是"细节型"还是"朦胧型"
  
-@@ -974,17 +1637,28 @@
+@@ -974,17 +1695,28 @@
        σ_psf 与 win 均由测得的 FWHM 得到 → 换目标不改数值也不改含义。
        T 现在只用于报表诊断（info 里的 T_p50…），不参与 R 的计算。
      """
@@ -1227,7 +1292,7 @@
  
      # 星点锐帧区外扩：半径随星点亮度自适应（亮星推到更暗处，暗星不动）
      grow_px = float(star_grow) * max(float(sigma_psf), 0.5)
-@@ -1005,9 +1679,13 @@
+@@ -1005,9 +1737,13 @@
      if r_floor and r_floor > 0:
          f = min(float(r_floor), 0.95)
          R = f + (1.0 - f) * R
@@ -1241,7 +1306,7 @@
          'star_grow': float(star_grow), 'grow_px': float(grow_px),
          'grow_px_mean': float(grow_mean),
          'T_p50': float(np.median(T)), 'T_p90': float(np.percentile(T, 90)),
-@@ -1023,7 +1701,8 @@
+@@ -1023,7 +1759,8 @@
  # ---------------------------------------------------------------------------
  
  def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
@@ -1251,7 +1316,7 @@
      """W[i,r] = C_i^(A·R_r) · S_i^(B·(1−R_r))，并逐像素归一使 mean_i(W) = 1
  
      融合式的形状选择依据（式 6、式 7）：
-@@ -1038,10 +1717,24 @@
+@@ -1038,17 +1775,32 @@
      """
      n = len(C)
      a = (A * R)[None, ...]
@@ -1279,7 +1344,40 @@
      W /= np.maximum(W.mean(axis=0), 1e-30)[None]
      return W.astype(np.float32)
  
-@@ -1102,7 +1795,20 @@
+ 
+ def stack_strip(D: np.ndarray, W: np.ndarray, R: Optional[np.ndarray] = None,
+                 sky: float = 0.0, rej_k: float = REJ_K,
+-                rej_max_frac: float = REJ_MAX_FRAC
++                rej_max_frac: float = REJ_MAX_FRAC,
++                frame_sig: Optional[np.ndarray] = None
+                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+     """排异 + 唯一一次加权平均：S = Σ W·D / Σ W
+ 
+@@ -1072,6 +1824,11 @@
+     if rej_k > 0:
+         anchor = np.median(D, axis=0)
+         dev = np.abs(D - anchor[None])
++        if frame_sig is not None:
++            # 月光/薄云下帧间噪声可差 5 倍：把偏差换算到「各帧自己的 σ 单位」再判，
++            # 否则 MAD 会被噪声大的帧撑大、干净的帧被误剔（这也是 moon 数据剔除率高的一因）
++            _s = np.maximum(np.asarray(frame_sig, np.float32).reshape(n, 1, 1), 1e-12)
++            dev = dev / _s
+         mad = 1.4826 * np.median(dev, axis=0).astype(np.float32)
+         if R is None:
+             thr = rej_k * mad
+@@ -1084,8 +1841,9 @@
+                 m = float(np.median(ratio))
+             else:
+                 m = 0.0
+-            thr = rej_k * mad + m * (R * sig)
+-        bad = dev > thr[None]
++            thr = rej_k * mad + (m * (R * sig) / _s[:, 0, 0].reshape(-1, 1, 1)
++                                  if frame_sig is not None else m * (R * sig))
++        bad = dev > thr   # thr 可能是 (h,w) 或逐帧 (n,h,w)，两者都能正确广播
+         nbad = bad.sum(axis=0)
+         expected = n * math.erfc(rej_k / 2.0 ** 0.5)   # 噪声期望误排数（κ 以 σ 为单位）
+         bad &= (nbad - expected <= max(1.0, rej_max_frac * n))[None]     # 剔除比例上限
+@@ -1102,7 +1860,20 @@
  
  
  def _avail_bytes() -> int:
@@ -1301,7 +1399,7 @@
      try:
          import psutil
          return int(psutil.virtual_memory().available)
-@@ -1177,14 +1883,50 @@
+@@ -1177,14 +1948,50 @@
      _MEM['off'] = off
  
  
@@ -1354,18 +1452,23 @@
  
  
  def _task_trail(job) -> Tuple[int, float, float]:
-@@ -1196,8 +1938,8 @@
+@@ -1196,11 +2003,12 @@
  
  def _task_strip(job):
      """一条带的权重 + 排异 + 加权平均（与串行的三段调用完全同序同式）"""
 -    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate = job
 -    W = strip_weights(C, S, Rr, A, B)
-+    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp, beta = job
++    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp, beta, sig = job
 +    W = strip_weights(C, S, Rr, A, B, T=T, fp=fp, beta=float(beta))
      mm, off = _MEM['mm'], _MEM['off']
      D = np.stack([mm[i, y0:y1] - np.float32(off[i]) for i in range(len(C))])
-     s, ne, rr = stack_strip(D, W, Rr, sky0, rej_k=rej_k, rej_max_frac=rej_gate)
-@@ -1214,22 +1956,77 @@
+-    s, ne, rr = stack_strip(D, W, Rr, sky0, rej_k=rej_k, rej_max_frac=rej_gate)
++    s, ne, rr = stack_strip(D, W, Rr, sky0, rej_k=rej_k, rej_max_frac=rej_gate,
++                            frame_sig=sig)
+     return s, ne, rr, float(W.max(axis=0).mean())
+ 
+ 
+@@ -1214,22 +2022,77 @@
      _MEM['mmw'] = np.memmap(path, dtype=np.float32, mode='r+', shape=(n, h, w))
  
  
@@ -1447,7 +1550,7 @@
  
  
  # ---------------------------------------------------------------------------
-@@ -1357,7 +2154,15 @@
+@@ -1357,7 +2220,15 @@
      img.geometry = (a.shape[1], a.shape[0], 1)      # XISF geometry = 宽:高:通道
      img.sample_format = 'Float32'
      img.color_space = 'Gray'
@@ -1464,7 +1567,7 @@
      img.pixel_storage = 'Planar'
      img.fits_keywords = [
          {'name': 'TOTALEXP', 'value': round(sum(m['exptime'] for m in metas), 1),
-@@ -1383,6 +2188,520 @@
+@@ -1383,6 +2254,520 @@
          f'元数据：关键字 {len(img.fits_keywords)}  Property {len(prop_raws)}')
  
  
@@ -1985,7 +2088,7 @@
  def run(p: PwsParams, on_log=None, on_progress=None, should_cancel=None) -> Dict:
      """PWS 引擎的对外唯一入口（界面与命令行都调它）
  
-@@ -1391,6 +2710,7 @@
+@@ -1391,6 +2776,7 @@
      """
      set_hooks(on_log, on_progress, should_cancel)
      try:
@@ -1993,7 +2096,7 @@
          return _run(p)
      finally:
          set_hooks()
-@@ -1406,7 +2726,7 @@
+@@ -1406,7 +2792,7 @@
      photos = (p.photos or '').strip()
      if not photos:
          raise SystemExit('请选择素材（目录或单张帧）')
@@ -2002,7 +2105,7 @@
      if not (p.out or '').strip():
          raise SystemExit('请选择输出目录（不放在素材目录里，避免成品被当成帧）')
      out_dir = Path(p.out)
-@@ -1414,34 +2734,330 @@
+@@ -1414,33 +2800,336 @@
  
      _emit('读帧', 0.0, '读头分组')
      groups = group_frames_by_filter(frames)
@@ -2253,7 +2356,7 @@
          log(f'[时] 全部 {len(groups)} 组总计 {time.perf_counter() - t_start:.1f}s')
          res['groups'] = summaries
      return res
- 
++
 +
 +def _ln_normalize(fs, ref_idx: int, block: int = 32,
 +                  lo: float = 0.8, hi: float = 1.25, log=print) -> None:
@@ -2342,10 +2445,16 @@
 +        log('[两遍] 局部锐度场：%d 帧 × %d×%d 块（%dpx），相对权重 %.2f~%.2f'
 +            % (n, nby, nbx, blk, float(_np.min(r)), float(_np.max(r))))
 +    return r.astype(_np.float32)
++
++def _flag(v) -> bool:
++    """命令行/界面传进来的布尔：'0'/'false' 也算关（argparse 里 bool 会退化成字符串）"""
++    if isinstance(v, str):
++        return v.strip().lower() not in ('', '0', 'false', 'no', 'off')
++    return bool(v)
+ 
  
  def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
-                out_dir: Path, stem: str) -> Dict:
-@@ -1449,10 +3065,28 @@
+@@ -1449,10 +3138,28 @@
      完整流程（读帧→星表→R 场→叠加→导出），成品文件主名由 stem 给出。"""
      # 参数别名：算法体统一从 PwsParams 取值
      A, B = float(p.A), float(p.B)
@@ -2374,7 +2483,7 @@
      rej_gate = float(p.rej_gate)                  # 剔除比例上限（默认 1/3）
      limit = int(p.limit) or None
      crop, keep_frames, frames_dir = int(p.crop), bool(p.keep_frames), p.frames_dir
-@@ -1463,9 +3097,46 @@
+@@ -1463,9 +3170,49 @@
  
      # ---- 阶段 0：读帧 + 帧级归一（自动选驻留 / memmap）----
      center = resolve_center(frames, crop, parse_center(p.center))
@@ -2399,8 +2508,11 @@
 +    else:
 +        fs = prepare_frames(frames, ';'.join(str(s) for s in sources), crop, center,
 +                            limit, frames_dir, keep_frames=keep_frames,
-+                            bgdeg=int(getattr(p, 'bgdeg', 1) or 0),
-+                            bg_r=int(getattr(p, 'bg_r', 0) or 0))
++                            bgdeg=(0 if _flag(getattr(p, 'ln_xnml', False))
++                                   else int(getattr(p, 'bgdeg', 1) or 0)),
++                            bg_r=int(getattr(p, 'bg_r', 0) or 0),
++                            bg_tiles=int(_flag(getattr(p, 'bg_tiles', False))),
++                            ln_xnml=int(_flag(getattr(p, 'ln_xnml', False))))
 +        if _CFA.get('pattern'):
 +            fs._shared = True
 +        _FS_CACHE[_ck] = fs
@@ -2423,7 +2535,7 @@
      metas = fs.metas
      skies = fs.skies
      # 量纲回乘：内部一切计算都在 EXPTIME_REF 基准上（权重/排异全是比值，不受影响），
-@@ -1479,6 +3150,18 @@
+@@ -1479,6 +3226,37 @@
      # S_i = σ_中位 / σ_i（归一化后测 → 曝光差异已被吸收，可直接跨帧比）
      sig = fs.sigma
      S = np.median(sig) / np.maximum(sig, 1e-30)
@@ -2439,10 +2551,29 @@
 +            log(f'[S] 帧间噪声极差 {_r:.1f}×，S 已限幅到 [{1.0 / _k_clip:.3f}, '
 +                f'{_k_clip:g}]（{_n_clip} 帧被限；避免单帧独占权重，'
 +                f'要关掉填 --snr-clip 0）')
++    # ---- 局部噪声权重（实验，--local-snr 1）----
++    # 月光/光害/薄云在视场里不均匀：同一帧在一角被抬高、另一角还干净。
++    # 用每帧自己的背景梯度模型估每格天空，再按散粒噪声把 σ 缩放到该格，
++    # 得到 S_i(cell) = median_i σ_i(cell)/σ_i(cell)：亮格自动少用被污染的帧。
++    _S_field = None
++    if _flag(getattr(p, 'local_snr', 0)):
++        try:
++            import sigma_field as _sf
++            _S_field, _sinfo = _sf.weight_field(
++                fs, sig, gh=int(getattr(p, 'local_snr_grid', 8) or 8),
++                gw=int(getattr(p, 'local_snr_grid', 8) or 8),
++                clip_k=float(_k_clip or 3.0))
++            log(f'[局部权重] 天空 {_sinfo["sky_min"]:.3g}~{_sinfo["sky_max"]:.3g}'
++                f'（{_sinfo["sky_ratio"]:.2f}×），S 场 {_sinfo["S_min"]:.3f}~{_sinfo["S_max"]:.3f}'
++                f'（中位 {_sinfo["S_med"]:.3f}）；{_S_field.shape[1]}×{_S_field.shape[2]} 格，'
++                f'暗处被月光抬高的帧会自动降权（本模式走 CPU 叠加）')
++        except Exception as _e:
++            _S_field = None
++            log(f'[局部权重] 构建失败，退回全局 S（不影响本次）：{_e}')
      sig_out = sig * scale_out          # 展示与落盘量纲 = 成品量纲（内部仍用 sig 算比值）
      log(f'[S] 单帧信噪比权重（σ_中位/σ_i）{S.min():.3f}~{S.max():.3f}  中位 {np.median(S):.3f}')
      log(f'[σ] 逐帧噪声 {sig_out.min():.4e}~{sig_out.max():.4e}'
-@@ -1486,40 +3169,165 @@
+@@ -1486,40 +3264,165 @@
  
      # ---- 阶段 A：C_i（星点 FWHM，开源 fit_fwhm）----
      # 先用最干净的一帧建固定星表（星表位置对全部帧共用）
@@ -2614,7 +2745,7 @@
          f' {np.nanmin(fwhms):.2f}~{np.nanmax(fwhms):.2f}px  中位 {fmed:.2f}px  '
          f'{time.perf_counter() - t1:.1f}s')
      log(f'[C] 清晰度权重（FWHM_中位/FWHM_i）{C.min():.3f}~{C.max():.3f}')
-@@ -1528,6 +3336,52 @@
+@@ -1528,6 +3431,52 @@
          f'#{int(i)}({fwhms[int(i)]:.2f}px)' for i in order[:3]))
      log('[C] 最糊 3 帧 ' + '  '.join(
          f'#{int(i)}({fwhms[int(i)]:.2f}px)' for i in order[-3:]))
@@ -2667,7 +2798,7 @@
  
      sigma_psf = fmed / 2.3548
  
-@@ -1556,9 +3410,22 @@
+@@ -1556,9 +3505,22 @@
                  _check_cancel()
                  lam1[i], pas[i] = fs.trail(i, stars, sigma_psf)
  
@@ -2691,7 +2822,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,88 +3453,1133 @@
+@@ -1586,88 +3548,1177 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -3398,6 +3529,10 @@
 +    if drz_on:
 +        # ---- drizzle：每帧按自己的位移落点，输出网格逐像素排异，分母 ΣW·c ----
 +        _gm = str(getattr(p, 'gpu', 'auto') or 'auto').lower()
++        if _S_field is not None and _gm != 'cpu':
++            # 逐格 S 目前只接在 CPU 的逐块加权里；GPU canvas 内核用的是标量 lnS
++            log('[局部权重] GPU 内核暂不支持逐格 S，本次 drizzle 改走 CPU 逐块加权')
++            _gm = 'cpu'
 +        if _gm == 'cpu':
 +            os.environ['DWT_GPU'] = '0'
 +        elif _gm == 'gpu':
@@ -3661,6 +3796,8 @@
 +                _bud_mb = min(8192.0, max(512.0, _avail_bytes() / 2**20 * 0.60))
 +                _cap = max(1, int(_bud_mb // max(1.0, _cv_mb * 2.2)))
 +                _nw = max(1, min(int(_drizzle_workers()), _cap))
++                if _S_field is not None:
++                    _nw = 1
 +                if _nw < int(_drizzle_workers()):
 +                    log('[drizzle] 画布 %.0f MB，并行进程从 %d 降到 %d（避免内存打爆）'
 +                        % (_cv_mb, int(_drizzle_workers()), _nw))
@@ -3804,7 +3941,8 @@
 +                    _beta_st = float(_detail_beta(p))
 +                    jobs = ((y0, min(h, y0 + strip), R[y0:y0 + strip],
 +                             band_cfield(C, C_tiles, y0, min(h, y0 + strip), h, w), S, A, B, rej_k,
-+                             fs.sky0, rej_gate, T, fp, _beta_st)
++                             fs.sky0, rej_gate, T, fp, _beta_st,
++                             (fs.sigma if bool(getattr(p, 'rej_z', False)) else None))
 +                            for y0 in range(0, h, strip))
 +                    for k, (s, ne, rr, wm) in enumerate(ex.map(_task_strip, jobs, chunksize=1)):
 +                        _check_cancel()
@@ -3821,25 +3959,67 @@
 +                finally:
 +                    ex.shutdown(wait=True, cancel_futures=True)
 +            else:
++                _sf_mod = None
++                if _S_field is not None:
++                    try:
++                        import sigma_field as _sf_mod
++                    except Exception:
++                        _sf_mod = None
 +                for k, y0 in enumerate(range(0, h, strip)):
                      _check_cancel()
 -                    y0 = k * strip
                      y1 = min(h, y0 + strip)
-+                    _beta = _detail_beta(p)
-+                    W = strip_weights(band_cfield(C, C_tiles, y0, y1, h, w),
-+                                      S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
-+                    D = fs.stack_strips(y0, y1)
-+                    s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,
-+                                            rej_max_frac=rej_gate)
-                     Stk[y0:y1] = s
-                     neff[y0:y1] = ne
-                     cnt = float(s.size)
-                     rej_num += float(rr) * cnt
-                     rej_den += cnt
+-                    Stk[y0:y1] = s
+-                    neff[y0:y1] = ne
+-                    cnt = float(s.size)
+-                    rej_num += float(rr) * cnt
+-                    rej_den += cnt
 -                    wmax.append(wm)
 -                    del s, ne
-+                    wmax.append(float(W.max(axis=0).mean()))
-+                    del W, D, s, ne, rr
++                    _beta = _detail_beta(p)
++                    _rej_z = bool(getattr(p, 'rej_z', False))
++                    if _S_field is None or _sf_mod is None:
++                        W = strip_weights(band_cfield(C, C_tiles, y0, y1, h, w),
++                                          S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
++                        D = fs.stack_strips(y0, y1)
++                        s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,
++                                                rej_max_frac=rej_gate,
++                                                frame_sig=(fs.sigma if _rej_z else None))
++                        Stk[y0:y1] = s
++                        neff[y0:y1] = ne
++                        cnt = float(s.size)
++                        rej_num += float(rr) * cnt
++                        rej_den += cnt
++                        wmax.append(float(W.max(axis=0).mean()))
++                        del W, D, s, ne, rr
++                    else:
++                        # 局部权重：按列块切，每块用该块的 S_i(cell) 标量
++                        rows = _sf_mod.cell_for_band(_S_field, y0, y1, h, _S_field.shape[1])
++                        nb = int(_S_field.shape[2])
++                        D_full = None
++                        for cx in range(nb):
++                            x0 = cx * w // nb
++                            x1 = (cx + 1) * w // nb
++                            if x1 <= x0:
++                                continue
++                            S_c = rows.mean(axis=1)[:, cx]
++                            W = strip_weights(
++                                band_cfield(C, C_tiles, y0, y1, h, w)[..., x0:x1],
++                                S_c, R[y0:y1, x0:x1], A, B, T=T, fp=fp, beta=_beta)
++                            if D_full is None:
++                                D_full = fs.stack_strips(y0, y1)
++                            s, ne, rr = stack_strip(D_full[:, :, x0:x1], W,
++                                                    R[y0:y1, x0:x1], fs.sky0,
++                                                    rej_k=rej_k, rej_max_frac=rej_gate,
++                                                    frame_sig=(fs.sigma if _rej_z else None))
++                            Stk[y0:y1, x0:x1] = s
++                            neff[y0:y1, x0:x1] = ne
++                            cnt = float(s.size)
++                            rej_num += float(rr) * cnt
++                            rej_den += cnt
++                            wmax.append(float(W.max(axis=0).mean()))
++                            del W, s, ne, rr
++                        del D_full
                      _emit('叠加', (k + 1) / n_strip, f'{k + 1}/{n_strip} 条带')
 -            finally:
 -                ex.shutdown(wait=True, cancel_futures=True)
@@ -3883,7 +4063,7 @@
      log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
          f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
      log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
-@@ -1688,11 +4600,61 @@
+@@ -1688,11 +4739,61 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -3948,7 +4128,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +4662,257 @@
+@@ -1700,27 +4801,257 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -4210,7 +4390,19 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1750,13 +4942,23 @@
+@@ -1741,6 +5072,11 @@
+         default = getattr(base, prm.key)
+         if prm.kind == 'check':
+             ap.add_argument(flag, action='store_true', default=default, help=text)
++            if default is True:
++                # 默认开启的开关要给一个否定形式，否则命令行无法关掉
++                ap.add_argument('--no-' + flag.lstrip('-'), dest=prm.key,
++                                action='store_false', default=True,
++                                help='关闭「%s」' % prm.label)
+         elif prm.kind == 'float':
+             ap.add_argument(flag, type=float, default=default, help=text)
+         elif prm.kind == 'int':
+@@ -1750,13 +5086,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -4234,7 +4426,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +4966,82 @@
+@@ -1764,5 +5110,82 @@
      return 0
  
  
@@ -4319,10 +4511,14 @@
      main()
 --- a/core/pws_params.py
 +++ b/core/pws_params.py
-@@ -46,29 +46,90 @@
+@@ -46,29 +46,95 @@
      # ---- 标准 ----
      A: float = 20.0
      rej_k: float = 3.5
++    local_snr: bool = False
++    local_snr_grid: int = 8
++    bg_tiles: bool = False
++    ln_xnml: bool = False
 +    snr_clip: float = 3.0
 +    detail_snr: float = 0.0
      limit: int = 0
@@ -4368,6 +4564,7 @@
 +    c_star: int = 64
 +    jobs: int = 0
 +    rej_mode: str = 'winsor'
++    rej_z: bool = True
 +
 +    kernel: str = 'box'
 +
@@ -4411,7 +4608,7 @@
            '用「添加目录 / 添加单张」加入多个来源（一行一个，行尾「×」移除，「清空」一键移除）；'
            '重复声明的文件只算一帧。同一目标不同夜晚的帧可以混叠。'
            '混合滤镜的素材会按文件头（FILTER）自动分组，各滤镜独立叠加、各自出一张成品。'),
-@@ -85,9 +146,24 @@
+@@ -85,9 +151,36 @@
            '细节区愿意用多少信噪比换解析力',
            '唯一需要标定的参数，也是本方法唯一"可调风格"的旋钮。'
            'R=1 处的权重为 C^A，A 越大越偏向锐帧。'
@@ -4421,6 +4618,18 @@
 +          '20 更锐但权重更集中；10 更干净；'
            '30 更锐：星点再细 0.1~0.3px，但天空噪声涨 6~7%、细节区等效帧数掉到 4 以下。',
            lo=1.0, hi=60.0, step=0.5, dec=1),
++    Param('local_snr', '局部噪声权重（逐帧×分块）', 'check', '高级',
++          '按每帧自己的背景梯度把视场分块估天空，亮格自动少用被月光/光害污染的帧',
++          '默认关。天空均匀时没用；有月晕、光害梯度、薄云不均匀时再开（本模式走 CPU 叠加）。'),
++    Param('local_snr_grid', '局部分块格数', 'int', '高级',
++          '网格边长：8 表示 8×8=64 块',
++          '默认 8。格太细会被星云结构污染，格太粗救不了局部污染；4~12 实用。'),
++    Param('bg_tiles', '实测块中位背景（LN 风格）', 'check', '高级',
++          '用每帧 32px 块中位测出的背景场代替一/二阶多项式，吃得住月光、薄云这类不规则大尺度梯度',
++          '默认关。多项式跟不上的强梯度/云影时开；平滑星云场别开（会把大尺度结构当背景减掉）。'),
++    Param('ln_xnml', '使用 WBPP 的 LN 模型（*.xnml）', 'check', '高级',
++          '读取 PI/WBPP 每帧的 LocalNormalization 模型（同名 .xnml），把该帧背景拉到参考帧水平',
++          '默认关。素材是 WBPP registered 且带 .xnml 时开；开了会自动关闭本程序的背景梯度拟合（bgdeg=0）。'),
 +    Param('snr_clip', '噪声离群限幅', 'float', '高级',
 +          'S 权重（按帧噪声逆方差）的限幅倍数，防止个别异常干净的帧独占权重',
 +          'S = σ_中位/σ_i 会被限在 [1/K, K]。K=3 表示单帧最多 9 倍权重；'
@@ -4437,7 +4646,7 @@
      Param('rej_k', '排异强度 k', 'float', '标准',
            '剔除单帧异常像元（卫星、宇宙线、热噪）',
            '逐像素跨帧|偏差|超过 阈值 = k×1.4826×MAD + m·R·信号（信号 = 比较基准−天空）的帧判为离群剔除；'
-@@ -101,6 +177,28 @@
+@@ -101,6 +194,28 @@
            '0 = 全部（正式出图用这个）。>0 用于先在小样本上试参数，'
            '注意这不是"挑好帧"：帧的取舍由权重在叠加内部完成。',
            lo=0, hi=100000, step=1),
@@ -4466,7 +4675,7 @@
      Param('frames_dir', '帧落盘目录', 'dir', '标准',
            '帧多到装不进内存时的临时帧文件位置',
            '留空 = 自动挑盘（需 1.25× 余量）：优先软件所在目录 _DWT_frames'
-@@ -113,6 +211,62 @@
+@@ -113,6 +228,62 @@
            '注意：无论是否勾选，每次叠加都会重新读取源帧并重新落盘，勾选并不省落盘时间。'),
  
      # ---------------- 高级 ----------------
@@ -4529,7 +4738,7 @@
      Param('crop', '裁剪边长', 'int', '高级',
            '只叠画面中间 N×N 像素',
            '0 = 全幅（正式出图）。>0 只用于快速试参数：裁剪后帧小、跑得快，'
-@@ -142,6 +296,71 @@
+@@ -142,6 +313,71 @@
            '把 R 收得更紧',
            '1.0 即推荐值。>1 收窄支撑（R 更贴核心），<1 放宽。',
            lo=0.25, hi=4.0, step=0.05, dec=2),
@@ -4601,10 +4810,13 @@
      Param('star_grow_pct', '星点锐帧扩展', 'float', '高级',
            '按实测拖线长度自动外扩星点锐帧区',
            '100% = 用实测值（默认）：逐帧量星点长轴方差，相减得到拖线长度，'
-@@ -160,12 +379,125 @@
+@@ -160,12 +396,128 @@
            '在信噪比最好的一帧上一次性选星（未饱和、孤立、最亮），'
            '之后所有帧量同一批位置。中位数在 100 颗以上已稳定；星太少的视场可调小。',
            lo=20, hi=600, step=10),
++    Param('rej_z', '排异按各帧噪声归一（月光/薄云）', 'check', '高级',
++          '帧间噪声差很大时（月光、薄云、短曝光混拍），把偏差换算到各帧自己的 σ 单位再判，',
++          '避免噪声大的帧把阈值撑大、干净的帧被误剔。默认开；要在 GPU drizzle 下关掉请用 --no-rej-z。'),
 +    Param('rej_mode', '排异尺度算法', 'choice', '高级',
 +          'winsorized = 截尾后求均值（默认，快且抗差）',
 +          '三种都是噪声尺度的鲁棒估计：winsor 先按 3σ 截尾再求 mean|x−μ|×1.2533，'
@@ -12462,7 +12674,7 @@
 +            'wmax': float(cov.max()) if cov.size else 0.0}
 --- a/gui.py
 +++ b/gui.py
-@@ -0,0 +1,1793 @@
+@@ -0,0 +1,1803 @@
 +# -*- coding: utf-8 -*-
 +"""DWT + Drizzle 图形界面
 +
@@ -12734,6 +12946,8 @@
 +        argv += ["--kernel", c["kernel"], "--psf-target", str(c.get("psf_target") or "50")]
 +    if str(c.get("cache", "1")) != "1":
 +        argv += ["--cache", "0"]
++    if str(c.get("rej_z", "1")) != "1":
++        argv += ["--no-rej-z"]
 +    if str(c.get("two_pass", "0")) == "1":
 +        argv += ["--two-pass", "1"]
 +    if float(c.get("detail_snr", "0") or 0) > 0:
@@ -13158,6 +13372,12 @@
 +            variable=self.v_cache),
 +             "默认开：换素材/裁剪/参考帧会自动失效重测；关掉＝每次强制重测"
 +             "（怀疑配准有问题时用）")
++        self.v_rejz = tk.BooleanVar(value=True)
++        arow(32, "排异按噪声归一", ttk.Checkbutton(
++            adv, text="把偏差换成各帧自己的 σ 再判（月光/薄云下少误剔）",
++            variable=self.v_rejz),
++             "默认开：帧间噪声差大时（月光、薄云、短曝光混拍）效果最明显；"
++             "只在 drizzle 走 CPU 时生效，GPU 内核仍用标准排异")
 +        self.v_jobs = tk.StringVar()
 +        self.v_refk = tk.StringVar()
 +        _sp_refk = ttk.Spinbox(adv, from_=0, to=64, increment=1, width=6, textvariable=self.v_refk)
@@ -13234,7 +13454,7 @@
 +            values=["关（推荐）", "开"]),
 +             "第一遍出图后按 64px 块估局部锐度再叠一遍；实测收益 <1%、耗时 +40%")
 +
-+        # ---- R 场包络（2.7.106-D 起可见）----
++        # ---- R 场包络（2.7.107-D 起可见）----
 +        # 这三个数决定「细节掩膜 R」的形状：哪算结构、结构边缘多宽、空白天压得多狠。
 +        # 默认值是标定过的，只有在特定目标上（暗弱大结构被压掉 / 星点外有硬边）才动。
 +        self.v_envw = tk.StringVar(value="2.0")
@@ -13413,6 +13633,7 @@
 +        self.v_tunea.set(c.get("tune_a", "10,14,20"))
 +        self.v_1x.set(str(c.get("native_1x", "0")) == "1")
 +        self.v_cache.set(str(c.get("cache", "1")) not in ("0", "", "False"))
++        self.v_rejz.set(str(c.get("rej_z", "1")) not in ("0", "", "False"))
 +        self.v_aligned.set(str(c.get("aligned", "0")) == "1")
 +        self.v_cfa.set({"off": "关", "auto": "自动识别"}.get(c.get("cfa", "off"),
 +                                                       c.get("cfa", "off") or "关"))
@@ -13477,6 +13698,7 @@
 +            "tune_a": self.v_tunea.get().strip() or "10,14,20",
 +            "native_1x": "1" if bool(self.v_1x.get()) else "0",
 +            "cache": "1" if bool(self.v_cache.get()) else "0",
++            "rej_z": "1" if bool(self.v_rejz.get()) else "0",
 +            "aligned": "1" if bool(self.v_aligned.get()) else "0",
 +            "cfa_ref": self.v_cfa_ref.get().strip(),
 +            "cfa_raw": {"自动": "auto", "强制开": "on",
@@ -13896,7 +14118,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.106-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.107-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""
