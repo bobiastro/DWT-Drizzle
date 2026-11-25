@@ -1844,9 +1844,42 @@ def stack_strip(D: np.ndarray, W: np.ndarray, R: Optional[np.ndarray] = None,
             thr = rej_k * mad + (m * (R * sig) / _s[:, 0, 0].reshape(-1, 1, 1)
                                   if frame_sig is not None else m * (R * sig))
         bad = dev > thr   # thr 可能是 (h,w) 或逐帧 (n,h,w)，两者都能正确广播
+        # ---- 天空区单侧压低伪迹（卫星线/月光斜纹）----
+        # 卫星线在注册后的帧里常常落在同一批像素上、且只「加亮」。对称的中位/MAD
+        # 会被它整体抬高，于是要么留线、要么把干净帧当离群剔掉。天空区（R<0.1）
+        # 改用 25% 分位当基准、只剔上侧：干净帧一个不丢，线帧被整段去掉。
+        if R is not None:
+            _sky = R < 0.1
+            if bool(_sky.any()):
+                _d = D[:, _sky]
+                if frame_sig is not None:
+                    _d = _d / _s[:, 0, 0][:, None]
+                _a = np.percentile(_d, 25, axis=0)
+                _lo = _d <= np.median(_d, axis=0)[None]
+                _sig = 1.4826 * np.median(np.abs(_d - _a[None]), axis=0)
+                _sig = np.maximum(_sig, 1e-12)
+                _hi = (_d - _a[None]) / _sig[None]
+                _b = _hi > rej_k
+                _nb = _b.sum(axis=0)
+                _okb = _nb <= 0.8 * n
+                _b &= _okb[None]
+                bad[:, _sky] = _b
+                del _d, _a, _lo, _sig, _hi, _b
         nbad = bad.sum(axis=0)
         expected = n * math.erfc(rej_k / 2.0 ** 0.5)   # 噪声期望误排数（κ 以 σ 为单位）
-        bad &= (nbad - expected <= max(1.0, rej_max_frac * n))[None]     # 剔除比例上限
+        _ok = (nbad - expected <= max(1.0, rej_max_frac * n))
+        # 单侧豁免：卫星线/流星这类「只往上偏」的伪迹常出现在 >1/3 的帧里，
+        # 会被上面的比例上限整片挡住（这就是"怎么设都排不掉"的原因）。
+        # 判据：被剔样本几乎全在中位上侧（≥95%），且下侧几乎没有 → 判为单侧伪迹，
+        # 允许剔到 70%；两侧都有明显离群时仍按原上限，避免误伤共有结构。
+        if R is None:
+            _hi = (dev > thr) & (D > anchor[None])
+        else:
+            _hi = (dev > thr) & (D > anchor[None])
+        _nhi = _hi.sum(axis=0)
+        _nlo = nbad - _nhi
+        _one = (_nlo <= 0.05 * n) & (_nhi - expected <= 0.7 * n)
+        bad &= (_ok | _one)[None] if _ok.ndim == 0 else (_ok | _one)
         rej_rate = float(bad.mean())
         W = np.where(bad, np.float32(0.0), W)
     else:
@@ -4724,6 +4757,42 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
     log(f'[叠加] N_eff 中位 {np.median(neff):.2f}/{n}  '
         f'P10 {np.percentile(neff, 10):.2f}  最小 {neff.min():.2f}')
+
+    # ---- 卫星线手工掩膜（成品坐标）----
+    # 排异是「逐像素少数派」判据：卫星线若在很多帧里落在同一批像素上（慢速目标、
+    # 或与星芒重叠），它就成了该像素的多数派，怎么调 k 都留。这里给一个精确的出口：
+    # 用户量出线的两个端点，只把这条线段（±3 px）用垂直邻域中值补掉——
+    # 覆盖之外一个像素都不动，代价仅这条线本身。
+    _tl = str(getattr(p, 'trail_line', '') or '').strip()
+    if _tl:
+        try:
+            _v = [float(x) for x in _tl.replace('，', ',').split(',')]
+            if len(_v) != 4:
+                raise ValueError('需要 4 个数：x0,y0,x1,y1')
+            _ax, _ay, _bx, _by = [int(round(x)) for x in _v]
+            _H, _W = Stk.shape[:2]
+            _L = int(max(1.0, np.hypot(_bx - _ax, _by - _ay)))
+            _ux, _uy = (_bx - _ax) / _L, (_by - _ay) / _L
+            _px, _py = -_uy, _ux
+            _tt = np.arange(0, _L, 0.4)
+            _cx = _ax + _tt * _ux
+            _cy = _ay + _tt * _uy
+            for _k in (-3, -2, -1, 0, 1, 2, 3):
+                for _x, _y in zip(_cx, _cy):
+                    _samp = []
+                    for _d in (10, 12, 14, 18):
+                        for _sg in (-1, 1):
+                            _xa = int(round(_x + _px * (_k + _sg * _d)))
+                            _ya = int(round(_y + _py * (_k + _sg * _d)))
+                            if 0 <= _ya < _H and 0 <= _xa < _W:
+                                _samp.append(Stk[_ya, _xa])
+                    _xi = int(round(_x + _px * _k))
+                    _yi = int(round(_y + _py * _k))
+                    if _samp and 0 <= _yi < _H and 0 <= _xi < _W:
+                        Stk[_yi, _xi] = float(np.median(_samp))
+            log(f'[卫星线] 已按端点 ({_ax},{_ay})-({_bx},{_by}) 补掉 ±3px 线带（垂直邻域中值，其余像素未动）')
+        except Exception as _e:
+            log(f'[卫星线] 端点解析失败（{_e}），跳过；格式示例：4697,280,5170,4126')
 
     # 分区分读：细节区 vs 朦胧区的 N_eff 与噪声
     det = R > 0.5

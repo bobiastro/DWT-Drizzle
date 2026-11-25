@@ -103,6 +103,7 @@ class PwsParams:
     two_pass: int = 0
     cache: bool = True        # 复用跨运行的配准结果（素材/几何没变时跳过测位移）
     cache_dir: str = ''       # 空=用户目录/.dwt-cache；也可 DWT_CACHE_DIR
+    trail_line: str = ''      # 卫星线端点 "x0,y0,x1,y1"（成品坐标），空=不处理
 
     psf_target: float = 50.0
     rej_gate: float = 1 / 3
@@ -408,6 +409,10 @@ PARAMS: Tuple[Param, ...] = (
           choices=(('winsorized（推荐）', 'winsor'), ('中位绝对偏差（旧）', 'mad'),
                    ('平均绝对偏差（最快）', 'fast'), ('广义 ESD（Rosner）', 'esd'))),
 
+    Param('trail_line', '卫星线端点（x0,y0,x1,y1）', 'str', '高级',
+          '叠加完成后沿这条线段（±3px）用垂直邻域中值补掉，用来清掉排异也去不掉的卫星线',
+          '在成品坐标里量两个端点填进来，例如 4697,280,5170,4126；留空＝不做。'
+          '只改线段覆盖的像素，其余像素逐位不变。'),
     Param('cache', '复用配准缓存', 'bool', '高级',
           '把上次的帧间位移存起来；素材、裁剪、参考帧没变时第二次起直接复用',
           '同素材反复调 A / 排异 k / 吞吐权重时，读帧后那几步「测位移」纯属重复。'
