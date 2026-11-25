@@ -34,6 +34,7 @@ struct QP {
   y_off: u32, c0: u32, r0: u32, mask: u32,
   P: f32, lnc: f32, lns: f32, wa: f32, wb: f32, has_r: f32, kclip: f32,
   mode: f32, s_off: u32, lnt: f32, mgate: f32, sky: f32, sfac: f32, beta: f32,
+  kt: u32, capl: f32,
 };
 
 @group(0) @binding(0) var<storage, read> src: array<f32>;
@@ -46,6 +47,7 @@ struct QP {
 @group(0) @binding(7) var<storage, read> sd: array<f32>;
 @group(0) @binding(8) var<storage, read_write> aW2: array<atomic<f32>>;
 @group(0) @binding(9) var<storage, read_write> aBad: array<atomic<u32>>;
+@group(0) @binding(10) var<storage, read> ctile: array<f32>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -83,7 +85,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (wy <= 0.0) { continue; }
       let idx = u32(gy) * Q.w_out + u32(kx);
       let rr = select(0.5, rmap[(u32(gy) + Q.y_off) * Q.w_out + u32(kx)], Q.has_r > 0.5);
-      let wgt = exp(Q.wa * rr * Q.lnc + (Q.wb * (1.0 - rr) + Q.beta * rr) * Q.lns);
+      var lcg = Q.lnc;
+      if (Q.kt >= 2u) {
+        // 逐瓦片清晰度：**双线性插值**，权重随位置连续变化 → 区域之间没有台阶
+        let fk = f32(Q.kt);
+        let fx = (f32(gx0) + 0.5) * fk / f32(Q.w_src) - 0.5;
+        let fy = (f32(gy0) + 0.5) * fk / f32(Q.h_src) - 0.5;
+        let ix0 = clamp(i32(floor(fx)), 0, i32(Q.kt) - 1);
+        let iy0 = clamp(i32(floor(fy)), 0, i32(Q.kt) - 1);
+        let ix1 = min(ix0 + 1, i32(Q.kt) - 1);
+        let iy1 = min(iy0 + 1, i32(Q.kt) - 1);
+        let tx = clamp(fx - f32(ix0), 0.0, 1.0);
+        let ty = clamp(fy - f32(iy0), 0.0, 1.0);
+        let u = u32(Q.kt);
+        let c00 = ctile[u32(iy0) * u + u32(ix0)];
+        let c10 = ctile[u32(iy0) * u + u32(ix1)];
+        let c01 = ctile[u32(iy1) * u + u32(ix0)];
+        let c11 = ctile[u32(iy1) * u + u32(ix1)];
+        lcg = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+      }
+      // 单帧份额上限：把 A·lnC 截在 ±capl（capl=0 表示不限额）
+      var alc = Q.wa * rr * lcg;
+      if (Q.capl > 0.0) { alc = clamp(alc, -Q.capl, Q.capl); }
+      let wgt = exp(alc + (Q.wb * (1.0 - rr) + Q.beta * rr) * Q.lns);
       let w = wgt * wx * wy / (Q.P * Q.P) * exp(Q.lnt);
 
       if (mode == 0) {
@@ -206,7 +230,8 @@ def _pipes(dev):
 
 def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                     R=None, pixfrac=1.0, band_rows=512, T=None, fp=1.0,
-                    log=None, pattern=None, channel=None, beta=None, **kw):
+                    log=None, pattern=None, channel=None, beta=None, Ctiles=None,
+                    cap=None, **kw):
     if not available():
         raise RuntimeError('适配器不支持 shader-float32-atomic')
     dev, queue = G._device_f32()
@@ -264,10 +289,22 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                        else float(os.environ.get('DWT_DETAIL_SNR', '0') or 0))
     pu = p.view(np.uint32)
     pu[13] = np.uint32(mask2)
+    # 单帧份额上限：cap∈(0,1) 时换算成对数幅度上限 L=ln((n-1)cap/(1-cap))，写进 p[29]
+    try:
+        _cap = float(cap) if cap is not None else 0.0
+    except Exception:
+        _cap = 0.0
+    _nf = int(np.atleast_1d(dx).size)
+    if 0.0 < _cap < 1.0 and _nf > 1:
+        p[29] = np.float32(math.log(max((_nf - 1) * _cap / (1.0 - _cap), 1e-9)))
+    else:
+        p[29] = np.float32(0.0)
     p[14] = np.float32(P)
     p[17] = np.float32(float(A))
     p[18] = np.float32(float(B))
     p[19] = np.float32(1.0 if R is not None else 0.0)
+    _kt = 0 if Ctiles is None else int(getattr(Ctiles, 'shape', [0, 0])[1] or 0)
+    pu[28] = np.uint32(_kt)   # 必须写 uint32 视图，否则 float32 会写成 8.0 → 位型 0x41000000
 
     pipe, pstat, pfin, pbs = _pipes(dev)
     bgl = pipe.get_bind_group_layout(0)
@@ -367,6 +404,9 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
             bR = sbuf(4)
             queue.write_buffer(bR, 0, np.zeros(4, np.float32).tobytes())
             rsz = 16
+        _ctn = max(1, (int(Ctiles.shape[1]) ** 2) if (Ctiles is not None and _kt >= 2) else 1)
+        bCt = sbuf(_ctn)
+        queue.write_buffer(bCt, 0, np.zeros(_ctn, np.float32).tobytes())
 
         # 环形模式下源缓冲只能容纳 1~2 帧，任何一趟要读 src 的 pass 都必须
         # 重新把逐帧数据传进来（否则那一趟只看到最后两帧，成品会周期性重复）。
@@ -412,6 +452,10 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                     p[15] = np.float32(np.log(max(float(C[int(j)]), 1e-6)))
                 if S is not None:
                     p[16] = np.float32(np.log(max(float(S[int(j)]), 1e-6)))
+                if _kt >= 2:
+                    _ct = np.log(np.maximum(
+                        np.asarray(Ctiles[int(j)], np.float32).ravel(), 1e-6)).astype(np.float32)
+                    queue.write_buffer(bCt, 0, _ct.tobytes())
                 tv = float(T[int(j)]) if T is not None else 1.0
                 p[23] = np.float32(float(fp) * float(np.log(max(tv, 1e-6))))
                 bQk = dev.create_buffer(size=128, usage=U.UNIFORM | U.COPY_DST)
@@ -434,6 +478,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                     {'binding': 7, 'resource': {'buffer': bSd, 'offset': 0, 'size': n_pix * 4}},
                     {'binding': 8, 'resource': {'buffer': aW2, 'offset': 0, 'size': n_pix * 4}},
                     {'binding': 9, 'resource': {'buffer': aBad, 'offset': 0, 'size': 8}},
+                    {'binding': 10, 'resource': {'buffer': bCt, 'offset': 0, 'size': _ctn * 4}},
                 ])
                 cp.set_pipeline(pipe)
                 cp.set_bind_group(0, bg)

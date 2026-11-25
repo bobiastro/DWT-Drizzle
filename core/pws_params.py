@@ -46,10 +46,6 @@ class PwsParams:
     # ---- 标准 ----
     A: float = 20.0
     rej_k: float = 3.5
-    local_snr: bool = False
-    local_snr_grid: int = 8
-    bg_tiles: bool = False
-    ln_xnml: bool = False
     snr_clip: float = 3.0
     detail_snr: float = 0.0
     limit: int = 0
@@ -104,7 +100,6 @@ class PwsParams:
     two_pass: int = 0
     cache: bool = True        # 复用跨运行的配准结果（素材/几何没变时跳过测位移）
     cache_dir: str = ''       # 空=用户目录/.dwt-cache；也可 DWT_CACHE_DIR
-    trail_line: str = ''      # 卫星线端点 "x0,y0,x1,y1"（成品坐标），空=不处理
 
     psf_target: float = 50.0
     rej_gate: float = 1 / 3
@@ -158,18 +153,6 @@ PARAMS: Tuple[Param, ...] = (
           '20 更锐但权重更集中；10 更干净；'
           '30 更锐：星点再细 0.1~0.3px，但天空噪声涨 6~7%、细节区等效帧数掉到 4 以下。',
           lo=1.0, hi=60.0, step=0.5, dec=1),
-    Param('local_snr', '局部噪声权重（逐帧×分块）', 'check', '高级',
-          '按每帧自己的背景梯度把视场分块估天空，亮格自动少用被月光/光害污染的帧',
-          '默认关。天空均匀时没用；有月晕、光害梯度、薄云不均匀时再开（本模式走 CPU 叠加）。'),
-    Param('local_snr_grid', '局部分块格数', 'int', '高级',
-          '网格边长：8 表示 8×8=64 块',
-          '默认 8。格太细会被星云结构污染，格太粗救不了局部污染；4~12 实用。'),
-    Param('bg_tiles', '实测块中位背景（LN 风格）', 'check', '高级',
-          '用每帧 32px 块中位测出的背景场代替一/二阶多项式，吃得住月光、薄云这类不规则大尺度梯度',
-          '默认关。多项式跟不上的强梯度/云影时开；平滑星云场别开（会把大尺度结构当背景减掉）。'),
-    Param('ln_xnml', '使用 WBPP 的 LN 模型（*.xnml）', 'check', '高级',
-          '读取 PI/WBPP 每帧的 LocalNormalization 模型（同名 .xnml），把该帧背景拉到参考帧水平',
-          '默认关。素材是 WBPP registered 且带 .xnml 时开；开了会自动关闭本程序的背景梯度拟合（bgdeg=0）。'),
     Param('snr_clip', '噪声离群限幅', 'float', '高级',
           'S 权重（按帧噪声逆方差）的限幅倍数，防止个别异常干净的帧独占权重',
           'S = σ_中位/σ_i 会被限在 [1/K, K]。K=3 表示单帧最多 9 倍权重；'
@@ -414,10 +397,6 @@ PARAMS: Tuple[Param, ...] = (
           choices=(('winsorized（推荐）', 'winsor'), ('中位绝对偏差（旧）', 'mad'),
                    ('平均绝对偏差（最快）', 'fast'), ('广义 ESD（Rosner）', 'esd'))),
 
-    Param('trail_line', '卫星线端点（x0,y0,x1,y1）', 'str', '高级',
-          '叠加完成后沿这条线段（±3px）用垂直邻域中值补掉，用来清掉排异也去不掉的卫星线',
-          '在成品坐标里量两个端点填进来，例如 4697,280,5170,4126；留空＝不做。'
-          '只改线段覆盖的像素，其余像素逐位不变。'),
     Param('cache', '复用配准缓存', 'bool', '高级',
           '把上次的帧间位移存起来；素材、裁剪、参考帧没变时第二次起直接复用',
           '同素材反复调 A / 排异 k / 吞吐权重时，读帧后那几步「测位移」纯属重复。'

@@ -68,7 +68,6 @@ for _p in (str(ROOT), str(_HERE)):
 from DWT_DetailCore import EXPTIME_REF, read_frame                      # noqa: E402
 from pws_params import PARAMS, PwsParams, cli_flag                      # noqa: E402
 import bggrad
-import xnml
 import cropcover                                                          # noqa: E402
 try:                                                                   # noqa: E402
     import matchref
@@ -857,7 +856,7 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
                    limit: Optional[int] = None, frames_dir: str = '',
                    mem_frac: float = 0.55, keep_frames: bool = False,
                    bgdeg: int = 0, bg_r: int = 0, star_n: int = 0,
-                   bg_tiles: int = 0, ln_xnml: int = 0) -> FrameSet:
+                   ) -> FrameSet:
     """读帧 → 裁剪 → float32 → **曝光归一**（×EXPTIME_REF/t_i），
     同时逐帧量天空中位与噪声尺度；按内存预算自动决定驻留还是落 memmap。
 
@@ -963,7 +962,7 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
     _ln_bad = [0]
     _ln_miss = [0]
     try:
-        if nw > 1 and not int(ln_xnml or 0):
+        if nw > 1:
             fs.metas = [None] * n
             fs.names = [Path(str(f)).name for f in files]
             ex = ProcessPoolExecutor(max_workers=nw, initializer=ini_rw,
@@ -1002,7 +1001,7 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
                     d = _cfa.plane(d, _CFA['pattern'], _CFA['ch'])
                 if _ROWFPN:
                     _strip_rowfpn(d)
-                if int(ln_xnml or 0):
+                if False:  # [removed]
                     _xn = xnml.sibling_path(str(f))
                     if os.path.exists(_xn):
                         _fld = xnml.load_fields(_xn)
@@ -1046,7 +1045,7 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
         fs.close(keep=keep_frames)
         raise
 
-    if int(ln_xnml or 0):
+    if False:  # [removed]
         log(f'[LN] WBPP 本地归一化：已应用 {_ln_ok[0]} 帧（乘 Scale + 加 ZeroOffset，'
             f'网格双线性插值），缺 .xnml {_ln_miss[0]} 帧，解析失败 {_ln_bad[0]} 帧')
         if _ln_ok[0] == 0:
@@ -1077,7 +1076,7 @@ def prepare_frames(frames: List[Path], label: str, crop: int,
         else:
             log('[背景] 梯度拟合不可用（块数不足），按不校正处理')
     # ---- 实测块中位背景场（--bg-tiles 1）：比多项式更贴不规则梯度 ----
-    if int(bg_tiles or 0) and bg_grids is not None:
+    if False:  # [removed]
         try:
             from scipy.ndimage import gaussian_filter as _gf
             _G = [g for g in bg_grids if g is not None]
@@ -3230,11 +3229,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     else:
         fs = prepare_frames(frames, ';'.join(str(s) for s in sources), crop, center,
                             limit, frames_dir, keep_frames=keep_frames,
-                            bgdeg=(0 if _flag(getattr(p, 'ln_xnml', False))
-                                   else int(getattr(p, 'bgdeg', 1) or 0)),
-                            bg_r=int(getattr(p, 'bg_r', 0) or 0),
-                            bg_tiles=int(_flag(getattr(p, 'bg_tiles', False))),
-                            ln_xnml=int(_flag(getattr(p, 'ln_xnml', False))))
+                            bgdeg=int(getattr(p, 'bgdeg', 1) or 0),
+                            bg_r=int(getattr(p, 'bg_r', 0) or 0))
         if _CFA.get('pattern'):
             fs._shared = True
         _FS_CACHE[_ck] = fs
@@ -3284,20 +3280,6 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     # 用每帧自己的背景梯度模型估每格天空，再按散粒噪声把 σ 缩放到该格，
     # 得到 S_i(cell) = median_i σ_i(cell)/σ_i(cell)：亮格自动少用被污染的帧。
     _S_field = None
-    if _flag(getattr(p, 'local_snr', 0)):
-        try:
-            import sigma_field as _sf
-            _S_field, _sinfo = _sf.weight_field(
-                fs, sig, gh=int(getattr(p, 'local_snr_grid', 8) or 8),
-                gw=int(getattr(p, 'local_snr_grid', 8) or 8),
-                clip_k=float(_k_clip or 3.0))
-            log(f'[局部权重] 天空 {_sinfo["sky_min"]:.3g}~{_sinfo["sky_max"]:.3g}'
-                f'（{_sinfo["sky_ratio"]:.2f}×），S 场 {_sinfo["S_min"]:.3f}~{_sinfo["S_max"]:.3f}'
-                f'（中位 {_sinfo["S_med"]:.3f}）；{_S_field.shape[1]}×{_S_field.shape[2]} 格，'
-                f'暗处被月光抬高的帧会自动降权（本模式走 CPU 叠加）')
-        except Exception as _e:
-            _S_field = None
-            log(f'[局部权重] 构建失败，退回全局 S（不影响本次）：{_e}')
     sig_out = sig * scale_out          # 展示与落盘量纲 = 成品量纲（内部仍用 sig 算比值）
     log(f'[S] 单帧信噪比权重（σ_中位/σ_i）{S.min():.3f}~{S.max():.3f}  中位 {np.median(S):.3f}')
     log(f'[σ] 逐帧噪声 {sig_out.min():.4e}~{sig_out.max():.4e}'
@@ -4365,13 +4347,6 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             log('[GPU] 选项「只用 GPU（CUDA）」已随 CuPy 移除，改按 wgpu 处理')
             _gpu_sel = 'wgpu'
         _env_wgpu = os.environ.get('DWT_GPU_WGPU', '').strip()
-        _wcap_sel = float(getattr(p, 'max_share', 0.0) or 0.0)
-        if _wcap_sel > 0:
-            log('[W] 单帧份额上限 %.0f%%：GPU 内核的权重在着色器里算，'
-                '本次 drizzle 改走 CPU 以应用上限（想要 GPU 速度就把它设 0）'
-                % (_wcap_sel * 100.0))
-            globals()['_WCAP_FORCE_CPU'] = True
-            _env_wgpu = '0'
         _want_wgpu = (_env_wgpu == '1') or (_gpu_sel == 'wgpu') or (
             _gpu_sel == 'auto' and _env_wgpu != '0')
         _wgpu_ok = False
@@ -4551,7 +4526,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 if not _cupy_first:
                     try:
                         import gpu_wgpu_cfa_fatom as _wmod
-                        if _wmod.available() and not globals().get('_WCAP_FORCE_CPU', False):
+                        if _wmod.available():
                             log('[drizzle] 叠加走 GPU（wgpu）：整张画布')
                             _r = _wmod.stack_cfa_fatom(
                                 fs, C, S, dx, dy, th, kk, drz_plan, A, B,
@@ -4562,6 +4537,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 pattern=None, channel=None,
                                 # 黑白素材永远不用满月帧补偿；显式传 0 以杜绝环境变量串味
                                 beta=float(_detail_beta(p)),
+                                cap=float(getattr(p, 'max_share', 0.0) or 0.0),
                                 # 逐瓦片清晰度（可选）：让每个区域各自挑最锐的帧
                                 Ctiles=C_tiles)
                             try:
@@ -4774,13 +4750,6 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
     log(f'[叠加] N_eff 中位 {np.median(neff):.2f}/{n}  '
         f'P10 {np.percentile(neff, 10):.2f}  最小 {neff.min():.2f}')
-
-    # ---- 卫星线：实测垂直偏移 + 精确替换（成品坐标）----
-    # 排异是「逐像素少数派」判据：卫星线若在几乎每一帧里都落在同一批像素上，
-    # 它就成了该像素的多数派，任何 k 都留。这里按端点找到线，**先测出它的
-    # 垂直偏移与幅度**，再只用两侧干净样本替换这条 2 px 带——替换范围之外的
-    # 像素一个都不动，日志写出实测幅度，便于判断是否值得处理。
-    _tl = str(getattr(p, 'trail_line', '') or '').strip()
     if _tl:
         try:
             _v = [float(x) for x in _tl.replace('，', ',').split(',')]
