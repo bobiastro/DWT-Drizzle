@@ -1760,7 +1760,7 @@ def build_r_field(sref: np.ndarray, sigma_psf: float,
 
 def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
                   A: float, B: float, T=None, fp: float = 0.0,
-                  beta: float = 0.0) -> np.ndarray:
+                  beta: float = 0.0, cap: float = 0.0) -> np.ndarray:
     """W[i,r] = C_i^(A·R_r) · S_i^(B·(1−R_r))，并逐像素归一使 mean_i(W) = 1
 
     融合式的形状选择依据（式 6、式 7）：
@@ -1792,7 +1792,15 @@ def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
     # 帧质量相近时，逐帧权重估计本身带噪声，过度加权会降低有效帧数、反而抬高噪声；
     # 把它做成可调量，才谈得上"用多少权重"的实验，而不是写死。
     _gr = float(os.environ.get('DWT_WGAMMA', '') or 1.0)
-    W = np.exp(_gr * (a * lc + b * ls + fp * lt))
+    # 单帧份额上限：细节区的 C^A 会让某一帧独占绝大部分权重，此时该帧的
+    # 缺陷（卫星线/宇宙线）不是"少数派"而是"多数派"，逐像素排异按定义抓不到。
+    # 做法：把 A·lnC 截到 ±L，使最大/最小权重比 ≤ ((n-1)·cap/(1-cap))，
+    # 从而任一帧的份额 ≤ cap。cap=0 关闭（保持旧行为）。
+    _alc = a * lc
+    if cap and 0.0 < cap < 1.0 and n > 1:
+        _L = float(np.log(max((n - 1) * cap / (1.0 - cap), 1e-9)))
+        _alc = np.clip(_alc, -_L, _L)
+    W = np.exp(_gr * (_alc + b * ls + fp * lt))
     W /= np.maximum(W.mean(axis=0), 1e-30)[None]
     return W.astype(np.float32)
 
@@ -2036,8 +2044,8 @@ def _task_trail(job) -> Tuple[int, float, float]:
 
 def _task_strip(job):
     """一条带的权重 + 排异 + 加权平均（与串行的三段调用完全同序同式）"""
-    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp, beta, sig = job
-    W = strip_weights(C, S, Rr, A, B, T=T, fp=fp, beta=float(beta))
+    y0, y1, Rr, C, S, A, B, rej_k, sky0, rej_gate, T, fp, beta, sig, wcap = job
+    W = strip_weights(C, S, Rr, A, B, T=T, fp=fp, beta=float(beta), cap=float(wcap))
     mm, off = _MEM['mm'], _MEM['off']
     D = np.stack([mm[i, y0:y1] - np.float32(off[i]) for i in range(len(C))])
     s, ne, rr = stack_strip(D, W, Rr, sky0, rej_k=rej_k, rej_max_frac=rej_gate,
@@ -4357,6 +4365,13 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             log('[GPU] 选项「只用 GPU（CUDA）」已随 CuPy 移除，改按 wgpu 处理')
             _gpu_sel = 'wgpu'
         _env_wgpu = os.environ.get('DWT_GPU_WGPU', '').strip()
+        _wcap_sel = float(getattr(p, 'max_share', 0.0) or 0.0)
+        if _wcap_sel > 0:
+            log('[W] 单帧份额上限 %.0f%%：GPU 内核的权重在着色器里算，'
+                '本次 drizzle 改走 CPU 以应用上限（想要 GPU 速度就把它设 0）'
+                % (_wcap_sel * 100.0))
+            globals()['_WCAP_FORCE_CPU'] = True
+            _env_wgpu = '0'
         _want_wgpu = (_env_wgpu == '1') or (_gpu_sel == 'wgpu') or (
             _gpu_sel == 'auto' and _env_wgpu != '0')
         _wgpu_ok = False
@@ -4536,7 +4551,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 if not _cupy_first:
                     try:
                         import gpu_wgpu_cfa_fatom as _wmod
-                        if _wmod.available():
+                        if _wmod.available() and not globals().get('_WCAP_FORCE_CPU', False):
                             log('[drizzle] 叠加走 GPU（wgpu）：整张画布')
                             _r = _wmod.stack_cfa_fatom(
                                 fs, C, S, dx, dy, th, kk, drz_plan, A, B,
@@ -4666,7 +4681,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     jobs = ((y0, min(h, y0 + strip), R[y0:y0 + strip],
                              band_cfield(C, C_tiles, y0, min(h, y0 + strip), h, w), S, A, B, rej_k,
                              fs.sky0, rej_gate, T, fp, _beta_st,
-                             (fs.sigma if bool(getattr(p, 'rej_z', False)) else None))
+                             (fs.sigma if bool(getattr(p, 'rej_z', False)) else None),
+                             float(getattr(p, 'max_share', 0.0) or 0.0))
                             for y0 in range(0, h, strip))
                     for k, (s, ne, rr, wm) in enumerate(ex.map(_task_strip, jobs, chunksize=1)):
                         _check_cancel()
@@ -4694,9 +4710,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     y1 = min(h, y0 + strip)
                     _beta = _detail_beta(p)
                     _rej_z = bool(getattr(p, 'rej_z', False))
+                    _wcap = float(getattr(p, 'max_share', 0.0) or 0.0)
                     if _S_field is None or _sf_mod is None:
                         W = strip_weights(band_cfield(C, C_tiles, y0, y1, h, w),
-                                          S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta)
+                                          S, R[y0:y1], A, B, T=T, fp=fp, beta=_beta, cap=_wcap)
                         D = fs.stack_strips(y0, y1)
                         s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,
                                                 rej_max_frac=rej_gate,
@@ -4721,7 +4738,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                             S_c = rows.mean(axis=1)[:, cx]
                             W = strip_weights(
                                 band_cfield(C, C_tiles, y0, y1, h, w)[..., x0:x1],
-                                S_c, R[y0:y1, x0:x1], A, B, T=T, fp=fp, beta=_beta)
+                                S_c, R[y0:y1, x0:x1], A, B, T=T, fp=fp, beta=_beta, cap=_wcap)
                             if D_full is None:
                                 D_full = fs.stack_strips(y0, y1)
                             s, ne, rr = stack_strip(D_full[:, :, x0:x1], W,
@@ -4758,11 +4775,11 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     log(f'[叠加] N_eff 中位 {np.median(neff):.2f}/{n}  '
         f'P10 {np.percentile(neff, 10):.2f}  最小 {neff.min():.2f}')
 
-    # ---- 卫星线手工掩膜（成品坐标）----
-    # 排异是「逐像素少数派」判据：卫星线若在很多帧里落在同一批像素上（慢速目标、
-    # 或与星芒重叠），它就成了该像素的多数派，怎么调 k 都留。这里给一个精确的出口：
-    # 用户量出线的两个端点，只把这条线段（±3 px）用垂直邻域中值补掉——
-    # 覆盖之外一个像素都不动，代价仅这条线本身。
+    # ---- 卫星线：实测垂直偏移 + 精确替换（成品坐标）----
+    # 排异是「逐像素少数派」判据：卫星线若在几乎每一帧里都落在同一批像素上，
+    # 它就成了该像素的多数派，任何 k 都留。这里按端点找到线，**先测出它的
+    # 垂直偏移与幅度**，再只用两侧干净样本替换这条 2 px 带——替换范围之外的
+    # 像素一个都不动，日志写出实测幅度，便于判断是否值得处理。
     _tl = str(getattr(p, 'trail_line', '') or '').strip()
     if _tl:
         try:
@@ -4770,29 +4787,41 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             if len(_v) != 4:
                 raise ValueError('需要 4 个数：x0,y0,x1,y1')
             _ax, _ay, _bx, _by = [int(round(x)) for x in _v]
+            from scipy.ndimage import median_filter as _mf
             _H, _W = Stk.shape[:2]
             _L = int(max(1.0, np.hypot(_bx - _ax, _by - _ay)))
             _ux, _uy = (_bx - _ax) / _L, (_by - _ay) / _L
             _px, _py = -_uy, _ux
-            _tt = np.arange(0, _L, 0.4)
-            _cx = _ax + _tt * _ux
-            _cy = _ay + _tt * _uy
-            for _k in (-3, -2, -1, 0, 1, 2, 3):
-                for _x, _y in zip(_cx, _cy):
-                    _samp = []
-                    for _d in (10, 12, 14, 18):
+            _hp = Stk - _mf(Stk, 9)
+            _sd = 1.4826 * float(np.median(np.abs(_hp - np.median(_hp))))
+            _ts = np.arange(60, max(61, _L - 60), 1.0)
+            _best = (-1e9, 0)
+            for _d in range(-8, 9):
+                _xs = np.clip((_ax + _ts * _ux + _px * _d).astype(int), 0, _W - 1)
+                _ys = np.clip((_ay + _ts * _uy + _py * _d).astype(int), 0, _H - 1)
+                _v2 = float(np.median(_hp[_ys, _xs]))
+                if _v2 > _best[0]:
+                    _best = (_v2, _d)
+            _amp = _best[0] / max(_sd, 1e-12)
+            _d0 = _best[1]
+            for _k in range(_d0 - 2, _d0 + 3):
+                for _t in np.arange(0, _L, 0.5):
+                    _cx, _cy = _ax + _t * _ux, _ay + _t * _uy
+                    _s = []
+                    for _dd in (6, 8, 10, 14):
                         for _sg in (-1, 1):
-                            _xa = int(round(_x + _px * (_k + _sg * _d)))
-                            _ya = int(round(_y + _py * (_k + _sg * _d)))
+                            _xa = int(round(_cx + _px * (_k + _sg * _dd)))
+                            _ya = int(round(_cy + _py * (_k + _sg * _dd)))
                             if 0 <= _ya < _H and 0 <= _xa < _W:
-                                _samp.append(Stk[_ya, _xa])
-                    _xi = int(round(_x + _px * _k))
-                    _yi = int(round(_y + _py * _k))
-                    if _samp and 0 <= _yi < _H and 0 <= _xi < _W:
-                        Stk[_yi, _xi] = float(np.median(_samp))
-            log(f'[卫星线] 已按端点 ({_ax},{_ay})-({_bx},{_by}) 补掉 ±3px 线带（垂直邻域中值，其余像素未动）')
+                                _s.append(Stk[_ya, _xa])
+                    _xi = int(round(_cx + _px * _k))
+                    _yi = int(round(_cy + _py * _k))
+                    if _s and 0 <= _yi < _H and 0 <= _xi < _W:
+                        Stk[_yi, _xi] = float(np.median(_s))
+            log(f'[卫星线] 实测垂直偏移 {_d0:+d}px、幅度 {_amp:.2f}σ；'
+                f'已把该带 ±2px 用两侧 6–14px 邻域中值替换，其余像素未动')
         except Exception as _e:
-            log(f'[卫星线] 端点解析失败（{_e}），跳过；格式示例：4697,280,5170,4126')
+            log(f'[卫星线] 端点解析失败（{_e}），跳过；格式示例：1893,1,2757,2027')
 
     # 分区分读：细节区 vs 朦胧区的 N_eff 与噪声
     det = R > 0.5
