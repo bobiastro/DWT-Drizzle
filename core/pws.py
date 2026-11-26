@@ -4750,48 +4750,6 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
     log(f'[叠加] N_eff 中位 {np.median(neff):.2f}/{n}  '
         f'P10 {np.percentile(neff, 10):.2f}  最小 {neff.min():.2f}')
-    if _tl:
-        try:
-            _v = [float(x) for x in _tl.replace('，', ',').split(',')]
-            if len(_v) != 4:
-                raise ValueError('需要 4 个数：x0,y0,x1,y1')
-            _ax, _ay, _bx, _by = [int(round(x)) for x in _v]
-            from scipy.ndimage import median_filter as _mf
-            _H, _W = Stk.shape[:2]
-            _L = int(max(1.0, np.hypot(_bx - _ax, _by - _ay)))
-            _ux, _uy = (_bx - _ax) / _L, (_by - _ay) / _L
-            _px, _py = -_uy, _ux
-            _hp = Stk - _mf(Stk, 9)
-            _sd = 1.4826 * float(np.median(np.abs(_hp - np.median(_hp))))
-            _ts = np.arange(60, max(61, _L - 60), 1.0)
-            _best = (-1e9, 0)
-            for _d in range(-8, 9):
-                _xs = np.clip((_ax + _ts * _ux + _px * _d).astype(int), 0, _W - 1)
-                _ys = np.clip((_ay + _ts * _uy + _py * _d).astype(int), 0, _H - 1)
-                _v2 = float(np.median(_hp[_ys, _xs]))
-                if _v2 > _best[0]:
-                    _best = (_v2, _d)
-            _amp = _best[0] / max(_sd, 1e-12)
-            _d0 = _best[1]
-            for _k in range(_d0 - 2, _d0 + 3):
-                for _t in np.arange(0, _L, 0.5):
-                    _cx, _cy = _ax + _t * _ux, _ay + _t * _uy
-                    _s = []
-                    for _dd in (6, 8, 10, 14):
-                        for _sg in (-1, 1):
-                            _xa = int(round(_cx + _px * (_k + _sg * _dd)))
-                            _ya = int(round(_cy + _py * (_k + _sg * _dd)))
-                            if 0 <= _ya < _H and 0 <= _xa < _W:
-                                _s.append(Stk[_ya, _xa])
-                    _xi = int(round(_cx + _px * _k))
-                    _yi = int(round(_cy + _py * _k))
-                    if _s and 0 <= _yi < _H and 0 <= _xi < _W:
-                        Stk[_yi, _xi] = float(np.median(_s))
-            log(f'[卫星线] 实测垂直偏移 {_d0:+d}px、幅度 {_amp:.2f}σ；'
-                f'已把该带 ±2px 用两侧 6–14px 邻域中值替换，其余像素未动')
-        except Exception as _e:
-            log(f'[卫星线] 端点解析失败（{_e}），跳过；格式示例：1893,1,2757,2027')
-
     # 分区分读：细节区 vs 朦胧区的 N_eff 与噪声
     det = R > 0.5
     amb = R < 0.1
