@@ -47,6 +47,8 @@ struct Args {
     beta: f32,
     max_share: f32,
     aligned: bool,
+    register: Option<bool>,
+    canvas_from: Option<String>,
     rej_k: f32,
     star_grow: f32,
     r_floor: f32,
@@ -58,6 +60,8 @@ struct Args {
     dump_w: Option<String>,
     weights_from: Option<String>,
     seed_frame: Option<usize>,
+    ref_frame: Option<usize>,
+    geom: Option<String>,
     fixed_probe: bool,
     per_frame_stars: bool,
     fwhm_search: usize,
@@ -85,6 +89,8 @@ impl Default for Args {
             beta: 0.0,
             max_share: MAX_SHARE,
             aligned: true,
+            register: None,
+            canvas_from: None,
             rej_k: REJ_K,
             star_grow: 100.0,
             r_floor: 0.0,
@@ -97,6 +103,8 @@ impl Default for Args {
             weights_from: None,
 
             seed_frame: None,
+            ref_frame: None,
+            geom: None,
             fixed_probe: false,
             per_frame_stars: false,
             fwhm_search: 8,
@@ -195,6 +203,14 @@ fn parse_args() -> Result<Args, String> {
                 a.max_share = num(val()?, flag)? as f32;
                 i += 2;
             }
+            "--register" => {
+                a.register = Some(if has_val() { num(val()?, flag)? != 0.0 } else { true });
+                i += if has_val() { 2 } else { 1 };
+            }
+            "--canvas-from" => {
+                a.canvas_from = Some(val()?.to_string());
+                i += 2;
+            }
             "--aligned" => {
                 a.aligned = num(val()?, flag)? != 0.0;
                 i += 2;
@@ -225,6 +241,14 @@ fn parse_args() -> Result<Args, String> {
             }
             "--fixed-probe" => {
                 a.fixed_probe = num(val()?, flag)? != 0.0;
+                i += 2;
+            }
+            "--geom" => {
+                a.geom = Some(val()?.to_string());
+                i += 2;
+            }
+            "--ref-frame" => {
+                a.ref_frame = Some(val()?.parse().map_err(|_| "bad --ref-frame".to_string())?);
                 i += 2;
             }
             "--seed-frame" => {
@@ -485,7 +509,7 @@ fn run() -> Result<(), String> {
     // positions are then reused for every frame with a fixed window, so an
     // un-registered dither shows up as PSF blur -- we reproduce that on purpose
     // so the C weights can be compared like for like.
-    let probe = match a.seed_frame {
+    let probe = match a.ref_frame.or(a.seed_frame) {
         Some(i) => i.min(frames.len() - 1),
         None => {
             let mut best = (0usize, 0usize);
@@ -516,6 +540,90 @@ fn run() -> Result<(), String> {
             fwhms.push(measure_fwhm_search(f, &stars, 16, a.fwhm_search));
         }
     }
+    // ---- frame-to-frame registration --------------------------------------
+    // Python's `measure_shifts` (core/drizzle.py) detects stars on every frame,
+    // votes for the translation, then refines a similarity fit.  Same here.
+    let canvas: Option<(usize, usize)> = match &a.canvas_from {
+        Some(p) => {
+            let (m, im) = dwt_rs::xisf::read_xisf(std::path::Path::new(p))
+                .map_err(|e| format!("--canvas-from {p}: {e}"))?;
+            println!("[画布] 参考 {p}  {}x{}", im.w, im.h);
+            let _ = m;
+            Some((im.w, im.h))
+        }
+        None => None,
+    };
+    let register = match a.register {
+        Some(v) => v,
+        None => !a.aligned,
+    };
+    let mut sims: Vec<dwt_rs::register::Sim> = vec![dwt_rs::register::Sim::identity(); frames.len()];
+    if register {
+        let t = Instant::now();
+        let refc = dwt_rs::register::centroids(&frames[probe], &stars, 8);
+        for (i, f) in frames.iter().enumerate() {
+            if i == probe {
+                continue;
+            }
+            let own = build_star_table(f, 120, 26, 25.0);
+            let c = dwt_rs::register::centroids(f, &own, 8);
+            match dwt_rs::register::estimate(&refc, &c, 64.0) {
+                Some(s) => {
+                    println!(
+                        "[配准] 帧{i}  dx={:+.2} dy={:+.2} rot={:+.3}deg k={:.5} 匹配{} rms={:.2}px",
+                        s.ux, s.uy, s.theta, s.k, s.n, s.rms
+                    );
+                    sims[i] = s;
+                }
+                None => println!("[配准] 帧{i} 匹配失败，退回恒等变换"),
+            }
+        }
+        // Everything was solved relative to the probe frame; rebase onto the
+        // requested reference frame (Python's `measure_shifts(ref=...)`).
+        let r = probe;
+        if !sims[r].is_identity() {
+            let inv = sims[r].inverse();
+            for s in sims.iter_mut() {
+                *s = s.compose(&inv);
+            }
+        }
+        let tmax = sims.iter().map(|s| s.theta.abs()).fold(0.0f32, f32::max);
+        let kmax = sims.iter().map(|s| (s.k - 1.0).abs()).fold(0.0f32, f32::max);
+        println!(
+            "[配准] {} 帧  最大旋转 {tmax:.3}deg  最大尺度偏差 {kmax:.2}  用时 {:.2}s",
+            frames.len(),
+            t.elapsed().as_secs_f32()
+        );
+        if tmax > 0.5 {
+            return Err(format!("旋转 {tmax:.3}deg 超过 0.5deg，与 --canvas-from 的几何不一致，拒绝出图"));
+        }
+        if kmax > 0.01 {
+            return Err(format!("尺度偏差 {kmax:.4} 超过 1%，拒绝出图"));
+        }
+    }
+
+    // --geom: reuse an externally solved registration (used to attribute a parity
+    // difference to the registration solution versus the rest of the pipeline).
+    if let Some(p) = &a.geom {
+        let txt = std::fs::read_to_string(p).map_err(|e| format!("--geom {p}: {e}"))?;
+        for line in txt.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 5 || f[0].starts_with('#') {
+                continue;
+            }
+            let i: usize = f[0].parse().map_err(|_| "bad --geom index".to_string())?;
+            if i >= sims.len() {
+                continue;
+            }
+            let dx: f32 = f[1].parse().map_err(|_| "bad dx".to_string())?;
+            let dy: f32 = f[2].parse().map_err(|_| "bad dy".to_string())?;
+            let th: f32 = f[3].parse().map_err(|_| "bad theta".to_string())?;
+            let k: f32 = f[4].parse().map_err(|_| "bad k".to_string())?;
+            sims[i] = dwt_rs::register::Sim { ux: -dx, uy: -dy, theta: th, k, rms: 0.0, n: 0 };
+        }
+        println!("[配准] 使用外部解（--geom {p}）");
+    }
+
     // Python builds the reference from the k *sharpest* frames only
     // (core/pws.py:4245: k = max(1, min(refn=8, n)); idx = argsort(fwhms)[:k]).
     // Taking a median over every frame instead would blur the dithered PSF cores.
@@ -647,7 +755,8 @@ fn run() -> Result<(), String> {
     // drizzle is used only when it would actually change the grid (same rule as
     // the Python side: already-aligned frames at scale<=1 skip drizzle entirely,
     // unless --drizzle-force asks for it explicitly)
-    let drz = a.drizzle && (a.force_drizzle || a.dscale > 1.001);
+    let register = register || a.geom.is_some();
+    let drz = register || (a.drizzle && (a.force_drizzle || a.dscale > 1.001));
     let mut wts = wts;
 
     // -- micro-benchmark of the CPU combine only (used for the GPU speedup table)
@@ -673,7 +782,10 @@ fn run() -> Result<(), String> {
     // For the plain weighted-mean case the canvas is identity (margin 0), so the
     // GPU gather reproduces `stack_strip` pixel for pixel.
     let margin = if drz { 1.0 } else { 0.0 };
-    let gpu_out: Option<(Img, Vec<f32>)> = if a.gpu != "off" && dwt_rs::gpu::available() {
+    if register && a.gpu != "off" {
+        println!("[GPU] 配准路径走 CPU（wgpu kernel 目前只支持平移）");
+    }
+    let gpu_out: Option<(Img, Vec<f32>)> = if !register && a.gpu != "off" && dwt_rs::gpu::available() {
         let dx = vec![0.0f32; frames.len()];
         let dy = vec![0.0f32; frames.len()];
         let scale = if drz { a.dscale } else { 1.0 };
@@ -730,13 +842,29 @@ fn run() -> Result<(), String> {
         );
         let dx = vec![0.0f32; frames.len()];
         let dy = vec![0.0f32; frames.len()];
-        let plan = Plan::new(w, h, &dx, &dy, a.dscale, 1.0);
+        if std::env::var("DWT_RS_DEBUG").is_ok() {
+            for (i, s) in sims.iter().enumerate() {
+                eprintln!("[dbg] sim{i} ux={:.4} uy={:.4} th={:.5} k={:.6}", s.ux, s.uy, s.theta, s.k);
+            }
+            eprintln!("[dbg] bbox from w={} h={}", w, h);
+        }
+        let plan = if register {
+            Plan::new_sim(w, h, &sims, a.dscale, 1.0, canvas)
+        } else {
+            Plan::new(w, h, &dx, &dy, a.dscale, 1.0)
+        };
+        if let Some((cw, ch)) = canvas {
+            if plan.w != cw || plan.h != ch {
+                return Err(format!("画布 {}x{} 与本进程 {}x{} 不一致", cw, ch, plan.w, plan.h));
+            }
+        }
         let mut acc = Acc::new(plan);
         for i in 0..frames.len() {
-            drizzle_add(&mut acc, &frames[i], 0.0, 0.0, a.dpix, &wts[i].d);
+            let s = sims[i];
+            drizzle_add(&mut acc, &frames[i], s.ux, s.uy, s.theta, s.k, a.dpix, &wts[i].d);
         }
         let img = acc.finish();
-        println!("[drizzle] 输出 {}x{}  scale={} pixfrac={}", img.w, img.h, a.dscale, a.dpix);
+        println!("[drizzle] 输出 {}x{}  scale={} pixfrac={}  ox={} oy={}", img.w, img.h, a.dscale, a.dpix, plan.ox, plan.oy);
         (img, Vec::new(), rate)
     } else {
         let res = stack_strip(

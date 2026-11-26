@@ -124,14 +124,60 @@ One-off GPU start-up is ~1.12 s (0.27 s device init + 0.85 s shader/pipeline
 setup), so a single 400² run is still faster on the CPU; end-to-end at 1600² the
 GPU run takes 8.83 s vs 18.30 s on the CPU.
 
+## Registration and `--canvas-from` (un-aligned input)
+
+`--aligned 0` (the default) turns on frame-to-frame registration:
+`register.rs` measures sub-pixel centroids on a shared seed star table, votes for
+a translation, then refines a similarity `q = k*R(theta)*p + u` (Umeyama) over
+the matched pairs, and `drizzle.rs::Plan::new_sim` builds the output canvas from
+the rotated corner union exactly like `core/drizzle.py::plan_output_rot`.
+
+```
+dwt-rs --photos <dir> --out <dir> --limit 8 --crop 0 --pick O --A 6        --aligned 0 --ref-frame 7 --canvas-from <reference>.xisf --drizzle-scale 1
+```
+
+`--canvas-from` forces the reference image's W/H (and refuses to emit when the
+solved rotation exceeds 0.5 deg or the scale deviates by more than 1%).
+`--geom <txt>` injects an externally solved `idx dx dy theta k` table, which is
+what the parity attribution below uses to separate the registration solution
+from the rest of the pipeline.
+
+Measured against `G:/HFG1-3/pyf/PWS_pyf.xisf` (8 frames, 2783x2228, sky
+5.64e-3, sky noise 1.15e-4):
+
+| pair | all pixels corr | rms | background (99.8%) rms | star cores (0.16%) rms |
+|---|---|---|---|---|
+| Python rerun vs reference | 0.99941 | 2.04e-04 | 1.26e-04 (2.24% sky) | 3.92e-03 |
+| dwt-rs, `--geom` (Python's solution) | 0.99551 | 6.07e-04 | 1.01e-04 (1.79% sky) | 1.06e-02 |
+| dwt-rs, own registration | 0.99323 | 7.33e-04 | - | - |
+| dwt-rs `--A 0 --B 0` vs Python `--A 0 --B 0` | 0.99776 | 4.57e-04 | 8.92e-05 (1.58% sky) | 1.10e-02 |
+
+Attribution of the residual (each row is a real run, not a model):
+
+1. registration solution - **eliminated**: with `--geom` the fitted residual is
+   `rot -0.0000 deg, k 0.999992, shift (0.01, -0.02) px`; our own solution
+   reproduces Python's within 0.1 px / 0.002 deg per frame.
+2. C table (per-frame FWHM) - **eliminated**: injecting
+   `PWS_pyf_weights.txt` moves corr from 0.997878 to 0.997848.
+3. S table (per-frame sigma) - **eliminated**: same injection (it carries S).
+4. drizzle sampling - **this is the remaining term**: switching the weights off
+   entirely (`--A 0 --B 0` on both sides) leaves the same residual (0.99776),
+   and the difference is concentrated on star cores (rms 1.1e-2 on 0.16% of
+   pixels) while the background agrees to 1.58-1.79% of sky, i.e. below one sky
+   noise sigma.
+
+Note the acceptance bar `max|d| <= 3 * sky_noise = 3.5e-4` is not reachable even
+by Python against itself: its own rerun peaks at `7.17e-02` on a saturated core.
+
 ## Tests
 
-`cargo test --release -p dwt-rs` → 10 passed:
+`cargo test --release -p dwt-rs` → 11 passed:
 
 `weights_plain_formula`, `weights_r_mix`, `weights_cap_limits_share`,
 `reject_single_outlier`, `reject_disabled`, `drizzle_point_source_scale2`,
 `drizzle_known_shift`, `drizzle_scatter_equals_gather`, `xisf_roundtrip`,
-`gpu_matches_cpu_stack` (skipped automatically when no adapter exists).
+`gpu_matches_cpu_stack` (skipped automatically when no adapter exists),
+`register::tests::recovers_known_similarity`.
 
 ## Known limits
 
@@ -140,5 +186,5 @@ GPU run takes 8.83 s vs 18.30 s on the CPU.
   image, the R field and the rejection on the *output* grid (its `σ_psf`
   doubles: 9.35 px vs 0.57 px). dwt-rs keeps weights/R/rejection on the input
   crop grid and drizzles the result. At ×1 the two agree bit-exactly.
-* Mono only (no CFA/OSC), no registration (input is assumed aligned, as with
-  `--aligned 1`).
+* Mono only (no CFA/OSC).  Registration exists (`--aligned 0`) but the GPU
+  kernels only cover the translation case; the rotation path runs on the CPU.

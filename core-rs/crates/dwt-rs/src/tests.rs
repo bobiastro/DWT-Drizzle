@@ -110,7 +110,7 @@ fn drizzle_point_source_scale2() {
     let mut wmap = vec![0.0f32; 16 * 16];
     wmap[8 * 16 + 8] = 1.0;
     let mut acc = Acc::new(plan);
-    drizzle_add(&mut acc, &f, 0.0, 0.0, 1.0, &wmap);
+    drizzle_add(&mut acc, &f, 0.0, 0.0, 0.0, 1.0, 1.0, &wmap);
     let out = acc.finish();
     // input centre 8.5 -> X = 2*(8.5+0) + 2 = 19. Output pixel i spans [i, i+1),
     // so X=19 sits exactly on the boundary between pixels 18 and 19: the 2x2 drop
@@ -144,7 +144,7 @@ fn drizzle_scatter_equals_gather() {
     let plan = Plan::new(12, 12, &[0.3], &[-0.2], 2.0, 1.0);
     let mut a = Acc::new(plan);
     let mut b = Acc::new(plan);
-    drizzle_add(&mut a, &f, 0.3, -0.2, 1.0, &wmap);
+    drizzle_add(&mut a, &f, 0.3, -0.2, 0.0, 1.0, 1.0, &wmap);
     drizzle_add_gather(&mut b, &f, 0.3, -0.2, 1.0, &wmap);
     assert_eq!(a.num.len(), b.num.len());
     for i in 0..a.num.len() {
@@ -165,7 +165,7 @@ fn drizzle_known_shift() {
     let plan = Plan::new(16, 16, &[0.0, 2.0, -3.0], &[0.0], 1.0, 1.0);
     let peak = |ux: f32| -> (usize, usize) {
         let mut acc = Acc::new(plan);
-        drizzle_add(&mut acc, &f, ux, 0.0, 1.0, &wmap);
+        drizzle_add(&mut acc, &f, ux, 0.0, 0.0, 1.0, 1.0, &wmap);
         let out = acc.finish();
         let mut best = (0usize, 0usize, f32::NEG_INFINITY);
         for y in 0..out.h {

@@ -31,6 +31,69 @@ impl Plan {
     }
 }
 
+impl Plan {
+    /// Canvas for a per-frame similarity transform `X = s*(k*R(th)*c + u) + o`.
+    /// Same maths as `core/drizzle.py::plan_output_rot` (corners of every frame,
+    /// bounding box, `margin` native pixels around it).
+    pub fn new_sim(
+        w: usize,
+        h: usize,
+        sims: &[crate::register::Sim],
+        scale: f32,
+        margin: f32,
+        canvas: Option<(usize, usize)>,
+    ) -> Self {
+        let (mut xmin, mut xmax) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut ymin, mut ymax) = (f32::INFINITY, f32::NEG_INFINITY);
+        for s in sims {
+            let th = s.theta.to_radians();
+            let (ct, st) = (th.cos(), th.sin());
+            for (cx, cy) in [
+                (0.5f32, 0.5f32),
+                (w as f32 - 0.5, 0.5),
+                (0.5, h as f32 - 0.5),
+                (w as f32 - 0.5, h as f32 - 0.5),
+            ] {
+                // NOTE: this is Python's `plan_output_rot` convention
+                // (`p = k * cs @ [[ct, -st], [st, ct]]` evaluated as a matrix
+                // product, i.e. x = ct*cx + st*cy).  The scatter kernel uses the
+                // transposed form, which is what actually renders the frames; the
+                // bounding box only determines the canvas size and origin, and we
+                // reproduce Python's numbers bit for bit here so `ox`/`oy` agree.
+                let px = s.k * (ct * cx + st * cy) + s.ux;
+                let py = s.k * (-st * cx + ct * cy) + s.uy;
+                if !px.is_finite() || !py.is_finite() {
+                    continue;
+                }
+                xmin = xmin.min(px);
+                xmax = xmax.max(px);
+                ymin = ymin.min(py);
+                ymax = ymax.max(py);
+            }
+        }
+        if !xmin.is_finite() {
+            xmin = 0.0;
+            xmax = w as f32;
+            ymin = 0.0;
+            ymax = h as f32;
+        }
+        if std::env::var("DWT_RS_DEBUG").is_ok() {
+            eprintln!("[dbg] bbox x[{xmin},{xmax}] y[{ymin},{ymax}]");
+        }
+        let mut ox = (margin - xmin) * scale;
+        let mut oy = (margin - ymin) * scale;
+        let mut ow = (((xmax - xmin + 2.0 * margin) * scale).ceil() as i64).max(1) as usize;
+        let mut oh = (((ymax - ymin + 2.0 * margin) * scale).ceil() as i64).max(1) as usize;
+        if let Some((cw, ch)) = canvas {
+            // The reference canvas wins over the local bounding box; the origin is
+            // kept exactly as computed above (that is what Python's plan does).
+            ow = cw.max(1);
+            oh = ch.max(1);
+        }
+        Self { s: scale, ox, oy, w: ow, h: oh }
+    }
+}
+
 fn extrema(v: &[f32]) -> (f32, f32) {
     if v.is_empty() {
         return (0.0, 0.0);
@@ -61,7 +124,11 @@ impl Acc {
         let mut img = Img::new(self.plan.w, self.plan.h);
         for p in 0..img.d.len() {
             let d = self.den[p];
-            img.d[p] = if d > 0.0 { self.num[p] / d } else { f32::NAN };
+            // A pixel that only catches a sliver of a drop divides by almost
+            // nothing and blows up (20x the sky level at the canvas border).
+            // Python marks uncovered output pixels as NaN as well.
+            let thr = 1e-4 * self.plan.s * self.plan.s;
+            img.d[p] = if d > thr { self.num[p] / d } else { f32::NAN };
         }
         img
     }
@@ -73,22 +140,29 @@ pub fn drizzle_add(
     frame: &Img,
     ux: f32,
     uy: f32,
+    theta_deg: f32,
+    k: f32,
     pixfrac: f32,
     wmap: &[f32],
 ) {
     let s = acc.plan.s;
     let fp = 0.5 * s * pixfrac; // half-side of the drop, in output pixels
+    let th = theta_deg.to_radians();
+    let (ct, st) = (th.cos(), th.sin());
     let ow = acc.plan.w as i64;
     let oh = acc.plan.h as i64;
     for y in 0..frame.h {
-        let cy = s * (y as f32 + 0.5 + uy) + acc.plan.oy;
-        let y0 = (cy - fp - 1.0).floor() as i64;
-        let y1 = (cy + fp).ceil() as i64;
-        if y1 <= 0 || y0 >= oh {
+        let yc = y as f32 + 0.5;
+        let cy0 = s * (k * (st * (0.0) + ct * yc) + uy) + acc.plan.oy;
+        if cy0 + fp < -1.0 || cy0 - fp > oh as f32 + 1.0 {
             continue;
         }
         for x in 0..frame.w {
-            let cx = s * (x as f32 + 0.5 + ux) + acc.plan.ox;
+            let xc = x as f32 + 0.5;
+            let cx = s * (k * (ct * xc - st * yc) + ux) + acc.plan.ox;
+            let cy = s * (k * (st * xc + ct * yc) + uy) + acc.plan.oy;
+            let y0 = (cy - fp - 1.0).floor() as i64;
+            let y1 = (cy + fp).ceil() as i64;
             let x0 = (cx - fp - 1.0).floor() as i64;
             let x1 = (cx + fp).ceil() as i64;
             if x1 <= 0 || x0 >= ow {
@@ -122,6 +196,8 @@ pub fn drizzle_add(
 /// Same math as [`drizzle_add`] but gathering: for each output pixel, walk the
 /// source pixels whose footprint touches it. Produces results identical to the
 /// scatter for `pixfrac <= 1` and is the shape the GPU path mirrors.
+/// Translation-only gather variant (the wgpu kernel mirrors this one; rotation is
+/// handled by the scatter path above).
 pub fn drizzle_add_gather(
     acc: &mut Acc,
     frame: &Img,
