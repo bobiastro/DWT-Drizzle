@@ -890,9 +890,19 @@ fn run() -> Result<(), String> {
             Plan::new(w, h, &dx, &dy, a.dscale, 1.0)
         };
         if let Some((cw, ch)) = canvas {
-            if plan.w != cw || plan.h != ch {
-                return Err(format!("画布 {}x{} 与本进程 {}x{} 不一致", cw, ch, plan.w, plan.h));
+            // A reference product fixes the field of view.  Anything beyond a
+            // rounding difference means our registration behaves differently
+            // (or the reference used another scale), so refuse instead of
+            // emitting a differently-cropped image.
+            let dw = (plan.w as i64 - cw as i64).abs();
+            let dh = (plan.h as i64 - ch as i64).abs();
+            if dw > 2 || dh > 2 {
+                return Err(format!(
+                    "画布 {}x{} 与本进程解出的包围盒 {}x{} 相差 {}x{} px，超过 2px 容差；                     请核对 --drizzle-scale、参考帧与配准解，或去掉 --canvas-from 单独出图",
+                    cw, ch, plan.w, plan.h, dw, dh
+                ));
             }
+            println!("[画布] 参考 {}x{}，本进程包围盒 {}x{}（差 {}x{} px）", cw, ch, plan.w, plan.h, dw, dh);
         }
         let mut acc = Acc::new(plan);
         // core/drizzle.py:1867 -- the rotating branch passes

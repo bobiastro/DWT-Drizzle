@@ -82,14 +82,13 @@ impl Plan {
         }
         let mut ox = (margin - xmin) * scale;
         let mut oy = (margin - ymin) * scale;
-        let mut ow = (((xmax - xmin + 2.0 * margin) * scale).ceil() as i64).max(1) as usize;
-        let mut oh = (((ymax - ymin + 2.0 * margin) * scale).ceil() as i64).max(1) as usize;
-        if let Some((cw, ch)) = canvas {
-            // The reference canvas wins over the local bounding box; the origin is
-            // kept exactly as computed above (that is what Python's plan does).
-            ow = cw.max(1);
-            oh = ch.max(1);
-        }
+        let ow = (((xmax - xmin + 2.0 * margin) * scale).ceil() as i64).max(1) as usize;
+        let oh = (((ymax - ymin + 2.0 * margin) * scale).ceil() as i64).max(1) as usize;
+        // NOTE: `canvas` is deliberately *not* used to resize the plan.  The
+        // caller compares the natural bounding box against the reference canvas
+        // and refuses to run when they disagree (a silent resize would emit a
+        // different field of view than the reference product).
+        let _ = canvas;
         Self { s: scale, ox, oy, w: ow, h: oh }
     }
 }

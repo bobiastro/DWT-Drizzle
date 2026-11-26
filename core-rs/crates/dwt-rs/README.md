@@ -136,8 +136,14 @@ the rotated corner union exactly like `core/drizzle.py::plan_output_rot`.
 dwt-rs --photos <dir> --out <dir> --limit 8 --crop 0 --pick O --A 6        --aligned 0 --ref-frame 7 --canvas-from <reference>.xisf --drizzle-scale 1
 ```
 
-`--canvas-from` forces the reference image's W/H (and refuses to emit when the
-solved rotation exceeds 0.5 deg or the scale deviates by more than 1%).
+`--canvas-from` names a reference product and is a **hard check, not a resize**:
+dwt-rs solves its own geometry first, then refuses to emit (exit code 1, no file)
+when the solved bounding box differs from the reference W/H by more than 2 px,
+when the solved rotation exceeds 0.5 deg, or when the scale deviates by more
+than 1 %.  The bounding box is computed exactly like `plan_output_rot`, so a
+matching run prints `[画布] 参考 2783x2228，本进程包围盒 2783x2228（差 0x0 px）`
+and continues; pointing it at an unrelated product (e.g. a 400x400 crop) aborts
+with `画布 400x400 与本进程解出的包围盒 2783x2228 相差 2383x1828 px`.
 `--geom <txt>` injects an externally solved `idx dx dy theta k` table, which is
 what the parity attribution below uses to separate the registration solution
 from the rest of the pipeline.
