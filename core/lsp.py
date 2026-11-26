@@ -995,3 +995,235 @@ def process_auto(img, logf=None, sigma=None):
                     logf('  [LSPR] 二次扣除 θ=%.2f ρ=%.1f 幅度 %+.3e 覆盖 %d 像素'
                          % (st2['theta'], st2['rho'], st2['amp'], n2))
     return len(sts), tot
+
+# ---------------------------------------------------------------------------
+# 帧域验证（frame-domain validation）——【原型，尚未接线】
+# 状态（2026-11-26）：画布→单帧映射的 origin/scale 记账尚未对齐（必须在 pws 内
+# 用 drz_plan 的 ox/oy 与读帧时的 pf 直接给出，不能反推），本地相关校验只有
+# 0.02~0.17，故 frame_gate 暂不参与 process_auto 的决策，默认从不调用。
+#
+# 判据：真实加性共模线在**单帧**里也存在且符号一致；由采样/背景/噪声凑出来的
+# 直线在单帧里不存在（符号随机）。做法：等间隔取 n 帧 → 用 drizzle 的逆变换把
+# 画布上的 (θ, ρ) 映射回各帧坐标 → 每帧在 ±off1·w 的带内量
+# amp_j = median(on) − median(off)（on = ±wfac·w，off = off0..off1 倍 w）。
+#
+# 单位问题：帧与叠加的幅度单位不同（每帧 flux 标定 / drizzle 归一），所以判据用
+#   (a) 符号一致率 ≥ frac     —— 共模信号必须同号；随机结构约 0.5
+#   (b) median_j |z_j| ≥ zmin —— 每帧按自身噪声归一后的显著性下限
+# median_j|amp_j| / amp_stack 作为诊断量一起返回（换算系数由调用方给）。
+# ---------------------------------------------------------------------------
+
+def _to_frame(x, y, dx, dy, th, k, s, ox=0.0, oy=0.0, pf=1.0):
+    """画布坐标 → 单帧坐标（drizzle 着色器变换的逆）。th 用弧度。
+
+    pf = 帧在叠加坐标系里的放大倍数（--frame 时等于参考主帧的 _inv，
+    因为读入的帧已按该倍数上采样；无 --frame 时为 1.0）。
+    """
+    ct, stn = math.cos(th), math.sin(th)
+    u = (float(x) - ox + s * float(dx)) / s
+    v = (float(y) - oy + s * float(dy)) / s
+    return ((ct * u + stn * v) / (k * pf), (-stn * u + ct * v) / (k * pf))
+
+
+def _chord_pts(hh, ww, theta, rho, margin=4.0):
+    """直线 pr=rho 在 (hh, ww) 矩形内的两端点（画布/帧通用）。"""
+    c, s = math.cos(math.radians(theta)), math.sin(math.radians(theta))
+    ax, ay = rho * c, rho * s
+    dx, dy = -s, c
+    tt = np.arange(-3.0 * (hh + ww), 3.0 * (hh + ww), 1.0)
+    X = ax + dx * tt
+    Y = ay + dy * tt
+    ok = (X >= margin) & (X < ww - margin) & (Y >= margin) & (Y < hh - margin)
+    if not ok.any():
+        return None
+    X, Y = X[ok], Y[ok]
+    return (float(X[0]), float(Y[0])), (float(X[-1]), float(Y[-1]))
+
+
+def _frame_amp(img, x1, y1, x2, y2, w, wfac=1.5, off0=4.0, off1=8.0, K=8):
+    """在一帧上量 on/off 中位差 → (amp, z, w_f, nseg)。坐标已在该帧坐标系。"""
+    dxl, dyl = x2 - x1, y2 - y1
+    L = math.hypot(dxl, dyl)
+    if L < 12.0 or not np.isfinite(L):
+        return None
+    dxl, dyl = dxl / L, dyl / L
+    cth, sth = dyl, -dxl
+    rho = x1 * cth + y1 * sth
+    th_deg = math.degrees(math.atan2(sth, cth))
+    w_f = float(w) * (L / max(L, 1e-9))  # 占位，下面按弧长/画布弧长比修正
+    return th_deg, rho, L
+
+
+def _refine_pt(img, px, py, ref, rx, ry, half=90, srch=36, step=3):
+    """在帧里局部搜索：使帧块与画布块最相关的位置（补偿变换残差）。"""
+    from scipy.ndimage import gaussian_filter
+    x0, y0 = int(rx) - half, int(ry) - half
+    if x0 < 0 or y0 < 0 or x0 + 2 * half > ref.shape[1] or y0 + 2 * half > ref.shape[0]:
+        return px, py, 0.0
+    a = ref[y0:y0 + 2 * half, x0:x0 + 2 * half]
+    a = np.where(np.isfinite(a), a, np.nanmedian(a))
+    a = (a - gaussian_filter(a, 2.0)).ravel()
+    a = a - a.mean()
+    sd_a = float(a.std())
+    if sd_a <= 0:
+        return px, py, 0.0
+    best = (-2.0, px, py)
+    cx, cy = int(px), int(py)
+    for oy in range(-srch, srch + 1, step):
+        for ox in range(-srch, srch + 1, step):
+            b = img[cy + oy - half:cy + oy + half, cx + ox - half:cx + ox + half]
+            if b.shape != (2 * half, 2 * half):
+                continue
+            b = np.where(np.isfinite(b), b, np.nanmedian(b))
+            b = (b - gaussian_filter(b, 2.0)).ravel()
+            b = b - b.mean()
+            sd_b = float(b.std())
+            if sd_b <= 0:
+                continue
+            c = float((a * b).mean() / (sd_a * sd_b))
+            if c > best[0]:
+                best = (c, cx + ox, cy + oy)
+    return float(best[1]), float(best[2]), float(best[0])
+
+
+def frame_gate(st, sampler, nframes, logf=None, n=10, wfac=1.5, off0=4.0,
+               off1=8.0, frac=0.8, zmin=1.0, w_px=None, ref=None, sc=1.0):
+    """对结构 st 做帧域验证。sampler(j) 返回 dict(img, dx, dy, th, k, s, ox, oy)。
+
+    返回 dict(ok, frac, zmed, amp_med, n, amps, zs, frames, w).
+    """
+    import numpy as _np
+    if sampler is None or not nframes:
+        return {'ok': True, 'skipped': True, 'frac': 1.0, 'zmed': 0.0,
+                'amp_med': 0.0, 'n': 0, 'amps': [], 'zs': [], 'frames': []}
+    w = float(w_px if w_px is not None else st['width'])
+    hh, ww = st['_shape'] if '_shape' in st else (None, None)
+    if hh is None:
+        return {'ok': True, 'skipped': True, 'frac': 1.0, 'zmed': 0.0,
+                'amp_med': 0.0, 'n': 0, 'amps': [], 'zs': [], 'frames': []}
+    p = _chord_pts(hh, ww, st['theta'], st['rho'])
+    if p is None:
+        return {'ok': True, 'skipped': True, 'frac': 1.0, 'zmed': 0.0,
+                'amp_med': 0.0, 'n': 0, 'amps': [], 'zs': [], 'frames': []}
+    (cx1, cy1), (cx2, cy2) = p
+    Lc = math.hypot(cx2 - cx1, cy2 - cy1)
+    _ib = max(1, int(round(sc)))
+    ref_s = None
+    if ref is not None:
+        ref_s = ref[::_ib, ::_ib] if _ib > 1 else ref
+    # 画布弦上取 18%..82% 一段（避开帧边缘）
+    q = [(cx1 + (cx2 - cx1) * f, cy1 + (cy2 - cy1) * f) for f in (0.18, 0.82)]
+    idx = sorted(set(int(round(i * (nframes - 1) / float(max(n - 1, 1))))
+                     for i in range(n)))
+    amps, zs, used, wf_used = [], [], [], []
+    for j in idx:
+        rec = sampler(j)
+        if rec is None:
+            continue
+        img = rec['img']
+        if img is None:
+            continue
+        f1 = _to_frame(q[0][0], q[0][1], rec['dx'], rec['dy'],
+                       math.radians(rec['th']), rec['k'], rec['s'],
+                       rec.get('ox', 0.0), rec.get('oy', 0.0),
+                       rec.get('pf', 1.0))
+        f2 = _to_frame(q[1][0], q[1][1], rec['dx'], rec['dy'],
+                       math.radians(rec['th']), rec['k'], rec['s'],
+                       rec.get('ox', 0.0), rec.get('oy', 0.0),
+                       rec.get('pf', 1.0))
+        Lf = math.hypot(f2[0] - f1[0], f2[1] - f1[1])
+        if not (np.isfinite(Lf) and Lf > 20.0):
+            continue
+        w_f = max(1.0, w * (Lf / Lc))
+        if ref_s is None:
+            p1r = (f1[0], f1[1], 1.0)
+            p2r = (f2[0], f2[1], 1.0)
+        else:
+            p1r = _refine_pt(img, f1[0], f1[1], ref_s, q[0][0] / _ib, q[0][1] / _ib)
+            p2r = _refine_pt(img, f2[0], f2[1], ref_s, q[1][0] / _ib, q[1][1] / _ib)
+        if p1r[2] < 0.15 or p2r[2] < 0.15:
+            if logf is not None:
+                logf('  [LSPR] 帧 %d：映射相关 %.2f/%.2f，跳过' % (j, p1r[2], p2r[2]))
+            continue
+        gx1, gy1, gx2, gy2 = p1r[0], p1r[1], p2r[0], p2r[1]
+        dl = math.hypot(gx2 - gx1, gy2 - gy1)
+        if dl < 40.0:
+            continue
+        ddx, ddy = (gx2 - gx1) / dl, (gy2 - gy1) / dl
+        cth, sth = ddy, -ddx
+        th_f = math.degrees(math.atan2(sth, cth))
+        rho_f = gx1 * cth + gy1 * sth
+        cp = None
+        if False:
+            pass
+        # 用弦的 25%..75% 段，再按该帧内的弦重算 (θ, ρ)（避免梯形误差）
+        (gx1, gy1), (gx2, gy2) = cp
+        gx1 = gx1 + (gx2 - gx1) * 0.25
+        gy1 = gy1 + (gy2 - gy1) * 0.25
+        gx2 = gx1 + (gx2 - gx1) * 0.667
+        gy2 = gy1 + (gy2 - gy1) * 0.667
+        dl = math.hypot(gx2 - gx1, gy2 - gy1)
+        if dl < 40.0:
+            continue
+        ddx, ddy = (gx2 - gx1) / dl, (gy2 - gy1) / dl
+        cth, sth = ddy, -ddx
+        th_f = math.degrees(math.atan2(sth, cth))
+        rho_f = gx1 * cth + gy1 * sth
+        try:
+            V, dd, ss = _strip(img, th_f, rho_f, dmax=off1 * w_f + 2.0,
+                               dstep=1.0, sstep=max(2.0, w_f))
+        except Exception:
+            continue
+        if V is None or V.size == 0:
+            continue
+        mon = np.abs(dd) <= wfac * w_f
+        moff = (np.abs(dd) >= off0 * w_f) & (np.abs(dd) <= off1 * w_f)
+        if mon.sum() < 2 or moff.sum() < 4:
+            continue
+        a_k, z_k = [], []
+        nr = V.shape[0]
+        kk = max(1, min(8, nr // 8))
+        edges = np.linspace(0, nr, kk + 1).astype(int)
+        for k in range(kk):
+            row = _nanmed(V[edges[k]:edges[k + 1]], axis=0) if (edges[k + 1] - edges[k]) > 1 else V[edges[k]]
+            ro = row[moff]
+            rn = row[mon]
+            if not np.isfinite(row).any():
+                continue
+            on = _nanmed(rn)
+            off = _nanmed(ro)
+            if not (np.isfinite(on) and np.isfinite(off)):
+                continue
+            a = float(on - off)
+            se = 1.2533 * 1.4826 * float(np.nanmedian(np.abs(ro - off))) / math.sqrt(max(int(np.isfinite(rn).sum()), 1))
+            a_k.append(a)
+            z_k.append(a / max(se, 1e-30))
+        if not a_k:
+            continue
+        amps.append(float(_nanmed(np.array(a_k))))
+        zs.append(float(_nanmed(np.array(z_k))))
+        used.append(j)
+        wf_used.append(w_f)
+        if logf is not None:
+            logf('  [LSPR] 帧 %d：amp %+.3e  z %+.2f  w_f %.2f' % (j, amps[-1], zs[-1], w_f))
+    if not amps:
+        return {'ok': False, 'frac': 0.0, 'zmed': 0.0, 'amp_med': 0.0,
+                'n': 0, 'amps': [], 'zs': [], 'frames': [], 'w': w}
+    A = np.array(amps, float)
+    Z = np.array(zs, float)
+    pos = float(np.mean(A > 0))
+    neg = float(np.mean(A < 0))
+    fr = max(pos, neg)
+    sgn = 1.0 if pos >= neg else -1.0
+    zmed = float(np.median(Z))
+    amp_med = float(np.median(np.abs(A)))
+    ok = bool(fr >= frac and abs(zmed) >= zmin and (zmed * sgn) > 0)
+    if logf is not None:
+        logf('  [LSPR] 帧域验证 θ=%.2f ρ=%.1f：%d/%d 帧  符号一致 %.0f%%  '
+             'z 中位 %+.2f  |amp| 中位 %.3e  宽 %.2f px → %s'
+             % (st['theta'], st['rho'], len(used), len(idx), 100.0 * fr, zmed,
+                amp_med, (np.median(wf_used) if wf_used else 0.0),
+                '通过' if ok else '判为假线，不扣除'))
+    return {'ok': ok, 'frac': fr, 'zmed': zmed, 'amp_med': amp_med,
+            'n': len(used), 'amps': amps, 'zs': zs, 'frames': used,
+            'w': float(np.median(wf_used)) if wf_used else w}
