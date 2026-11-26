@@ -1507,16 +1507,27 @@ def frame_gate(st, sampler, nframes, logf=None, n=10, wfac=1.5, off0=4.0,
             ctrl_v.append(float(np.median(np.abs(np.asarray(a_c, float)))))
     p95 = float(np.percentile(ctrl_v, 95.0)) if ctrl_v else 0.0
     _amp_sig = float(amp_med / sig_frame) if (sig_frame and sig_frame > 0) else float('nan')
-    # 非对称「否决门」：只有**两项都不满足**才否决；其余（含证据不足、灰区）一律保留。
-    # 误杀真痕 = 用户继续看到那条线（主要诉求失败）；误留假线 = 多扣 ~0.35% 像素。
-    # 因此本门只提供否决权，不提供确认权。
+    # 非对称「否决门」：三条证据（显著性 / 绝对幅度下限 / 对照线 p95）**任一不满足即否决**，
+    # 三条全过才保留。误杀真痕 = 用户继续看到那条线（主要诉求失败，最坏）；
+    # 误留假线 = 多扣 ~0.35% 像素。因此本门只提供否决权，不提供确认权。
     _z_bad = (not np.isfinite(zmed)) or (abs(zmed) < float(zmin))
+    _f_bad = bool(sig_frame and sig_frame > 0) and (
+        (not np.isfinite(_amp_sig)) or _amp_sig < float(ampmin))
     _a_bad = bool(ctrl_v) and (not np.isfinite(amp_med) or amp_med < p95)
-    veto = bool(_z_bad and _a_bad)
+    veto = bool(_z_bad or _f_bad or _a_bad)
     ok = not veto
     if logf is not None:
-        _why = ('z<%.2f 且 |amp|<对照 p95' % zmin) if veto else (
-            'z≥%.2f' % zmin if not _z_bad else '|amp|≥对照 p95')
+        if not veto:
+            _why = 'z≥%.2f 且 |amp|≥%.2fσ_frame 且 ≥对照 p95' % (zmin, ampmin)
+        else:
+            _bad = []
+            if _z_bad:
+                _bad.append('z<%.2f' % zmin)
+            if _f_bad:
+                _bad.append('|amp|<%.2fσ_frame' % ampmin)
+            if _a_bad:
+                _bad.append('|amp|<对照 p95')
+            _why = ' 且 '.join(_bad) if _bad else '证据不足'
         logf('  [LSPR][gate] θ=%.2f ρ=%.1f：帧 %d  z 中位 %+.2f  |amp| 中位 %+.3e'
              '（%.3fσ_frame） 对照 p95 %+.3e  → %s（%s）'
              % (st['theta'], st['rho'], len(A), zmed, amp_med, _amp_sig, p95,
@@ -1543,7 +1554,7 @@ def process_auto(img, logf=None, sigma=None, sampler=None, nframes=0,
     _sc0 = None
     _amap = {}
     _nt = 0
-    _fg_on = str(os.environ.get('DWT_LSPR_FRAMEGATE', '0')).strip() in ('1', 'true', 'True')
+    _fg_on = str(os.environ.get('DWT_LSPR_FRAMEGATE', '1')).strip() not in ('0', 'false', 'False')
     if sampler is not None and nframes and _fg_on:
         # 映射自检独立于「是否检出结构」：有结构要验证就得先证明映射准
         try:
@@ -1567,6 +1578,7 @@ def process_auto(img, logf=None, sigma=None, sampler=None, nframes=0,
                 logf('  [LSPR] 仿射拟合失败（%s: %s）→ 本次跳过验证'
                      % (type(_e_af).__name__, _e_af))
             _amap, _nt = {}, 0
+    _nveto = 0
     for st in sts:
         if sampler is not None and nframes and _nt > 0 and _fg_on:
             st['_shape'] = a.shape
@@ -1578,6 +1590,7 @@ def process_auto(img, logf=None, sigma=None, sampler=None, nframes=0,
                               off0=4.0, off1=8.0, ref=a, sc=_sc0,
                               ampmin=0.06, sig_frame=sig_frame, amap=_amap)
             if not _res.get('ok', True):
+                _nveto += 1
                 continue
             _nframe_use += 1
         _npx = _apply_band(a, st)
@@ -1595,4 +1608,6 @@ def process_auto(img, logf=None, sigma=None, sampler=None, nframes=0,
                 if logf is not None:
                     logf('  [LSPR] 二次扣除 θ=%.2f ρ=%.1f 幅度 %+.3e 覆盖 %d 像素'
                          % (st2['theta'], st2['rho'], st2['amp'], n2))
-    return len(sts), tot
+    if _nveto and logf is not None:
+        logf('  [LSPR] 帧域否决：%d/%d 条未通过，未改动' % (_nveto, len(sts)))
+    return len(sts) - _nveto, tot
