@@ -1,7 +1,7 @@
 //! Region field R ∈ [0,1]: "detail" vs "hazy" per pixel, ported from
 //! `build_r_field` / `_r_envelope` / `_grow_support_adaptive` in `core/pws.py`.
 
-use crate::image::{box_filter, clamp, downsample, gaussian_filter, max_filter, median_of, zoom_bilinear, Img};
+use crate::image::{box_filter, clamp, gaussian_filter, max_filter, median_of, zoom_bilinear, Img};
 
 pub const ENV_WIN_MULT: f32 = 2.0;
 pub const ENV_EPS: f32 = 16.0;

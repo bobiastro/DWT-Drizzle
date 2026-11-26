@@ -285,6 +285,27 @@ fn run() -> Result<(), String> {
     }
     if let Some(p) = &a.pick {
         files.retain(|f| filter_hint(f).eq_ignore_ascii_case(p));
+    } else {
+        // No --pick: mirror the Python CLI, which stacks one filter at a time.
+        // Keep the largest group instead of mixing channels in a single stack.
+        let mut groups: std::collections::BTreeMap<String, Vec<PathBuf>> =
+            std::collections::BTreeMap::new();
+        for f in &files {
+            groups.entry(filter_hint(f)).or_default().push(f.clone());
+        }
+        if groups.len() > 1 {
+            let best = groups
+                .iter()
+                .max_by_key(|(k, v)| (v.len(), std::cmp::Reverse(k.to_string())))
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default();
+            let n = groups[&best].len();
+            println!(
+                "[选] 未指定 --pick，自动取帧数最多的滤镜 {best}（{n} 帧，共 {} 组）",
+                groups.len()
+            );
+            files = groups.remove(&best).unwrap_or_default();
+        }
     }
     // python's resolve_center() runs on the FULL frame list, before prepare_frames()
     // truncates to --limit: the median centre is therefore taken over frames spread

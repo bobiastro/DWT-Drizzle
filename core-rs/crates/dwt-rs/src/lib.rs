@@ -7,6 +7,10 @@
 pub mod bggrad;
 pub mod detect;
 pub mod drizzle;
+#[cfg(feature = "gpu")]
+pub mod gpu;
+#[cfg(not(feature = "gpu"))]
+#[path = "gpu_stub.rs"]
 pub mod gpu;
 pub mod image;
 pub mod rfield;

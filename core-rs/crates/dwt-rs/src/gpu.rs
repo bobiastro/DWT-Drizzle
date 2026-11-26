@@ -474,7 +474,7 @@ pub fn stack_gpu(inp: &GpuInput) -> Result<(Img, Vec<f32>), String> {
     };
     let p_w = pipe("k_weights");
     let p_r = pipe("k_reject");
-    let p_m = pipe("k_mean");
+    let _p_m = pipe("k_mean");
     let p_a = pipe("k_accum");
 
     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
