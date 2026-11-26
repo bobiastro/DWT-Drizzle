@@ -57,6 +57,8 @@ struct Args {
     dump_frames: Option<String>,
     dump_w: Option<String>,
     weights_from: Option<String>,
+    seed_frame: Option<usize>,
+    fixed_probe: bool,
     report: bool,
     gpu: String,
     jobs: usize,
@@ -91,6 +93,9 @@ impl Default for Args {
             dump_frames: None,
             dump_w: None,
             weights_from: None,
+
+            seed_frame: None,
+            fixed_probe: false,
             report: false,
             gpu: "off".into(),
             jobs: 0,
@@ -109,6 +114,14 @@ fn parse_args() -> Result<Args, String> {
         let flag = argv[i].as_str();
         let val = || -> Result<&str, String> {
             argv.get(i + 1).map(|s| s.as_str()).ok_or_else(|| format!("{flag} needs a value"))
+        };
+        // Boolean-ish switches accept either "--flag 1" or a bare "--flag"
+        // (the published command line writes `--drizzle --drizzle-scale 2`).
+        let has_val = || -> bool {
+            match argv.get(i + 1) {
+                Some(s) => !s.starts_with("--"),
+                None => false,
+            }
         };
         match flag {
             "--photos" => {
@@ -147,12 +160,12 @@ fn parse_args() -> Result<Args, String> {
                 i += 2;
             }
             "--drizzle" => {
-                a.drizzle = num(val()?, flag)? != 0.0;
-                i += 2;
+                a.drizzle = if has_val() { num(val()?, flag)? != 0.0 } else { true };
+                i += if has_val() { 2 } else { 1 };
             }
             "--drizzle-force" => {
-                a.force_drizzle = num(val()?, flag)? != 0.0;
-                i += 2;
+                a.force_drizzle = if has_val() { num(val()?, flag)? != 0.0 } else { true };
+                i += if has_val() { 2 } else { 1 };
             }
             "--drizzle-scale" => {
                 a.dscale = num(val()?, flag)? as f32;
@@ -206,13 +219,21 @@ fn parse_args() -> Result<Args, String> {
                 a.dump_r = Some(val()?.to_string());
                 i += 2;
             }
+            "--fixed-probe" => {
+                a.fixed_probe = num(val()?, flag)? != 0.0;
+                i += 2;
+            }
+            "--seed-frame" => {
+                a.seed_frame = Some(val()?.parse().map_err(|_| "bad --seed-frame".to_string())?);
+                i += 2;
+            }
             "--weights-from" => {
                 a.weights_from = Some(val()?.to_string());
                 i += 2;
             }
             "--save-aux" => {
-                a.save_aux = num(val()?, flag)? != 0.0;
-                i += 2;
+                a.save_aux = if has_val() { num(val()?, flag)? != 0.0 } else { true };
+                i += if has_val() { 2 } else { 1 };
             }
             "--dump-frames" => {
                 a.dump_frames = Some(val()?.to_string());
@@ -428,10 +449,40 @@ fn run() -> Result<(), String> {
     let sref = stack_median(&refs);
     // the star table must come from a single frame: these frames are dithered by
     // several px, so a median stack blurs the PSF cores into the noise.
-    let stars = build_star_table(&frames[0], 120, 26, 25.0);
+    // Python builds the probe star table on a single frame: the one with the most
+    // DAOStarFinder detections among the cleanest frames (pws.py:3307-3347). The
+    // positions are then reused for every frame with a fixed window, so an
+    // un-registered dither shows up as PSF blur -- we reproduce that on purpose
+    // so the C weights can be compared like for like.
+    let probe = match a.seed_frame {
+        Some(i) => i.min(frames.len() - 1),
+        None => {
+            let mut best = (0usize, 0usize);
+            for (i, f) in frames.iter().enumerate() {
+                let k = build_star_table(f, 120, 26, 25.0).len();
+                if k > best.1 {
+                    best = (i, k);
+                }
+            }
+            best.0
+        }
+    };
+    let stars = build_star_table(&frames[probe], 120, 26, 25.0);
+    println!("[星表] 探针帧 #{probe} 上检出 {} 颗", stars.len());
+    // Two PSF-metrology modes:
+    //   default            -> detect on *each* frame and measure its own stars
+    //                         (follows the dither, so it measures the real PSF);
+    //   --fixed-probe      -> one shared table measured at fixed windows, which is
+    //                         what core/pws.py does; with un-registered dither that
+    //                         inflates the frames that sit far from the probe.
     let mut fwhms = Vec::with_capacity(frames.len());
     for f in &frames {
-        fwhms.push(measure_fwhm(f, &stars, 16));
+        if a.fixed_probe {
+            fwhms.push(measure_fwhm(f, &stars, 16));
+        } else {
+            let own = build_star_table(f, 120, 26, 25.0);
+            fwhms.push(measure_fwhm(f, &own, 16));
+        }
     }
     let finite: Vec<f32> = fwhms.iter().copied().filter(|v| v.is_finite() && *v > 0.5 && *v < 40.0).collect();
     let mut fmed = if finite.is_empty() { 1.0 } else { median_of(&finite) };
@@ -556,7 +607,82 @@ fn run() -> Result<(), String> {
     // unless --drizzle-force asks for it explicitly)
     let drz = a.drizzle && (a.force_drizzle || a.dscale > 1.001);
     let mut wts = wts;
-    let (stk, neff, rej_rate) = if drz {
+
+    // -- micro-benchmark of the CPU combine only (used for the GPU speedup table)
+    if let Ok(v) = std::env::var("DWT_BENCH_CPU") {
+        let reps: usize = v.parse().unwrap_or(1).max(1);
+        let mut best = f32::INFINITY;
+        let mut tot = 0.0f32;
+        for _ in 0..reps {
+            let mut w2 = wts.clone();
+            let tb = Instant::now();
+            let _ = stack_strip(&frames, &mut w2, Some(&rfield), sky0, a.rej_k, REJ_GATE, Some(&sigmas));
+            let dt = tb.elapsed().as_secs_f32();
+            if dt < best { best = dt; }
+            tot += dt;
+        }
+        println!(
+            "[BENCH-CPU] stack_strip reps={reps} mean {:.4}s best {:.4}s  grid {}x{} n={}",
+            tot / reps as f32, best, frames[0].w, frames[0].h, frames.len()
+        );
+    }
+
+    // ---- GPU path (weights -> rejection -> accumulate) ---------------------
+    // For the plain weighted-mean case the canvas is identity (margin 0), so the
+    // GPU gather reproduces `stack_strip` pixel for pixel.
+    let margin = if drz { 1.0 } else { 0.0 };
+    let gpu_out: Option<(Img, Vec<f32>)> = if a.gpu != "off" && dwt_rs::gpu::available() {
+        let dx = vec![0.0f32; frames.len()];
+        let dy = vec![0.0f32; frames.len()];
+        let scale = if drz { a.dscale } else { 1.0 };
+        let plan = Plan::new(w, h, &dx, &dy, scale, margin);
+        let gpu_in = dwt_rs::gpu::GpuInput {
+            frames: &frames,
+            r: &rfield,
+            c: &c,
+            s: &s,
+            sig: &sigmas,
+            a_exp: a.a_exp,
+            b_exp: a.b_exp,
+            beta: a.beta,
+            cap: a.max_share,
+            sky: sky0,
+            rej_k: a.rej_k,
+            rej_frac: REJ_GATE,
+            m_ratio: 0.0,
+            s_scale: scale,
+            ox: plan.ox,
+            oy: plan.oy,
+            pixfrac: a.dpix,
+            ow: plan.w,
+            oh: plan.h,
+            ux: &dx,
+            uy: &dy,
+        };
+        let t_gpu = Instant::now();
+        match dwt_rs::gpu::stack_gpu(&gpu_in) {
+            Ok((img, neff_g)) => {
+                println!(
+                    "[GPU] {}  {}x{}  用时 {:.2}s",
+                    dwt_rs::gpu::adapter_info(),
+                    img.w,
+                    img.h,
+                    t_gpu.elapsed().as_secs_f32()
+                );
+                Some((img, neff_g))
+            }
+            Err(e) => {
+                println!("[GPU] 失败（回退 CPU）：{e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (stk, neff, rej_rate) = if let Some((img, nf)) = gpu_out {
+        (img, nf, f32::NAN)
+    } else if drz {
         let rate = dwt_rs::stack::reject(
             &frames, &mut wts, Some(&rfield), sky0, a.rej_k, REJ_GATE, Some(&sigmas),
         );
@@ -583,9 +709,9 @@ fn run() -> Result<(), String> {
         (res.image, res.neff, res.reject_rate)
     };
     println!(
-        "[叠] {:.2}s  像素剔除率 {:.3}%  {}",
+        "[叠] {:.2}s  像素剔除率 {}  {}",
         t.elapsed().as_secs_f32(),
-        rej_rate * 100.0,
+        if rej_rate.is_nan() { "GPU".to_string() } else { format!("{:.3}%", rej_rate * 100.0) },
         if drz { "drizzle" } else { "加权平均" }
     );
 

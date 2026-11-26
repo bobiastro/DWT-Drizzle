@@ -112,12 +112,17 @@ fn drizzle_point_source_scale2() {
     let mut acc = Acc::new(plan);
     drizzle_add(&mut acc, &f, 0.0, 0.0, 1.0, &wmap);
     let out = acc.finish();
-    // input centre 8.5 -> X = 2*8.5 + 2 = 19 -> output coord 18.5
+    // input centre 8.5 -> X = 2*(8.5+0) + 2 = 19. Output pixel i spans [i, i+1),
+    // so X=19 sits exactly on the boundary between pixels 18 and 19: the 2x2 drop
+    // (fp = 0.5*s*pixfrac = 1) covers those four pixels with weight 1 each.
     let (cy, cx) = (18usize, 18usize);
-    assert!(close(out.d[cy * 36 + cx], 100.0, 1e-5), "core {}", out.d[cy * 36 + cx]);
-    assert!(close(acc.den[cy * 36 + cx], 1.0, 1e-6));
-    assert!(close(acc.den[cy * 36 + cx - 1], 0.5, 1e-6));
-    assert!(close(acc.den[(cy - 1) * 36 + cx - 1], 0.25, 1e-6));
+    for dy in 0..2 {
+        for dx in 0..2 {
+            let k = (cy + dy) * 36 + cx + dx;
+            assert!(close(out.d[k], 100.0, 1e-5), "core {k} = {}", out.d[k]);
+            assert!(close(acc.den[k], 1.0, 1e-6), "den {k} = {}", acc.den[k]);
+        }
+    }
     let total: f32 = acc.den.iter().sum();
     assert!(close(total, 4.0, 1e-5), "drop area {total}");
     assert!(out.d[0].is_nan(), "uncovered pixels must be NaN");
@@ -217,3 +222,73 @@ fn xisf_roundtrip() {
     assert_eq!(&raw[..8], b"XISF0100");
     let _ = std::fs::remove_file(&path);
 }
+
+// ------------------------------------------------------------------- gpu
+
+/// The wgpu kernels must reproduce the CPU combine. Skipped when no adapter is
+/// available (the CI box has no GPU).
+#[test]
+fn gpu_matches_cpu_stack() {
+    if !crate::gpu::available() {
+        eprintln!("no wgpu adapter -- skipping");
+        return;
+    }
+    let (w, h, n) = (37usize, 29usize, 5usize);
+    let mut st = 12345u64;
+    let mut rnd = move || {
+        st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((st >> 33) as f32) / (u32::MAX >> 1) as f32
+    };
+    let sky = 0.01f32;
+    let mut frames = Vec::new();
+    for i in 0..n {
+        let mut f = img(w, h, 0.0);
+        for p in 0..w * h {
+            f.d[p] = sky + 0.001 * rnd() + if p == 111 { 0.4 * (i as f32 + 1.0) } else { 0.0 };
+        }
+        frames.push(f);
+    }
+    let mut r = img(w, h, 0.0);
+    for p in 0..w * h {
+        r.d[p] = if p % 13 == 0 { 0.7 } else { 0.05 * rnd() };
+    }
+    let c = vec![1.0f32, 1.05, 0.97, 1.02, 0.99];
+    let s = vec![1.0f32, 1.01, 0.98, 1.03, 0.99];
+    let sig = vec![1e-3f32; n];
+
+    let mut wt = strip_weights(&c, &s, &r, 6.0, 2.0, 0.0, 0.25);
+    let cpu = stack_strip(&frames, &mut wt, Some(&r), sky, 0.0, 1.0 / 3.0, Some(&sig));
+
+    let ux = vec![0.0f32; n];
+    let uy = vec![0.0f32; n];
+    let gpu_in = crate::gpu::GpuInput {
+        frames: &frames,
+        r: &r,
+        c: &c,
+        s: &s,
+        sig: &sig,
+        a_exp: 6.0,
+        b_exp: 2.0,
+        beta: 0.0,
+        cap: 0.25,
+        sky,
+        rej_k: 0.0,
+        rej_frac: 1.0 / 3.0,
+        m_ratio: 0.0,
+        s_scale: 1.0,
+        ox: 0.0,
+        oy: 0.0,
+        pixfrac: 1.0,
+        ow: w,
+        oh: h,
+        ux: &ux,
+        uy: &uy,
+    };
+    let (gpu, neff) = crate::gpu::stack_gpu(&gpu_in).expect("gpu stack");
+    for p in 0..w * h {
+        let d = (cpu.image.d[p] - gpu.d[p]).abs();
+        assert!(d < 1e-6, "pixel {p}: cpu {} gpu {}", cpu.image.d[p], gpu.d[p]);
+        assert!((cpu.neff[p] - neff[p]).abs() < 1e-4, "neff {p}: cpu {} gpu {}", cpu.neff[p], neff[p]);
+    }
+}
+

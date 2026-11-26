@@ -14,10 +14,12 @@ path = "src/main.rs"
 rayon = "1.10"
 bytemuck = { version = "1.19", features = ["derive"] }
 flate2 = "1.0"
+wgpu = { version = "26.0.1", optional = true, default-features = false, features = ["dx12", "wgsl", "std", "serde"] }
+pollster = { version = "1.0.3", optional = true }
 
 [features]
-default = []
-gpu = []
+default = ["gpu"]
+gpu = ["dep:wgpu", "dep:pollster"]
 
 [lints]
 workspace = true

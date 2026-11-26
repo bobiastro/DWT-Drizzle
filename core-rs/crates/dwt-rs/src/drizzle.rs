@@ -81,15 +81,15 @@ pub fn drizzle_add(
     let ow = acc.plan.w as i64;
     let oh = acc.plan.h as i64;
     for y in 0..frame.h {
-        let cy = s * (y as f32 + 0.5 + uy) + acc.plan.oy - 0.5;
-        let y0 = (cy - fp).floor() as i64;
+        let cy = s * (y as f32 + 0.5 + uy) + acc.plan.oy;
+        let y0 = (cy - fp - 1.0).floor() as i64;
         let y1 = (cy + fp).ceil() as i64;
         if y1 <= 0 || y0 >= oh {
             continue;
         }
         for x in 0..frame.w {
-            let cx = s * (x as f32 + 0.5 + ux) + acc.plan.ox - 0.5;
-            let x0 = (cx - fp).floor() as i64;
+            let cx = s * (x as f32 + 0.5 + ux) + acc.plan.ox;
+            let x0 = (cx - fp - 1.0).floor() as i64;
             let x1 = (cx + fp).ceil() as i64;
             if x1 <= 0 || x0 >= ow {
                 continue;
@@ -150,13 +150,13 @@ pub fn drizzle_add_gather(
             let mut num = 0.0f32;
             let mut den = 0.0f32;
             for y in j0..=j1 {
-                let fy = s * (y as f32 + 0.5 + uy) + acc.plan.oy - 0.5;
+                let fy = s * (y as f32 + 0.5 + uy) + acc.plan.oy;
                 let wy = overlap(fp, oy as f32 + 0.5 - fy);
                 if wy <= 0.0 {
                     continue;
                 }
                 for x in i0..=i1 {
-                    let fx = s * (x as f32 + 0.5 + ux) + acc.plan.ox - 0.5;
+                    let fx = s * (x as f32 + 0.5 + ux) + acc.plan.ox;
                     let wx = overlap(fp, ox as f32 + 0.5 - fx);
                     if wx <= 0.0 {
                         continue;

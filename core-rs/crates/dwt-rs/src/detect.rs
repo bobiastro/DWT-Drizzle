@@ -147,7 +147,7 @@ fn fwhm_at(img: &Img, x: usize, y: usize, half: usize) -> Option<f32> {
     }
     // Python 的 `_fwhm_each` 用固定 xypos=[(16,16)]，不做重定心；重定心会让
     // 被 dither 切到窗边的星点被"救回来"，从而复现不出 Python 的 8.4px 伪影。
-    let fixed_centre = std::env::var("DWT_RS_RECENTER").is_ok();
+    let fixed_centre = std::env::var("DWT_RS_NO_RECENTER").is_err();
     let cx = if fixed_centre { (sx / sw).clamp(-3.0, 3.0) } else { 0.0 };
     let cy = if fixed_centre { (sy / sw).clamp(-3.0, 3.0) } else { 0.0 };
     // grid search over sigma with A/B solved in closed form
@@ -201,7 +201,7 @@ fn fwhm_at(img: &Img, x: usize, y: usize, half: usize) -> Option<f32> {
     // photutils 的 `fit_fwhm` 没有额外的振幅门限，只由调用方筛 0.5<v<40；
     // 加了门限会把"窗边被截断"的伪影值丢掉，与 Python 的 C 就对不上了。
     let _ = (amp, noise);
-    if std::env::var("DWT_RS_AMP_GATE").is_ok() && amp < 3.0 * noise {
+    if std::env::var("DWT_RS_NO_AMP_GATE").is_err() && amp < 3.0 * noise {
         return None;
     }
     Some(2.3548 * sigma)
