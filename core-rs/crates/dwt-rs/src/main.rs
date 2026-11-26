@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use dwt_rs::bggrad;
-use dwt_rs::detect::{build_star_table, measure_fwhm, noise_sigma};
+use dwt_rs::detect::{build_star_table, measure_fwhm_search, noise_sigma};
 use dwt_rs::drizzle::{drizzle_add, Acc, Plan};
 use dwt_rs::image::{downsample, median, median_of, percentile, stack_median, Img};
 use dwt_rs::rfield::build_r_field;
@@ -59,6 +59,8 @@ struct Args {
     weights_from: Option<String>,
     seed_frame: Option<usize>,
     fixed_probe: bool,
+    per_frame_stars: bool,
+    fwhm_search: usize,
     report: bool,
     gpu: String,
     jobs: usize,
@@ -96,6 +98,8 @@ impl Default for Args {
 
             seed_frame: None,
             fixed_probe: false,
+            per_frame_stars: false,
+            fwhm_search: 8,
             report: false,
             gpu: "off".into(),
             jobs: 0,
@@ -226,6 +230,14 @@ fn parse_args() -> Result<Args, String> {
             "--seed-frame" => {
                 a.seed_frame = Some(val()?.parse().map_err(|_| "bad --seed-frame".to_string())?);
                 i += 2;
+            }
+            "--fwhm-search" => {
+                a.fwhm_search = num(val()?, flag)? as usize;
+                i += 2;
+            }
+            "--per-frame-stars" => {
+                a.per_frame_stars = if has_val() { num(val()?, flag)? != 0.0 } else { true };
+                i += if has_val() { 2 } else { 1 };
             }
             "--weights-from" => {
                 a.weights_from = Some(val()?.to_string());
@@ -466,8 +478,6 @@ fn run() -> Result<(), String> {
 
     // ---- per-frame quality ------------------------------------------------
     let t = Instant::now();
-    let refs: Vec<&Img> = frames.iter().collect();
-    let sref = stack_median(&refs);
     // the star table must come from a single frame: these frames are dithered by
     // several px, so a median stack blurs the PSF cores into the noise.
     // Python builds the probe star table on a single frame: the one with the most
@@ -498,13 +508,24 @@ fn run() -> Result<(), String> {
     //                         inflates the frames that sit far from the probe.
     let mut fwhms = Vec::with_capacity(frames.len());
     for f in &frames {
-        if a.fixed_probe {
-            fwhms.push(measure_fwhm(f, &stars, 16));
-        } else {
+        if a.per_frame_stars {
             let own = build_star_table(f, 120, 26, 25.0);
-            fwhms.push(measure_fwhm(f, &own, 16));
+            fwhms.push(measure_fwhm_search(f, &own, 16, a.fwhm_search));
+        } else {
+            // python: one seed star table for every frame + per-frame recentring
+            fwhms.push(measure_fwhm_search(f, &stars, 16, a.fwhm_search));
         }
     }
+    // Python builds the reference from the k *sharpest* frames only
+    // (core/pws.py:4245: k = max(1, min(refn=8, n)); idx = argsort(fwhms)[:k]).
+    // Taking a median over every frame instead would blur the dithered PSF cores.
+    let kref = 8.min(frames.len());
+    let mut order: Vec<usize> = (0..frames.len()).collect();
+    order.sort_by(|&i, &j| fwhms[i].partial_cmp(&fwhms[j]).unwrap_or(std::cmp::Ordering::Equal));
+    let refs: Vec<&Img> = order[..kref].iter().map(|&i| &frames[i]).collect();
+    let sref = stack_median(&refs);
+    println!("[R] 参考像 = 最锐 {kref} 帧等权中位");
+
     let finite: Vec<f32> = fwhms.iter().copied().filter(|v| v.is_finite() && *v > 0.5 && *v < 40.0).collect();
     let mut fmed = if finite.is_empty() { 1.0 } else { median_of(&finite) };
     let mut c: Vec<f32> = fwhms.iter().map(|v| if v.is_finite() && *v > 0.0 { fmed / *v } else { 1.0 }).collect();

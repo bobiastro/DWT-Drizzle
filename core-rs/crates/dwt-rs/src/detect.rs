@@ -7,6 +7,7 @@
 //! are invariant under a global scale factor of the estimator.
 
 use crate::image::{gaussian_filter, median_of, Img};
+use rayon::prelude::*;
 
 pub const FWHM_GUESS: f32 = 6.0;
 
@@ -26,7 +27,13 @@ pub fn build_star_table(sref: &Img, n_star: usize, margin: usize, iso_px: f32) -
         hp.d[p] = sref.d[p] - bg.d[p];
     }
     let smooth = gaussian_filter(&hp, FWHM_GUESS / 2.3548);
-    let thresh = 5.0 * nz;
+    // DAOStarFinder thresholds the *convolved* image: smoothing averages the noise
+    // down while the matched-filter peak survives, so the raw-frame sigma is the
+    // wrong yardstick (it hides ~3/4 of the table on these frames).
+    let smed = median_of(&smooth.d);
+    let sdev: Vec<f32> = smooth.d.iter().map(|v| (v - smed).abs()).collect();
+    let nz_smooth = 1.4826 * median_of(&sdev);
+    let thresh = 5.0 * nz_smooth;
     let mut peak_max = f32::NEG_INFINITY;
     for v in &sref.d {
         if *v > peak_max {
@@ -126,30 +133,10 @@ fn fwhm_at(img: &Img, x: usize, y: usize, half: usize) -> Option<f32> {
     let m = median_of(&outer);
     let dev: Vec<f32> = outer.iter().map(|q| (q - m).abs()).collect();
     let noise = (1.4826 * median_of(&dev)).max(1e-12);
-    // flux-weighted recentring inside 5 px
-    let mut sw = 0.0f64;
-    let mut sx = 0.0f64;
-    let mut sy = 0.0f64;
-    for k in 0..n * n {
-        let (i, j) = (k % n, k / n);
-        let dx = i as f32 - r as f32;
-        let dy = j as f32 - r as f32;
-        if dx * dx + dy * dy > 25.0 {
-            continue;
-        }
-        let w = p[k].max(0.0) as f64;
-        sw += w;
-        sx += w * dx as f64;
-        sy += w * dy as f64;
-    }
-    if sw <= 0.0 {
-        return None;
-    }
-    // Python 的 `_fwhm_each` 用固定 xypos=[(16,16)]，不做重定心；重定心会让
-    // 被 dither 切到窗边的星点被"救回来"，从而复现不出 Python 的 8.4px 伪影。
-    let fixed_centre = std::env::var("DWT_RS_NO_RECENTER").is_err();
-    let cx = if fixed_centre { (sx / sw).clamp(-3.0, 3.0) } else { 0.0 };
-    let cy = if fixed_centre { (sy / sw).clamp(-3.0, 3.0) } else { 0.0 };
+    // Python `_fwhm_each` fits every window with a fixed `xypos=[(16,16)]`; the
+    // dither is handled by `recenter_brightest` before the fit, exactly like
+    // `measure_fwhm_frame(..., search=N)` in core/pws.py.
+    let (cx, cy) = (0.0f32, 0.0f32);
     // grid search over sigma with A/B solved in closed form
     let mut best = (f64::INFINITY, 0.0f32, 0.0f32);
     for step in 0..48 {
@@ -194,7 +181,64 @@ fn fwhm_at(img: &Img, x: usize, y: usize, half: usize) -> Option<f32> {
             best = (chi2, sigma, a as f32);
         }
     }
-    let (chi2, sigma, amp) = best;
+    let (chi2, _sigma0, mut amp) = best;
+    // refine: 1.09^k grid quantises FWHM to ~9%, far too coarse for the C ratio
+    let mut sigma = best.1;
+    let mut best_chi = chi2;
+    let mut lo = sigma / 1.09;
+    let mut hi = sigma * 1.09;
+    for _ in 0..12 {
+        let probes = [lo + (hi - lo) * 0.25, (lo + hi) * 0.5, hi - (hi - lo) * 0.25];
+        let mut bestp = (f64::INFINITY, 0.0f32, 0.0f32);
+        for &sg in &probes {
+            let inv = 1.0 / (2.0 * sg * sg);
+            let (mut sgg, mut sg1, mut s1, mut sgp, mut sp) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for k in 0..n * n {
+                let (i, j) = (k % n, k / n);
+                let dx = i as f32 - r as f32;
+                let dy = j as f32 - r as f32;
+                let g = (-(dx * dx + dy * dy) * inv).exp() as f64;
+                let v = p[k] as f64;
+                sgg += g * g;
+                sg1 += g;
+                s1 += 1.0;
+                sgp += g * v;
+                sp += v;
+            }
+            let det = sgg * s1 - sg1 * sg1;
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let a = (sgp * s1 - sg1 * sp) / det;
+            let b = (sgg * sp - sg1 * sgp) / det;
+            if a <= 0.0 {
+                continue;
+            }
+            let mut c2 = 0.0f64;
+            for k in 0..n * n {
+                let (i, j) = (k % n, k / n);
+                let dx = i as f32 - r as f32;
+                let dy = j as f32 - r as f32;
+                let g = (-(dx * dx + dy * dy) * inv).exp() as f64;
+                let d = p[k] as f64 - (b + a * g);
+                c2 += d * d;
+            }
+            if c2 < bestp.0 {
+                bestp = (c2, sg, a as f32);
+            }
+        }
+        if bestp.0.is_finite() && bestp.0 <= best_chi {
+            best_chi = bestp.0;
+            sigma = bestp.1;
+            amp = bestp.2;
+            lo = sigma / 1.09;
+            hi = sigma * 1.09;
+        } else {
+            lo = lo + (hi - lo) * 0.25;
+            hi = hi - (hi - lo) * 0.25;
+        }
+    }
+    let chi2 = best_chi;
     if !chi2.is_finite() || sigma <= 0.0 {
         return None;
     }
@@ -207,16 +251,71 @@ fn fwhm_at(img: &Img, x: usize, y: usize, half: usize) -> Option<f32> {
     Some(2.3548 * sigma)
 }
 
-/// Median FWHM over the star table, in pixels (`NaN` when nothing fits).
-pub fn measure_fwhm(img: &Img, stars: &[(usize, usize)], half: usize) -> f32 {
-    let mut vals: Vec<f32> = Vec::new();
-    for (x, y) in stars {
-        if let Some(v) = fwhm_at(img, *x, *y, half) {
-            if v.is_finite() && v > 0.5 && v < 40.0 {
-                vals.push(v);
+/// Python's per-frame recentring (`measure_fwhm_frame(..., search=N)`).
+///
+/// Takes the brightest pixel inside `x +- (half+search)`, `y +- (half+search)`
+/// and centres the fit window on it, so an un-registered dither does not turn a
+/// PSF fit into an 8 px artefact. Falls back to the seed coordinate when the
+/// shifted window would leave the image.
+pub fn recenter_brightest(
+    img: &Img,
+    x: usize,
+    y: usize,
+    half: usize,
+    search: usize,
+) -> (usize, usize) {
+    if search == 0 {
+        return (x, y);
+    }
+    let x0 = x.saturating_sub(half + search);
+    let y0 = y.saturating_sub(half + search);
+    let x1 = (x + half + search + 1).min(img.w);
+    let y1 = (y + half + search + 1).min(img.h);
+    let mut best = f32::NEG_INFINITY;
+    let (mut bx, mut by) = (x, y);
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let v = img.at(yy, xx);
+            if v > best {
+                best = v;
+                bx = xx;
+                by = yy;
             }
         }
     }
+    if bx < half || by < half || bx + half >= img.w || by + half >= img.h {
+        (x, y)
+    } else {
+        (bx, by)
+    }
+}
+
+/// Median FWHM over the star table, in pixels (`NaN` when nothing fits).
+pub fn measure_fwhm(img: &Img, stars: &[(usize, usize)], half: usize) -> f32 {
+    measure_fwhm_search(img, stars, half, 0)
+}
+
+/// [`measure_fwhm`] with Python's per-frame recentring (`search` px first).
+pub fn measure_fwhm_search(
+    img: &Img,
+    stars: &[(usize, usize)],
+    half: usize,
+    search: usize,
+) -> f32 {
+    // stars are independent, so spread them over the rayon pool (this loop is the
+    // dominant cost on a 60-frame full-frame run)
+    let vals: Vec<f32> = stars
+        .par_iter()
+        .filter_map(|&(x, y)| {
+            // python's `kut` drops stars whose *seed* window already leaves the frame
+            if x < half || y < half || x + half >= img.w || y + half >= img.h {
+                return None;
+            }
+            let (cx, cy) = recenter_brightest(img, x, y, half, search);
+            let v = fwhm_at(img, cx, cy, half)?;
+            if v.is_finite() && v > 0.5 && v < 40.0 { Some(v) } else { None }
+        })
+        .collect();
     if std::env::var("DWT_RS_DEBUG").is_ok() {
         eprintln!("  kept {} of {} stars", vals.len(), stars.len());
     }
