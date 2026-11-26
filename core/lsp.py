@@ -237,7 +237,9 @@ _LSP_SCAN_DRHO = 48.0
 _LSP_SCAN_STEP = 16.0
 _LSP_COARSE = 6.0        # 粗筛 on/off 统计下限
 _LSP_NMEAS = 12          # 精测（_measure）上限
-_LSP_SAMPLES = 1.5e6     # 目标采样点数（自适应 step）
+_LSP_SAMPLES = 1.5e6
+# 帧域验证开关：1 = 用 10 帧复核（默认），0 = 退回纯叠加域判据
+_LSP_FRAMES = 1     # 目标采样点数（自适应 step）
 
 _A_ZSUM = 14.0
 _A_CV = 0.45
@@ -967,7 +969,42 @@ def find_auto(img, logf=None, sigma=None):
     return ded
 
 
-def process_auto(img, logf=None, sigma=None):
+def _map_check(img, sampler, nframes, logf, npt=4, half=60, srch=24):
+    """DWT_LSPR_DEBUG=1 时打印「画布→帧」的星点残差（父 agent 要求 <0.5 px）。"""
+    import os as _os
+    if str(_os.environ.get('DWT_LSPR_DEBUG', '0')) in ('0', '', 'false', 'False'):
+        return
+    try:
+        from scipy.ndimage import maximum_filter as _mx, gaussian_filter as _gf
+    except Exception:
+        return
+    hp = img - _gf(np.where(np.isfinite(img), img, 0.0), 3.0)
+    ys, xs = np.where((hp == _mx(hp, 9)) & (hp > np.percentile(hp, 99.9)))
+    if ys.size == 0:
+        return
+    sel = np.linspace(0, ys.size - 1, min(npt, ys.size)).astype(int)
+    for i in sel:
+        j = int(i * (nframes - 1) / max(ys.size - 1, 1))
+        rec = sampler(j)
+        if rec is None:
+            continue
+        f = _to_frame(xs[i], ys[i], rec['dx'], rec['dy'],
+                      math.radians(rec['th']), rec['k'], rec['s'],
+                      rec.get('ox', 0.0), rec.get('oy', 0.0), rec.get('pf', 1.0))
+        fr = rec['img']
+        cx, cy = int(round(f[0])), int(round(f[1]))
+        if cx < half or cy < half or cx + half > fr.shape[1] or cy + half > fr.shape[0]:
+            continue
+        b = fr[cy - half:cy + half, cx - half:cx + half]
+        b = b - _gf(np.where(np.isfinite(b), b, 0.0), 3.0)
+        iy, ix = np.unravel_index(int(np.argmax(b)), b.shape)
+        d = math.hypot(ix - half, iy - half)
+        logf('  [LSPR][debug] 星点 (%d,%d) → 帧 (%d,%d) %d 帧  帧内峰偏差 %.2f px'
+             % (xs[i], ys[i], cx, cy, j, d))
+
+
+def process_auto(img, logf=None, sigma=None, sampler=None, nframes=0,
+                 sig_frame=None):
     """In-place: detect structures and subtract their measured profiles.
 
     Returns (n_structures, n_pixels_changed).  Pixels outside the detected
@@ -978,7 +1015,22 @@ def process_auto(img, logf=None, sigma=None):
         return 0, 0
     sts = find_auto(a, logf=logf, sigma=sigma)
     tot = 0
+    _nframe_use = 0
+    _sc0 = None
     for st in sts:
+        if sampler is not None and nframes:
+            st['_shape'] = a.shape
+            if _sc0 is None:
+                _r0 = sampler(0)
+                _sc0 = float(_r0['k']) if _r0 is not None else 1.0
+                _map_check(a, sampler, nframes, logf)
+            _res = frame_gate(st, sampler, nframes, logf=logf, n=10,
+                              wfac=max(1.5, 0.65 * float(st['width'])),
+                              off0=4.0, off1=8.0, ref=a, sc=_sc0,
+                              ampmin=0.06, sig_frame=sig_frame)
+            if not _res.get('ok', True):
+                continue
+            _nframe_use += 1
         _npx = _apply_band(a, st)
         tot += _npx
         if logf is not None:
@@ -1087,7 +1139,8 @@ def _refine_pt(img, px, py, ref, rx, ry, half=90, srch=36, step=3):
 
 
 def frame_gate(st, sampler, nframes, logf=None, n=10, wfac=1.5, off0=4.0,
-               off1=8.0, frac=0.8, zmin=1.0, w_px=None, ref=None, sc=1.0):
+               off1=8.0, frac=0.8, zmin=1.0, w_px=None, ref=None, sc=1.0,
+               ampmin=None, sig_frame=None):
     """对结构 st 做帧域验证。sampler(j) 返回 dict(img, dx, dy, th, k, s, ox, oy)。
 
     返回 dict(ok, frac, zmed, amp_med, n, amps, zs, frames, w).
@@ -1218,11 +1271,15 @@ def frame_gate(st, sampler, nframes, logf=None, n=10, wfac=1.5, off0=4.0,
     zmed = float(np.median(Z))
     amp_med = float(np.median(np.abs(A)))
     ok = bool(fr >= frac and abs(zmed) >= zmin and (zmed * sgn) > 0)
+    if ok and ampmin is not None and sig_frame is not None:
+        ok = bool(amp_med >= float(ampmin) * float(sig_frame))
     if logf is not None:
         logf('  [LSPR] 帧域验证 θ=%.2f ρ=%.1f：%d/%d 帧  符号一致 %.0f%%  '
-             'z 中位 %+.2f  |amp| 中位 %.3e  宽 %.2f px → %s'
+             'z 中位 %+.2f  |amp| 中位 %.3e（叠加 %.3e，比 %.2f）  宽 %.2f px → %s'
              % (st['theta'], st['rho'], len(used), len(idx), 100.0 * fr, zmed,
-                amp_med, (np.median(wf_used) if wf_used else 0.0),
+                amp_med, abs(float(st.get('amp', 0.0))),
+                (amp_med / max(abs(float(st.get('amp', 0.0))), 1e-30)),
+                (np.median(wf_used) if wf_used else 0.0),
                 '通过' if ok else '判为假线，不扣除'))
     return {'ok': ok, 'frac': fr, 'zmed': zmed, 'amp_med': amp_med,
             'n': len(used), 'amps': amps, 'zs': zs, 'frames': used,

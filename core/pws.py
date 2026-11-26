@@ -5000,6 +5000,46 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             try:
                 import lsp as _lsp_new
                 _t_lsp = time.time()
+                _lsp_smp = None
+                _lsp_nf = 0
+                _lsp_sf = None
+                try:
+                    if _lsp_new._LSP_FRAMES and int(n) > 1:
+                        _pl_s = float(drz_plan['s']) if drz_on else 1.0
+                        _pl_ox = float(drz_plan.get('ox', 0.0)) if drz_on else 0.0
+                        _pl_oy = float(drz_plan.get('oy', 0.0)) if drz_on else 0.0
+                        _dx_l = np.asarray(dx, np.float64)
+                        _dy_l = np.asarray(dy, np.float64)
+                        _th_l = np.asarray(th, np.float64)
+                        _kk_l = np.asarray(kk, np.float64)
+                        _cache_l = {}
+
+                        def _lsp_smp(j, _fs=fs, _dx=_dx_l, _dy=_dy_l, _th=_th_l,
+                                     _kk=_kk_l, _s=_pl_s, _ox=_pl_ox, _oy=_pl_oy,
+                                     _cc=_cache_l):
+                            j = int(j)
+                            if j in _cc:
+                                return _cc[j]
+                            try:
+                                _im = _fs.frame(j)
+                            except Exception:
+                                return None
+                            _cc[j] = {'img': _im, 'dx': float(_dx[j]),
+                                      'dy': float(_dy[j]), 'th': float(_th[j]),
+                                      'k': float(_kk[j]), 's': _s,
+                                      'ox': _ox, 'oy': _oy, 'pf': 1.0}
+                            return _cc[j]
+                        _lsp_nf = int(n)
+                        _lsp_sf = float(np.median(fs.sigma)) if fs.sigma is not None else None
+                except Exception as _e_lsp3:
+                    log('[LSPR] 帧域验证不可用（%s: %s），退回叠加域判据'
+                        % (type(_e_lsp3).__name__, _e_lsp3))
+                    _lsp_smp = None
+                # 帧域验证暂不接线：sampler 已备好（_lsp_smp/_lsp_nf/_lsp_sf），
+                # 但画布→帧映射的星点残差尚未压到 <0.5 px（见 CHANGELOG），
+                # 故仍走纯叠加域判据；接通只需把下面三行换成带 sampler 的调用。
+                # _lspn, _lspx = _lsp_new.process_auto(Stk, logf=log, sampler=_lsp_smp,
+                #                                      nframes=_lsp_nf, sig_frame=_lsp_sf)
                 _lspn, _lspx = _lsp_new.process_auto(Stk, logf=log)
                 log('[LSPR] 结构排异：检出并扣除 %d 条细长结构，改动 %d 像素'
                     '（%.3f%%），用时 %.2fs'
