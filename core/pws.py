@@ -4064,6 +4064,12 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     log(f'[网格] 参考图配准失败，退回包围盒画布：{_fi.get("error")}')
             except Exception as _e:
                 log(f'[网格] 参考网格不可用（{type(_e).__name__}: {_e}），退回包围盒画布')
+        # ---- --frame 与 --crop 同时给出：画布口径无法同时满足（裁剪块坐标与
+        #      参考栅格换算未通过验证：实测内容错位、corr≈0），这里显式告警。
+        if _frame_ref and int(crop or 0) > 0:
+            log('[网格] 警告：--frame 与 --crop 同时给出时，输出画布取参考整幅、'
+                '裁剪不起作用（该组合的画布换算未通过验证：实测内容错位 corr≈0）。'
+                '要裁剪请在 PI/Siril 里做，或去掉 --frame 用包围盒画布。')
         # ---- CFA：三通道必须共用同一个变换和同一张画布。各自配准会让画布差
         #      几个像素、通道之间整体错位（实测 R 12702 宽 vs G/B 12700 宽，
         #      合成出来是一堆分开的红绿蓝点）。这里存的必须是**帧块修正之后**的
