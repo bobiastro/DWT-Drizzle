@@ -166,6 +166,15 @@ Attribution of the residual (each row is a real run, not a model):
    pixels) while the background agrees to 1.58-1.79% of sky, i.e. below one sky
    noise sigma.
 
+The residual has a clean signature: the background matches to **-0.13 % of sky**
+(mean difference -7.3e-6, i.e. slightly darker on our side), while pixels brighter
+than 50x sky (638 px, saturated cores) come out **+4.4 % higher** on our side
+(median ratio 1.047).  A footprint/PSF-resampling difference - not a
+registration, weight or rejection difference - produces exactly that signature,
+and Python's own drizzle is a quantized lookup table (`_QUAD_NBIN = 96` sub-pixel
+bins, `_quad_table` in `core/drizzle.py`) whose rotated-square overlap cannot be
+reproduced bit-exactly by a separable formula.
+
 Note the acceptance bar `max|d| <= 3 * sky_noise = 3.5e-4` is not reachable even
 by Python against itself: its own rerun peaks at `7.17e-02` on a saturated core.
 
