@@ -969,38 +969,241 @@ def find_auto(img, logf=None, sigma=None):
     return ded
 
 
-def _map_check(img, sampler, nframes, logf, npt=4, half=60, srch=24):
-    """DWT_LSPR_DEBUG=1 时打印「画布→帧」的星点残差（父 agent 要求 <0.5 px）。"""
-    import os as _os
-    if str(_os.environ.get('DWT_LSPR_DEBUG', '0')) in ('0', '', 'false', 'False'):
-        return
+
+def _star_pts(img, n=14, sep=28, half=18):
+    """画布上挑 n 颗亮且互相分开的星：返回 [(x, y)] （亚像素）。"""
     try:
         from scipy.ndimage import maximum_filter as _mx, gaussian_filter as _gf
     except Exception:
-        return
-    hp = img - _gf(np.where(np.isfinite(img), img, 0.0), 3.0)
-    ys, xs = np.where((hp == _mx(hp, 9)) & (hp > np.percentile(hp, 99.9)))
+        return []
+    z = np.where(np.isfinite(img), img, np.nan)
+    _m = np.nanmedian(z)
+    hp = z - _gf(np.where(np.isfinite(z), z, _m), 3.0)
+    hp = np.where(np.isfinite(hp), hp, 0.0)
+    pk = (hp == _mx(hp, 9))
+    _thr = np.percentile(hp, 99.95)
+    ys, xs = np.where(pk & (hp > _thr))
     if ys.size == 0:
-        return
-    sel = np.linspace(0, ys.size - 1, min(npt, ys.size)).astype(int)
-    for i in sel:
-        j = int(i * (nframes - 1) / max(ys.size - 1, 1))
+        return []
+    amp = hp[ys, xs]
+    order = np.argsort(-amp)
+    out = []
+    for i in order:
+        x, y = float(xs[i]), float(ys[i])
+        if x < half + 4 or y < half + 4 or x > img.shape[1] - half - 4 or y > img.shape[0] - half - 4:
+            continue
+        if any((x - u) ** 2 + (y - v) ** 2 < sep * sep for u, v, _ in out):
+            continue
+        out.append((x, y, float(amp[i])))
+        if len(out) >= n:
+            break
+    return out
+
+
+def _subpeak(a, cx, cy, half=6):
+    """在 a[cy-half:cy+half, cx-half:cx+half] 里找峰并做 3×3 抛物线亚像素细化。"""
+    y0, y1 = max(0, cy - half), min(a.shape[0], cy + half + 1)
+    x0, x1 = max(0, cx - half), min(a.shape[1], cx + half + 1)
+    if y1 - y0 < 3 or x1 - x0 < 3:
+        return None
+    b = a[y0:y1, x0:x1].astype(np.float64)
+    b = b - np.nanmedian(b[np.isfinite(b)]) if np.isfinite(b).any() else b
+    iy, ix = np.unravel_index(int(np.nanargmax(b)), b.shape)
+    dx = dy = 0.0
+    if 0 < ix < b.shape[1] - 1 and 0 < iy < b.shape[0] - 1:
+        c, l, r = b[iy, ix], b[iy, ix - 1], b[iy, ix + 1]
+        u, d2 = b[iy - 1, ix], b[iy + 1, ix]
+        den = (2.0 * c - l - r)
+        if abs(den) > 1e-12:
+            dx = float(np.clip(0.5 * (l - r) / den, -0.5, 0.5))
+        den = (2.0 * c - u - d2)
+        if abs(den) > 1e-12:
+            dy = float(np.clip(0.5 * (u - d2) / den, -0.5, 0.5))
+    return (x0 + ix + dx, y0 + iy + dy)
+
+
+def _p_mat(p6):
+    """p[0..5] → 帧索引空间 → 画布索引空间 的 2×3（含 +0.5 像素中心修正）。"""
+    p0, p1, p2, p3, p4, p5 = (float(v) for v in p6[:6])
+    return np.array([[p0, p1, p2 + 0.5 * (p0 + p1)],
+                     [p3, p4, p5 + 0.5 * (p3 + p4)]], np.float64)
+
+
+def _fit_affine(img, sampler, nframes, logf, npt=14, srch=140, seed=7,
+                edge_px=2.0, sclim=0.005, tlim=2.0, nsample=10):
+    """用画面里的星点把 p 先验修正成逐帧仿射：2/3 拟合、1/3 留出，报留出残差。
+
+    返回 {j: {'A': 3×3 逆映射(画布→帧索引), 'med': 留出中位, 'p90': 留出 p90,
+              'n': 内点数, 'dt': (dx,dy), 'ds': 尺度差, 'dr': 旋转差(度), 'ok': bool}}
+    """
+    stars = _star_pts(img, npt)
+    if len(stars) < 10:
+        return {}
+    res = {}
+    rng = np.random.RandomState(int(seed) & 0x7FFFFFFF)
+    _js = np.unique(np.linspace(0, max(0, int(nframes) - 1),
+                                max(1, min(int(nsample), int(nframes)))).astype(int))
+    for j in list(_js):
+        rec = sampler(j)
+        if rec is None or rec.get('p') is None:
+            continue
+        fr = rec['img']
+        if fr is None:
+            continue
+        Pm = _p_mat(rec['p'])
+        can, frm = [], []
+        for (x, y, _a) in stars:
+            g = _p_to_frame(x, y, rec['p'])
+            if not (np.isfinite(g[0]) and np.isfinite(g[1])):
+                continue
+            s = _subpeak(fr, int(round(g[0])), int(round(g[1])), half=max(6, int(srch)))
+            if s is None:
+                continue
+            can.append((x, y))
+            frm.append(s)
+        n = len(can)
+        if n < 8:
+            continue
+        C = np.asarray(can, np.float64)
+        F = np.asarray(frm, np.float64)
+        # 以 p 为初值的残差门（防吸错星）：>srch 的点丢掉
+        _pre = np.hypot(*(Pm @ np.c_[F, np.ones(n)].T - C.T))
+        keep = _pre <= float(srch)
+        if keep.sum() < 8:
+            continue
+        C, F = C[keep], F[keep]
+        n = C.shape[0]
+        # 2/3 拟合 / 1/3 留出
+        idx = np.arange(n)
+        rng.shuffle(idx)
+        nfit = max(6, int(round(n * 2.0 / 3.0)))
+        fit, hold = idx[:nfit], idx[nfit:]
+        if hold.size < 3:
+            hold = idx[-3:]
+            fit = idx[:-3]
+        Am = np.c_[F[fit], np.ones(fit.size)]
+        # 最小二乘 F → C（帧索引 → 画布索引）
+        M, *_ = np.linalg.lstsq(Am, C[fit], rcond=None)
+        Rf = C[hold] - np.c_[F[hold], np.ones(hold.size)] @ M
+        rr = np.hypot(Rf[:, 0], Rf[:, 1])
+        med, p90 = float(np.median(rr)), float(np.percentile(rr, 90.0))
+        dt = M[2] - Pm[:, 2]
+        _s_p = float(np.linalg.norm(Pm[:, :2]))
+        _s_m = float(np.linalg.norm(M[:2, :]))
+        ds = (_s_m / _s_p - 1.0) if _s_p > 0 else 1.0
+        _a_p = math.atan2(Pm[1, 0] - Pm[0, 1], Pm[0, 0] + Pm[1, 1])
+        _a_m = math.atan2(M[1, 0] - M[0, 1], M[0, 0] + M[1, 1])
+        dr = math.degrees(_a_m - _a_p)
+        ok = (n >= 8 and med < 0.5 and p90 < 0.5
+              and abs(ds) <= sclim and float(np.hypot(dt[0], dt[1])) <= tlim)
+        # 反解出「画布 → 帧索引」的仿射，供 frame_gate 用
+        L = M[:2, :].T            # 2×2
+        try:
+            Li = np.linalg.inv(L)
+        except Exception:
+            continue
+        A = np.empty((2, 3), np.float64)
+        A[:, :2] = Li
+        A[:, 2] = -Li @ M[2, :]
+        res[int(j)] = {'A': A, 'med': med, 'p90': p90, 'n': int(n), 'ok': bool(ok),
+                       'dt': (float(dt[0]), float(dt[1])), 'ds': float(ds),
+                       'dr': float(dr)}
+        if logf is not None:
+            logf('  [LSPR][debug] 仿射 %d：内点 %d  留出残差 median %.2f / p90 %.2f px'
+                 '  Δ平移 (%+.2f,%+.2f) px  Δ尺度 %+.3f%%  Δ旋转 %+.3f°  %s'
+                 % (j, n, med, p90, dt[0], dt[1], 100.0 * ds, dr,
+                    '可信' if ok else '不可信'))
+    return res
+
+
+def _map_check(img, sampler, nframes, logf, npt=12, half=64, srch=90):
+    """DWT_LSPR_DEBUG=1 时量「画布→帧」映射的星点残差（父 agent 门槛 <0.5 px）。
+
+    取画布上 npt 颗最亮的孤立峰（高通滤波后 9×9 极大 + 99.9 分位），逐帧用
+    着色器同源的 p 逆映射到帧坐标，再在 ±srch 内找帧内峰，统计残差 median / p90。
+    """
+    import os as _os
+    if str(_os.environ.get('DWT_LSPR_DEBUG', '0')) in ('0', '', 'false', 'False'):
+        return None
+    try:
+        from scipy.ndimage import maximum_filter as _mx, gaussian_filter as _gf
+    except Exception:
+        return None
+    hp = img - _gf(np.where(np.isfinite(img), img, 0.0), 3.0)
+    _thr = np.percentile(hp[np.isfinite(hp)], 99.9)
+    ys, xs = np.where((hp == _mx(hp, 11)) & (hp > _thr))
+    if ys.size == 0:
+        return None
+    if ys.size > npt:
+        sel = np.linspace(0, ys.size - 1, npt).astype(int)
+        ys, xs = ys[sel], xs[sel]
+    res, rows, _all = [], [], []
+    _why = {'nosamp': 0, 'nofin': 0, 'oob': 0, 'far': 0, 'pk': 0}
+    _allT = []
+    for i in range(ys.size):
+        j = int(round(float(i) * (nframes - 1) / float(max(ys.size - 1, 1))))
         rec = sampler(j)
         if rec is None:
+            _why['nosamp'] += 1
             continue
-        f = _to_frame(xs[i], ys[i], rec['dx'], rec['dy'],
-                      math.radians(rec['th']), rec['k'], rec['s'],
-                      rec.get('ox', 0.0), rec.get('oy', 0.0), rec.get('pf', 1.0))
+        if rec.get('p') is not None:
+            f = _p_to_frame(xs[i], ys[i], rec['p'])
+            fT = _p_to_frame_T(xs[i], ys[i], rec['p'])
+        else:
+            f = _to_frame(xs[i], ys[i], rec['dx'], rec['dy'],
+                          math.radians(rec['th']), rec['k'], rec['s'],
+                          rec.get('ox', 0.0), rec.get('oy', 0.0), rec.get('pf', 1.0))
         fr = rec['img']
+        if fr is None or not (np.isfinite(f[0]) and np.isfinite(f[1])):
+            _why['nofin'] += 1
+            continue
         cx, cy = int(round(f[0])), int(round(f[1]))
-        if cx < half or cy < half or cx + half > fr.shape[1] or cy + half > fr.shape[0]:
+        if (cx < half or cy < half or cx + half > fr.shape[1]
+                or cy + half > fr.shape[0]):
+            _why['oob'] += 1
             continue
         b = fr[cy - half:cy + half, cx - half:cx + half]
         b = b - _gf(np.where(np.isfinite(b), b, 0.0), 3.0)
         iy, ix = np.unravel_index(int(np.argmax(b)), b.shape)
-        d = math.hypot(ix - half, iy - half)
-        logf('  [LSPR][debug] 星点 (%d,%d) → 帧 (%d,%d) %d 帧  帧内峰偏差 %.2f px'
-             % (xs[i], ys[i], cx, cy, j, d))
+        dxp, dyp = float(ix - half), float(iy - half)
+        d = math.hypot(dxp, dyp)
+        _all.append((d, dxp, dyp))
+        rows.append((int(xs[i]), int(ys[i]), int(cx), int(cy), j, dxp, dyp, d))
+        if d > srch:
+            _why['far'] += 1
+            continue
+        res.append(d)
+        # 变体 B 的同一测量（诊断用，不改变结果）
+        if rec.get('p') is not None and np.isfinite(fT[0]) and np.isfinite(fT[1]):
+            cxT, cyT = int(round(fT[0])), int(round(fT[1]))
+            if (cxT >= half and cyT >= half and cxT + half <= fr.shape[1]
+                    and cyT + half <= fr.shape[0]):
+                bT = fr[cyT - half:cyT + half, cxT - half:cxT + half]
+                bT = bT - _gf(np.where(np.isfinite(bT), bT, 0.0), 3.0)
+                iyT, ixT = np.unravel_index(int(np.argmax(bT)), bT.shape)
+                _allT.append(math.hypot(float(ixT - half), float(iyT - half)))
+        rows.append((xs[i], ys[i], cx, cy, j, dxp, dyp, d))
+    _aa = np.asarray(_all, np.float64) if _all else np.zeros((0, 3))
+    if _aa.shape[0]:
+        _d0 = _aa[:, 0]
+        logf('  [LSPR][debug] 映射校验：n=%d  偏移 median %.2f px  p90 %.2f px  max %.2f px'
+             % (_aa.shape[0], float(np.median(_d0)), float(np.percentile(_d0, 90.0)),
+                float(_d0.max())))
+    else:
+        logf('  [LSPR][debug] 映射校验：无可用点  %s  peaks=%d' % (_why, ys.size))
+        return None
+    for _row in rows[:8]:
+        logf('  [LSPR][debug]   画布(%d,%d) -> p 映射帧(%.1f,%.1f)[第%d帧] 帧内峰(%+.1f,%+.1f) 残差 %.2f px'
+             % (_row[0], _row[1], _row[2], _row[3], _row[4], _row[5], _row[6], _row[7]))
+    if _allT:
+        _t = np.asarray(_allT, np.float64)
+        logf('  [LSPR][debug] 映射校验(变体B 线性转置)：n=%d median %.2f px p90 %.2f px'
+             % (_t.size, float(np.median(_t)), float(np.percentile(_t, 90.0))))
+    nb = int((_aa[:, 0] <= srch).sum())
+    logf('  [LSPR][debug] 映射校验：<%.0fpx 的点 %d/%d' % (srch, nb, _aa.shape[0]))
+    return {'med': float(np.median(_aa[:, 0])),
+            'p90': float(np.percentile(_aa[:, 0], 90.0)),
+            'n': int(_aa.shape[0]), 'res': _aa[:, 0]}
 
 
 def process_auto(img, logf=None, sigma=None, sampler=None, nframes=0,
@@ -1017,17 +1220,41 @@ def process_auto(img, logf=None, sigma=None, sampler=None, nframes=0,
     tot = 0
     _nframe_use = 0
     _sc0 = None
+    _amap = {}
+    _nt = 0
+    if sampler is not None and nframes:
+        # 映射自检独立于「是否检出结构」：有结构要验证就得先证明映射准
+        try:
+            _r0 = sampler(0)
+            _sc0 = float((_r0 or {}).get('k', 1.0) or 1.0)
+            _map_check(a, sampler, nframes, logf)
+        except Exception as _e_mc:
+            if logf is not None:
+                logf('  [LSPR] 映射自检失败（%s: %s）' % (type(_e_mc).__name__, _e_mc))
+        try:
+            _amap = _fit_affine(a, sampler, nframes, logf)
+            _nt = sum(1 for _v in _amap.values() if _v.get('ok'))
+            if _nt == 0 and _amap:
+                _best = max(_v.get('n', 0) for _v in _amap.values())
+                _med = float(np.median([_v.get('med', 9.9) for _v in _amap.values()]))
+                if logf is not None:
+                    logf('  [LSPR] 帧域映射不可信（内点 %d/留出残差 %.2fpx）→ 本次跳过验证'
+                         % (_best, _med))
+        except Exception as _e_af:
+            if logf is not None:
+                logf('  [LSPR] 仿射拟合失败（%s: %s）→ 本次跳过验证'
+                     % (type(_e_af).__name__, _e_af))
+            _amap, _nt = {}, 0
     for st in sts:
-        if sampler is not None and nframes:
+        if sampler is not None and nframes and _nt > 0:
             st['_shape'] = a.shape
             if _sc0 is None:
                 _r0 = sampler(0)
-                _sc0 = float(_r0['k']) if _r0 is not None else 1.0
-                _map_check(a, sampler, nframes, logf)
+                _sc0 = float((_r0 or {}).get('k', 1.0) or 1.0)
             _res = frame_gate(st, sampler, nframes, logf=logf, n=10,
                               wfac=max(1.5, 0.65 * float(st['width'])),
                               off0=4.0, off1=8.0, ref=a, sc=_sc0,
-                              ampmin=0.06, sig_frame=sig_frame)
+                              ampmin=0.06, sig_frame=sig_frame, amap=_amap)
             if not _res.get('ok', True):
                 continue
             _nframe_use += 1
@@ -1075,6 +1302,33 @@ def _to_frame(x, y, dx, dy, th, k, s, ox=0.0, oy=0.0, pf=1.0):
     u = (float(x) - ox + s * float(dx)) / s
     v = (float(y) - oy + s * float(dy)) / s
     return ((ct * u + stn * v) / (k * pf), (-stn * u + ct * v) / (k * pf))
+
+
+def _p_to_frame_T(x, y, p6):
+    """同上，但线性部分按 [[p0,p3],[p1,p4]] 解（Q.b/Q.d 互换的变体，用于诊断）。"""
+    p0, p1, p2, p3, p4, p5 = (float(v) for v in p6[:6])
+    det = p0 * p4 - p1 * p3
+    if not np.isfinite(det) or abs(det) < 1e-12:
+        return (float('nan'), float('nan'))
+    u = float(x) - p2
+    v = float(y) - p5
+    return ((p0 * u + p3 * v) / det - 0.5, (p1 * u + p4 * v) / det - 0.5)
+
+
+def _p_to_frame(x, y, p6):
+    """画布坐标 → 单帧坐标，用着色器同源的 2×3 变换 p[0..5] 求逆。
+
+    着色器正向：X = p0*(gx+0.5) + p1*(gy+0.5) + p2
+                Y = p3*(gx+0.5) + p4*(gy+0.5) + p5
+    这里解出 (gx, gy)；与 drizzle 逐位同源，不需要在外层重算 dx/dy/th/kk/ox/oy。
+    """
+    p0, p1, p2, p3, p4, p5 = (float(v) for v in p6[:6])
+    det = p0 * p4 - p1 * p3
+    if not np.isfinite(det) or abs(det) < 1e-12:
+        return (float('nan'), float('nan'))
+    u = float(x) - p2
+    v = float(y) - p5
+    return ((p4 * u - p1 * v) / det - 0.5, (-p3 * u + p0 * v) / det - 0.5)
 
 
 def _chord_pts(hh, ww, theta, rho, margin=4.0):
@@ -1140,7 +1394,7 @@ def _refine_pt(img, px, py, ref, rx, ry, half=90, srch=36, step=3):
 
 def frame_gate(st, sampler, nframes, logf=None, n=10, wfac=1.5, off0=4.0,
                off1=8.0, frac=0.8, zmin=1.0, w_px=None, ref=None, sc=1.0,
-               ampmin=None, sig_frame=None):
+               ampmin=None, sig_frame=None, amap=None):
     """对结构 st 做帧域验证。sampler(j) 返回 dict(img, dx, dy, th, k, s, ox, oy)。
 
     返回 dict(ok, frac, zmed, amp_med, n, amps, zs, frames, w).
@@ -1169,6 +1423,7 @@ def frame_gate(st, sampler, nframes, logf=None, n=10, wfac=1.5, off0=4.0,
     idx = sorted(set(int(round(i * (nframes - 1) / float(max(n - 1, 1))))
                      for i in range(n)))
     amps, zs, used, wf_used = [], [], [], []
+    _am = amap or {}
     for j in idx:
         rec = sampler(j)
         if rec is None:
@@ -1176,14 +1431,25 @@ def frame_gate(st, sampler, nframes, logf=None, n=10, wfac=1.5, off0=4.0,
         img = rec['img']
         if img is None:
             continue
-        f1 = _to_frame(q[0][0], q[0][1], rec['dx'], rec['dy'],
-                       math.radians(rec['th']), rec['k'], rec['s'],
-                       rec.get('ox', 0.0), rec.get('oy', 0.0),
-                       rec.get('pf', 1.0))
-        f2 = _to_frame(q[1][0], q[1][1], rec['dx'], rec['dy'],
-                       math.radians(rec['th']), rec['k'], rec['s'],
-                       rec.get('ox', 0.0), rec.get('oy', 0.0),
-                       rec.get('pf', 1.0))
+        _A = (_am.get(int(j)) or {})
+        if _A.get('ok') and _A.get('A') is not None:
+            _Ai = _A['A']
+            f1 = (_Ai[0, 0] * q[0][0] + _Ai[0, 1] * q[0][1] + _Ai[0, 2],
+                  _Ai[1, 0] * q[0][0] + _Ai[1, 1] * q[0][1] + _Ai[1, 2])
+            f2 = (_Ai[0, 0] * q[1][0] + _Ai[0, 1] * q[1][1] + _Ai[0, 2],
+                  _Ai[1, 0] * q[1][0] + _Ai[1, 1] * q[1][1] + _Ai[1, 2])
+        elif rec.get('p') is not None:
+            f1 = _p_to_frame(q[0][0], q[0][1], rec['p'])
+            f2 = _p_to_frame(q[1][0], q[1][1], rec['p'])
+        else:
+            f1 = _to_frame(q[0][0], q[0][1], rec['dx'], rec['dy'],
+                           math.radians(rec['th']), rec['k'], rec['s'],
+                           rec.get('ox', 0.0), rec.get('oy', 0.0),
+                           rec.get('pf', 1.0))
+            f2 = _to_frame(q[1][0], q[1][1], rec['dx'], rec['dy'],
+                           math.radians(rec['th']), rec['k'], rec['s'],
+                           rec.get('ox', 0.0), rec.get('oy', 0.0),
+                           rec.get('pf', 1.0))
         Lf = math.hypot(f2[0] - f1[0], f2[1] - f1[1])
         if not (np.isfinite(Lf) and Lf > 20.0):
             continue

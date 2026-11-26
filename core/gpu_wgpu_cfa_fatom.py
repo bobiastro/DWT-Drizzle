@@ -34,7 +34,7 @@ struct QP {
   y_off: u32, c0: u32, r0: u32, mask: u32,
   P: f32, lnc: f32, lns: f32, wa: f32, wb: f32, has_r: f32, kclip: f32,
   mode: f32, s_off: u32, lnt: f32, mgate: f32, sky: f32, sfac: f32, beta: f32,
-  kt: u32, capl: f32,
+  kt: u32, capl: f32, klsp: f32, khalf: f32,
 };
 
 @group(0) @binding(0) var<storage, read> src: array<f32>;
@@ -48,6 +48,10 @@ struct QP {
 @group(0) @binding(8) var<storage, read_write> aW2: array<atomic<f32>>;
 @group(0) @binding(9) var<storage, read_write> aBad: array<atomic<u32>>;
 @group(0) @binding(10) var<storage, read> ctile: array<f32>;
+@group(0) @binding(11) var<storage, read_write> aWe: array<atomic<f32>>;
+@group(0) @binding(12) var<storage, read_write> aWDe: array<atomic<f32>>;
+@group(0) @binding(13) var<storage, read_write> aCnte: array<atomic<f32>>;
+@group(0) @binding(14) var<storage, read_write> aHits: array<atomic<f32>>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -137,6 +141,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicAdd(&aW[idx], w);
         atomicAdd(&aV[idx], w * v);
         atomicAdd(&aW2[idx], w * w);
+        if (Q.klsp > 0.5) { atomicAdd(&aHits[idx], 1.0); }
+        if (Q.klsp > 0.5 && abs(v - mu[idx]) > Q.khalf * sref) {
+          atomicAdd(&aWe[idx], w);
+          atomicAdd(&aWDe[idx], w * v);
+          atomicAdd(&aCnte[idx], 1.0);
+        }
       }
     }
   }
@@ -231,7 +241,7 @@ def _pipes(dev):
 def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                     R=None, pixfrac=1.0, band_rows=512, T=None, fp=1.0,
                     log=None, pattern=None, channel=None, beta=None, Ctiles=None,
-                    cap=None, **kw):
+                    cap=None, want_p=False, **kw):
     if not available():
         raise RuntimeError('适配器不支持 shader-float32-atomic')
     dev, queue = G._device_f32()
@@ -275,7 +285,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     cov = np.zeros((H, W), np.float32)
     neff = np.zeros((H, W), np.float32)
 
-    p = np.zeros(30, np.float32)
+    p = np.zeros(32, np.float32)
     # 排异的信号比例门（对齐 CPU 的 thr = rej_k·σ + m·(R·信号)）：
     # m 是标量，CPU 从逐帧 dev/sig 的 99 分位再取中位估出来；这里先按经验值，
     # 用 DWT_MGATE 可调（0 = 退回旧的纯 σ 判据）。
@@ -299,6 +309,13 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         p[29] = np.float32(0.5 * math.log(max((_nf - 1) * _cap / (1.0 - _cap), 1e-9)))
     else:
         p[29] = np.float32(0.0)
+    p[30] = np.float32(1.0 if float(os.environ.get('DWT_LSP', '0') or 0) > 0.5 else 0.0)
+    # want_p：逐帧记录着色器实际使用的 2×3 变换 [p0,p1,p2,p3,p4,p5]
+    #   X = p0*(gx+0.5) + p1*(gy+0.5) + p2
+    #   Y = p3*(gx+0.5) + p4*(gy+0.5) + p5
+    # 帧域验证需要它的**逆**（与 drizzle 逐位同源，避免在外层用 dx/dy/th/kk 重算）
+    _pcol = {}
+    p[31] = np.float32(max(1.0, 0.5 * float(rej_k)))
     p[14] = np.float32(P)
     p[17] = np.float32(float(A))
     p[18] = np.float32(float(B))
@@ -318,6 +335,21 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         n_pix = int(bh * W)
         aW, aV, aD, aW2 = sbuf(n_pix), sbuf(n_pix), sbuf(n_pix), sbuf(n_pix)
         aBad = dev.create_buffer(size=8, usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
+        _lsp_on = float(os.environ.get('DWT_LSP', '0') or 0) > 0.5
+        if _lsp_on:
+            aWe = dev.create_buffer(size=n_pix * 4, usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
+            aWDe = dev.create_buffer(size=n_pix * 4, usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
+            aCnte = dev.create_buffer(size=n_pix * 4, usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
+            aHits = dev.create_buffer(size=n_pix * 4, usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
+            queue.write_buffer(aHits, 0, np.zeros(n_pix, np.float32).tobytes())
+            queue.write_buffer(aWe, 0, np.zeros(n_pix, np.float32).tobytes())
+            queue.write_buffer(aWDe, 0, np.zeros(n_pix, np.float32).tobytes())
+            queue.write_buffer(aCnte, 0, np.zeros(n_pix, np.float32).tobytes())
+        else:
+            aWe = dev.create_buffer(size=4, usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
+            aWDe = dev.create_buffer(size=4, usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
+            aCnte = dev.create_buffer(size=4, usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
+            aHits = dev.create_buffer(size=4, usage=U.STORAGE | U.COPY_SRC | U.COPY_DST)
         bMu, bSd = sbuf(n_pix), sbuf(n_pix)
         oOut, oCov, oNef = sbuf(n_pix), sbuf(n_pix), sbuf(n_pix)
 
@@ -447,6 +479,9 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                 p[3] = np.float32(s_grid * ks * stn)
                 p[4] = np.float32(s_grid * ks * ct)
                 p[5] = np.float32(s_grid * -float(dy[j]) + oy)
+                if want_p:
+                    _pcol[int(j)] = (float(p[0]), float(p[1]), float(p[2]),
+                                     float(p[3]), float(p[4]), float(p[5]))
                 pu[22] = np.uint32(0 if _ring else k * plane)
                 if C is not None:
                     p[15] = np.float32(np.log(max(float(C[int(j)]), 1e-6)))
@@ -479,6 +514,10 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                     {'binding': 8, 'resource': {'buffer': aW2, 'offset': 0, 'size': n_pix * 4}},
                     {'binding': 9, 'resource': {'buffer': aBad, 'offset': 0, 'size': 8}},
                     {'binding': 10, 'resource': {'buffer': bCt, 'offset': 0, 'size': _ctn * 4}},
+                    {'binding': 11, 'resource': {'buffer': aWe, 'offset': 0, 'size': (n_pix * 4 if _lsp_on else 4)}},
+                    {'binding': 12, 'resource': {'buffer': aWDe, 'offset': 0, 'size': (n_pix * 4 if _lsp_on else 4)}},
+                    {'binding': 13, 'resource': {'buffer': aCnte, 'offset': 0, 'size': (n_pix * 4 if _lsp_on else 4)}},
+                    {'binding': 14, 'resource': {'buffer': aHits, 'offset': 0, 'size': (n_pix * 4 if _lsp_on else 4)}},
                 ])
                 cp.set_pipeline(pipe)
                 cp.set_bind_group(0, bg)
@@ -645,5 +684,16 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
     _rate = (100.0 * _bad / _tot) if _tot else 0.0
     if log:
         log('[wgpu] 剔除率 %.3f%%（%d / %d 个 tap）' % (_rate, _bad, _tot))
-    return {'stack': stack, 'cov': cov, 'neff': neff, 'rej_rate': float(_rate) / 100.0,   # 接口约定是 0~1 小数，日志里才是百分数
-            'wmax': float(cov.max()) if cov.size else 0.0}
+    _lsp_out = None
+    if float(os.environ.get('DWT_LSP', '0') or 0) > 0.5:
+        try:
+            np.save(str(os.environ.get('DWT_LSP_DUMP', '')) or 'H:/Temp/cnte.npy', np.frombuffer(queue.read_buffer(aCnte), np.float32).copy()) if os.environ.get('DWT_LSP_DUMP') else None
+        except Exception:
+            pass
+        _lsp_out = {'we': np.frombuffer(queue.read_buffer(aWe), np.float32).copy(),
+                    'wde': np.frombuffer(queue.read_buffer(aWDe), np.float32).copy(),
+                    'cnte': np.frombuffer(queue.read_buffer(aCnte), np.float32).copy(),
+                    'hits': np.frombuffer(queue.read_buffer(aHits), np.float32).copy()}
+    return {'lsp': _lsp_out, 'stack': stack, 'cov': cov, 'neff': neff, 'rej_rate': float(_rate) / 100.0,   # 接口约定是 0~1 小数，日志里才是百分数
+            'wmax': float(cov.max()) if cov.size else 0.0,
+            'p': (_pcol if want_p else None)}

@@ -4555,7 +4555,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 beta=float(_detail_beta(p)),
                                 cap=float(getattr(p, 'max_share', 0.0) or 0.0),
                                 # 逐瓦片清晰度（可选）：让每个区域各自挑最锐的帧
-                                Ctiles=C_tiles)
+                                Ctiles=C_tiles,
+                                # 帧域验证需要着色器实际用的 2×3 变换（p[0..5]）
+                                want_p=True)
                             try:
                                 # cropcover.crop_box 要的是「每像素被多少帧覆盖」的计数图；
                                 # fatom 返回的 cov 是权重和（< 帧数、边缘更小），直接当计数
@@ -4597,6 +4599,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     % (type(_e_wgpu).__name__, _e_wgpu))
                 _use_wgpu = False
                 r_d = _do_stack()
+            try:
+                _lsp_pmap = r_d.get('p') if isinstance(r_d, dict) else None
+            except Exception:
+                _lsp_pmap = None
             if bool(int(getattr(p, 'two_pass', 0) or 0)):
                 _wmap = _local_sharp_maps(fs, np.arange(n), drz_plan, 64, log)
                 if _wmap is not None:
@@ -5004,43 +5010,82 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _lsp_nf = 0
                 _lsp_sf = None
                 try:
-                    if _lsp_new._LSP_FRAMES and int(n) > 1:
-                        _pl_s = float(drz_plan['s']) if drz_on else 1.0
-                        _pl_ox = float(drz_plan.get('ox', 0.0)) if drz_on else 0.0
-                        _pl_oy = float(drz_plan.get('oy', 0.0)) if drz_on else 0.0
-                        _dx_l = np.asarray(dx, np.float64)
-                        _dy_l = np.asarray(dy, np.float64)
-                        _th_l = np.asarray(th, np.float64)
-                        _kk_l = np.asarray(kk, np.float64)
+                    if _lsp_new._LSP_FRAMES and int(n) > 1 and _lsp_pmap:
+                        _pm_l = dict(_lsp_pmap)
+                        _DBG_L = str(os.environ.get('DWT_LSPR_DEBUG','0')) in ('1','true','True')
                         _cache_l = {}
+                        _pmap = {}
+                        try:
+                            for _r0, _d0, _fl0 in os.walk(str(getattr(p, 'photos', '') or '')):
+                                for _f0 in _fl0:
+                                    if _f0.lower().endswith('.xisf'):
+                                        _pmap[_f0] = os.path.join(_r0, _f0)
+                        except Exception:
+                            _pmap = {}
 
-                        def _lsp_smp(j, _fs=fs, _dx=_dx_l, _dy=_dy_l, _th=_th_l,
-                                     _kk=_kk_l, _s=_pl_s, _ox=_pl_ox, _oy=_pl_oy,
-                                     _cc=_cache_l):
+                        def _lsp_smp(j, _fs=fs, _pm=_pm_l, _cc=_cache_l, _pmap=_pmap):
                             j = int(j)
                             if j in _cc:
                                 return _cc[j]
-                            try:
-                                _im = _fs.frame(j)
-                            except Exception:
+                            _p6 = _pm.get(j)
+                            if _p6 is None:
+                                if _DBG_L:
+                                    try: log('[LSPR][debug] 无 p 表项 j=%d（键 %s）' % (j, sorted(_pm.keys())[:5]))
+                                    except Exception: pass
                                 return None
-                            _cc[j] = {'img': _im, 'dx': float(_dx[j]),
-                                      'dy': float(_dy[j]), 'th': float(_th[j]),
-                                      'k': float(_kk[j]), 's': _s,
-                                      'ox': _ox, 'oy': _oy, 'pf': 1.0}
+                            # 父进程里 fs.frame() 在多进程后端下不可用（frame 数据在子进程/临时 memmap），
+                            # 直接读 memmap 视图即可：帧域验证只要「带内 vs 带外中位差」的相对量，
+                            # 曝光归一/天空常数平移都不影响该差值。
+                            _im = None
+                            try:
+                                _mmv = getattr(_fs, 'mm', None)
+                                if _mmv is not None:
+                                    _im = _mmv[j]
+                                else:
+                                    _arr = getattr(_fs, 'arrays', None)
+                                    if _arr is not None:
+                                        _im = _arr[j]
+                                    else:
+                                        # 叠加结束时 memmap 已删除、父进程不留帧：
+                                        # 帧域验证只读被测的那几帧（≤10），从原始 XISF 取。
+                                        _fnm = (list(getattr(_fs, 'names', None) or []))
+                                        _pth = _pmap.get(_fnm[j]) if j < len(_fnm) else None
+                                        if _pth:
+                                            from xisf_io import read_xisf as _rxf
+                                            _lst = _rxf(_pth)
+                                            _im = _lst[0].data if _lst else None
+                            except Exception as _e_fr:
+                                if _DBG_L:
+                                    try: log('[LSPR][debug] 读帧失败 j=%d %s: %s' % (j, type(_e_fr).__name__, _e_fr))
+                                    except Exception: pass
+                                _im = None
+                            if _im is None:
+                                return None
+                            # p6 = (p0,p1,p2,p3,p4,p5)，语义见 gpu_wgpu_cfa_fatom：
+                            #   X = p0*(gx+0.5) + p1*(gy+0.5) + p2
+                            _cc[j] = {'img': _im, 'p': _p6, 'k': 1.0}
+                            if _DBG_L and len(_cc) <= 3:
+                                try: log('[LSPR][debug] sampler j=%d img %s p=(%.4f,%.4f,%.2f,%.4f,%.4f,%.2f)' % (j, getattr(_im,'shape',None), _p6[0], _p6[1], _p6[2], _p6[3], _p6[4], _p6[5]))
+                                except Exception: pass
                             return _cc[j]
-                        _lsp_nf = int(n)
+                        _lsp_nf = int(len(_pm_l))
                         _lsp_sf = float(np.median(fs.sigma)) if fs.sigma is not None else None
+                        log('[LSPR] 帧域验证：p 表 %d 帧（着色器同源）' % _lsp_nf)
+                        if _DBG_L:
+                            try:
+                                log('[LSPR][debug] fs: shape=%s n=%d mm=%s arrays=%s path=%s exists=%s'
+                                    % (fs.shape, fs.n, 'None' if getattr(fs,'mm',None) is None else 'ok',
+                                       'None' if getattr(fs,'arrays',None) is None else 'ok',
+                                       getattr(fs,'path',None),
+                                       getattr(getattr(fs,'path',None),'exists',lambda: 'n/a')()))
+                            except Exception as _e_d:
+                                log('[LSPR][debug] fs dump 失败 %s' % _e_d)
                 except Exception as _e_lsp3:
                     log('[LSPR] 帧域验证不可用（%s: %s），退回叠加域判据'
                         % (type(_e_lsp3).__name__, _e_lsp3))
                     _lsp_smp = None
-                # 帧域验证暂不接线：sampler 已备好（_lsp_smp/_lsp_nf/_lsp_sf），
-                # 但画布→帧映射的星点残差尚未压到 <0.5 px（见 CHANGELOG），
-                # 故仍走纯叠加域判据；接通只需把下面三行换成带 sampler 的调用。
-                # _lspn, _lspx = _lsp_new.process_auto(Stk, logf=log, sampler=_lsp_smp,
-                #                                      nframes=_lsp_nf, sig_frame=_lsp_sf)
-                _lspn, _lspx = _lsp_new.process_auto(Stk, logf=log)
+                _lspn, _lspx = _lsp_new.process_auto(Stk, logf=log, sampler=_lsp_smp,
+                                                     nframes=_lsp_nf, sig_frame=_lsp_sf)
                 log('[LSPR] 结构排异：检出并扣除 %d 条细长结构，改动 %d 像素'
                     '（%.3f%%），用时 %.2fs'
                     % (_lspn, _lspx, 100.0 * _lspx / float(max(1, Stk.size)), time.time() - _t_lsp))
