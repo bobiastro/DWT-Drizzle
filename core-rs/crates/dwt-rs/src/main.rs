@@ -52,6 +52,7 @@ struct Args {
     rej_k: f32,
     star_grow: f32,
     r_floor: f32,
+    drop_mul: f32,
     bgdeg: usize,
     star_grow_fixed: f32,
     dump_r: Option<String>,
@@ -94,6 +95,7 @@ impl Default for Args {
             rej_k: REJ_K,
             star_grow: 100.0,
             r_floor: 0.0,
+            drop_mul: 0.0,
             bgdeg: 1,
             star_grow_fixed: -1.0,
             dump_r: None,
@@ -227,6 +229,10 @@ fn parse_args() -> Result<Args, String> {
                 a.r_floor = num(val()?, flag)? as f32;
                 i += 2;
             }
+            "--drop-mul" => {
+                a.drop_mul = num(val()?, flag)? as f32;
+                i += 2;
+            }
             "--bgdeg" => {
                 a.bgdeg = num(val()?, flag)? as usize;
                 i += 2;
@@ -303,7 +309,23 @@ fn parse_args() -> Result<Args, String> {
 
 const USAGE: &str = "dwt-rs --photos <dir> --out <dir> --tag t --limit N --crop 400 \
 [--pick O] [--drizzle 1] [--drizzle-scale 2] [--drizzle-pix 1] [--A 6] [--B 2] \
-[--aligned 1] [--center cy,cx] [--save-aux 1] [--report] [--gpu off|auto] [--jobs N]";
+[--aligned 1] [--center cy,cx] [--save-aux 1] [--report] [--gpu off|auto] [--jobs N]
+
+aligned stacks (--aligned 1, no registration):
+  --crop N        cut an N x N window out of every frame; matches Python's crop
+                  path bit for bit.
+registration (--aligned 0 / --register 1), used to stack un-aligned frames:
+  --canvas-from F adopt the W/H of a reference stack; registration turns on
+                  automatically, and the run aborts when its own solution
+                  disagrees with the reference by >0.5 deg or >1% in scale.
+  --geom F        inject an external 'idx dx dy theta k' registration table.
+  --ref-frame N   the frame that is the identity of the similarity chain.
+  --drop-mul F    drizzle drop side in output pixels; defaults to 2.0 when
+                  rotating (core/drizzle.py:1867) and 1.0 otherwise.
+  NOTE: --crop N (N > 0) plus registration is REFUSED on purpose, exit code 1
+  and no output file: Python's crop builds a shift bounding box plus a centre
+  crop, so a plain input-window crop would silently emit a different region.
+  Pass --canvas-from, or use --aligned 1.";
 
 fn run() -> Result<(), String> {
     let a = parse_args()?;
@@ -553,10 +575,24 @@ fn run() -> Result<(), String> {
         }
         None => None,
     };
-    let register = match a.register {
+    let mut register = match a.register {
         Some(v) => v,
         None => !a.aligned,
     };
+    // `--canvas-from` names a reference stacked product, which can only be
+    // reproduced on the same grid when the frames are actually placed with a
+    // similarity transform; silently falling back to a plain mean would emit a
+    // different region, which is exactly what the flag exists to prevent.
+    if canvas.is_some() && !register {
+        println!("[画布] --canvas-from 需要配准；已自动启用 --register 1");
+        register = true;
+    }
+    if a.crop > 0 && canvas.is_none() && register && std::env::var("DWT_RS_ALLOW_CROP_REG").is_err() {
+        return Err(format!(
+            "--crop {} 搭配配准（未给 --aligned 1）时，Python 的画布是「位移包围盒 + 中心裁剪」，本进程若只裁输入窗，输出区域与 Python 不同；请改用 --canvas-from <参考成品.xisf> 指定画布，或加 --aligned 1 走已对齐路径（该路径的裁剪与 Python 逐位一致）",
+            a.crop
+        ));
+    }
     let mut sims: Vec<dwt_rs::register::Sim> = vec![dwt_rs::register::Sim::identity(); frames.len()];
     if register {
         let t = Instant::now();
@@ -859,12 +895,25 @@ fn run() -> Result<(), String> {
             }
         }
         let mut acc = Acc::new(plan);
+        // core/drizzle.py:1867 -- the rotating branch passes
+        // `Pi = pixfrac * s * kk * _pm` with `_pm` defaulting to 2.0 (a 2x drop
+        // side, so that the phase holes left by a thin dither still fill in).
+        // The non-rotating branch uses `P = pixfrac * s` (drizzle.py:2083), so the
+        // multiplier only applies when a similarity transform is in play.
+        let dmul = if a.drop_mul > 0.0 {
+            a.drop_mul
+        } else if register {
+            2.0
+        } else {
+            1.0
+        };
+        let pf = a.dpix * dmul;
         for i in 0..frames.len() {
             let s = sims[i];
-            drizzle_add(&mut acc, &frames[i], s.ux, s.uy, s.theta, s.k, a.dpix, &wts[i].d);
+            drizzle_add(&mut acc, &frames[i], s.ux, s.uy, s.theta, s.k, pf, &wts[i].d);
         }
         let img = acc.finish();
-        println!("[drizzle] 输出 {}x{}  scale={} pixfrac={}  ox={} oy={}", img.w, img.h, a.dscale, a.dpix, plan.ox, plan.oy);
+        println!("[drizzle] 输出 {}x{}  scale={} pixfrac={} (x{}) drop_mul={}  ox={} oy={}", img.w, img.h, a.dscale, a.dpix, pf, dmul, plan.ox, plan.oy);
         (img, Vec::new(), rate)
     } else {
         let res = stack_strip(

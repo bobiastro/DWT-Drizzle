@@ -32,7 +32,10 @@ pub fn strip_weights(
             let rp = r.d[p];
             let mut v = a_exp * rp * lc[i] + (b_exp * (1.0 - rp) + beta * rp) * ls[i];
             if l_cap.is_finite() {
-                v = v.clamp(-l_cap, l_cap);
+                // `numpy.clip(v, -L, L)` returns `L` for every element when L < 0
+                // (min > max), which is what happens with n = 2 and cap = 0.25;
+                // `f32::clamp` panics there, so mirror numpy's behaviour.
+                v = if l_cap < 0.0 { l_cap } else { v.clamp(-l_cap, l_cap) };
             }
             row[p] = v;
         }

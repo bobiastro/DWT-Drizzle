@@ -143,40 +143,75 @@ what the parity attribution below uses to separate the registration solution
 from the rest of the pipeline.
 
 Measured against `G:/HFG1-3/pyf/PWS_pyf.xisf` (8 frames, 2783x2228, sky
-5.64e-3, sky noise 1.15e-4):
+5.64e-3, sky noise 1.15e-4).  The mask below is the one requested for the
+acceptance report: it drops star cores (B > 3x sky) and anything more than
+10x the sky noise above sky, i.e. it measures the *background* agreement.
 
-| pair | all pixels corr | rms | background (99.8%) rms | star cores (0.16%) rms |
-|---|---|---|---|---|
-| Python rerun vs reference | 0.99941 | 2.04e-04 | 1.26e-04 (2.24% sky) | 3.92e-03 |
-| dwt-rs, `--geom` (Python's solution) | 0.99551 | 6.07e-04 | 1.01e-04 (1.79% sky) | 1.06e-02 |
-| dwt-rs, own registration | 0.99323 | 7.33e-04 | - | - |
-| dwt-rs `--A 0 --B 0` vs Python `--A 0 --B 0` | 0.99776 | 4.57e-04 | 8.92e-05 (1.58% sky) | 1.10e-02 |
+| pair | region | pixels | corr | max abs d / sky | rms / sky |
+|---|---|---|---|---|---|
+| Python rerun vs reference (ceiling) | all | 100 % | 0.999412 | 12.71 | 0.0361 |
+| Python rerun vs reference (ceiling) | masked | 98.94 % | 0.991845 | 0.307 | 0.00280 |
+| dwt-rs, `--geom` (Python's own solution) | all | 100 % | **0.999867** | 10.46 | 0.0172 |
+| dwt-rs, `--geom` (Python's own solution) | masked | 98.94 % | 0.981598 | 1.669 | 0.00430 |
+| dwt-rs, own registration | all | 100 % | 0.997764 | 10.12 | 0.0703 |
+| dwt-rs, own registration | masked | 98.94 % | 0.972477 | 1.700 | 0.00520 |
+
+The masked `max|d|` is set by 43 isolated pixels (0.0007 % of the mask) that sit
+up to 82x the sky noise (1.67x sky) above the reference; dropping the 40 worst
+lifts the same run to `corr 0.986475`, `max|d|/sky 0.415`, `rms/sky 0.00373`.
+They are single-frame hits (cosmic rays / hot pixels) that survive our
+input-grid rejection; Python rejects on the *output* grid and removes them.
+Note that this acceptance metric cannot reach the 3.5e-4 bar even for Python
+against itself: its own rerun differs from this reference by up to
+`1.73e-3` (0.31x sky) inside the same mask, because the input files are the
+same but the rejection/merge is not bit-reproducible across runs.  The number
+that *is* achievable is the all-pixel `corr`, where dwt-rs (0.999867) is
+slightly better than the Python rerun (0.999412).
 
 Attribution of the residual (each row is a real run, not a model):
 
 1. registration solution - **eliminated**: with `--geom` the fitted residual is
    `rot -0.0000 deg, k 0.999992, shift (0.01, -0.02) px`; our own solution
    reproduces Python's within 0.1 px / 0.002 deg per frame.
-2. C table (per-frame FWHM) - **eliminated**: injecting
-   `PWS_pyf_weights.txt` moves corr from 0.997878 to 0.997848.
+2. C table (per-frame FWHM) - **eliminated**: injecting `PWS_pyf_weights.txt`
+   moves corr from 0.997878 to 0.997848.
 3. S table (per-frame sigma) - **eliminated**: same injection (it carries S).
-4. drizzle sampling - **this is the remaining term**: switching the weights off
-   entirely (`--A 0 --B 0` on both sides) leaves the same residual (0.99776),
-   and the difference is concentrated on star cores (rms 1.1e-2 on 0.16% of
-   pixels) while the background agrees to 1.58-1.79% of sky, i.e. below one sky
-   noise sigma.
+4. drizzle sampling - **this was the remaining term, and it is now matched**.
+   `core/drizzle.py:1867` uses `Pi = pixfrac * s * kk * 2.0` in the *rotating*
+   branch (`_pm` defaults to 2.0 there; the non-rotating branch at
+   `drizzle.py:2083` uses `P = pixfrac * s`), i.e. Python drizzles with a drop
+   side of **two** output pixels.  `--drop-mul 2` is the default whenever a
+   similarity transform is in play and reproduces it: corr went 0.99551 ->
+   **0.99987**, and the star-core ratio went 1.0441 -> **0.99834** (median
+   0.99956), background ratio 0.99885.
 
-The residual has a clean signature: the background matches to **-0.13 % of sky**
-(mean difference -7.3e-6, i.e. slightly darker on our side), while pixels brighter
-than 50x sky (638 px, saturated cores) come out **+4.4 % higher** on our side
-(median ratio 1.047).  A footprint/PSF-resampling difference - not a
-registration, weight or rejection difference - produces exactly that signature,
-and Python's own drizzle is a quantized lookup table (`_QUAD_NBIN = 96` sub-pixel
-bins, `_quad_table` in `core/drizzle.py`) whose rotated-square overlap cannot be
-reproduced bit-exactly by a separable formula.
-
+So the earlier "+4.4 % on star cores" signature was the 2x drop side, not the
+`_QUAD_NBIN = 96` lookup table: with the drop matched the cores agree to 0.2 %.
 Note the acceptance bar `max|d| <= 3 * sky_noise = 3.5e-4` is not reachable even
-by Python against itself: its own rerun peaks at `7.17e-02` on a saturated core.
+by Python against itself on the full frame (its own rerun peaks at 7.17e-02 on a
+saturated core); against the masked background both implementations sit below
+0.31 (Python) / 1.67 (dwt-rs) sky, and the rms is 0.0028 / 0.0043 sky.
+
+### `--crop` together with registration
+
+Python's `--crop` cuts the *input* frames and then builds a shift-bounding-box
+canvas plus a centre crop; dwt-rs crops the input window and drizzles onto the
+bounding box, which is a different output region.  Rather than emit a silently
+different region, `--crop N` (N > 0) with registration enabled now **refuses to
+run**:
+
+```
+$ dwt-rs --photos ... --crop 400 --A 6 --aligned 0
+dwt-rs: --crop 400 搭配配准（未给 --aligned 1）时，Python 的画布是「位移包围盒 + 中心裁剪」，
+本进程若只裁输入窗，输出区域与 Python 不同；请改用 --canvas-from <参考成品.xisf> 指定画布，
+或加 --aligned 1 走已对齐路径（该路径的裁剪与 Python 逐位一致）
+$ echo $?
+1
+```
+
+and no output file is written.  `--aligned 1` (the already-aligned path) keeps
+plain cropping, which is bit-identical to Python's crop path.  Setting
+`DWT_RS_ALLOW_CROP_REG=1` bypasses the guard for experiments.
 
 ## Tests
 
@@ -188,6 +223,19 @@ by Python against itself: its own rerun peaks at `7.17e-02` on a saturated core.
 `gpu_matches_cpu_stack` (skipped automatically when no adapter exists),
 `register::tests::recovers_known_similarity`.
 
+## TODO
+
+* `_quad_table` (`core/drizzle.py`, a `_QUAD_NBIN = 96` sub-pixel lookup table
+  for the rotated-square overlap) is **not** reproduced: we evaluate the overlap
+  analytically.  With the drop side matched (`--drop-mul 2`) the residual on star
+  cores is 0.2 %, so porting the LUT is only worth it if somebody needs the cores
+  to 0.1 %.  Estimate: ~150 lines + a 96-bin unit test, target residual < 0.1 %
+  on cores, no measurable effect on the 15 s full-frame wall time (the CPU time
+  is dominated by FWHM measurement and the rejection pass, not by the overlap
+  kernel).
+* `--drizzle-scale > 1` does not reproduce Python's output-grid re-derivation of
+  the reference image / R field (see Known limits).
+
 ## Known limits
 
 * `--drizzle-scale > 1` is numerically valid and matches the CPU path, but does
@@ -197,3 +245,9 @@ by Python against itself: its own rerun peaks at `7.17e-02` on a saturated core.
   crop grid and drizzles the result. At ×1 the two agree bit-exactly.
 * Mono only (no CFA/OSC).  Registration exists (`--aligned 0`) but the GPU
   kernels only cover the translation case; the rotation path runs on the CPU.
+* **dwt-rs is not a bit-exact reimplementation of the Python stacker.**  Do not
+  use it as a regression baseline for `core/pws.py`: the star-core footprint
+  differs by up to 0.2 % even with the matched drop side, the background by
+  -0.11 % of sky, and 5e-4 % of masked pixels (single-frame hits) are rejected
+  differently.  The 1x aligned/crop path (no registration) *is* bit-exact -
+  `corr 1.00000000`, `max|d| 1.0e-8` - because both sides skip drizzle there.
