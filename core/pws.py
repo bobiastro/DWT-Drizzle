@@ -113,6 +113,7 @@ _RDEC = max(1, int(__import__('os').environ.get('DWT_RDEC', '2') or 2))  # R 场
 R_WIN_MULT = 2.0     # 结构 RMS 的空间窗 = 该倍数 × σ_psf（过大将摊薄点源能量）
 REJ_K = 3.5          # 逐像素排异：|偏差| > κ·1.4826·MAD + m·R·(a_r−天空) 即剔除（a_r = 跨帧中位比较基准）。
                      #   κ 以 σ 为单位（1.4826·MAD = σ 估计）；2 更严，1 会成批误排噪声尾
+_lsp_half = 0.5
 REJ_MAX_FRAC = 1 / 3  # 剔除比例上限：超额被剔帧数 > 该比例 × 总帧数 → 判为共有结构而非
                       #   孤立离群，该像素不排异
 FLUX_R = 7.0         # 测吞吐的定孔径半径（原生像素）
@@ -1810,7 +1811,8 @@ def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
 def stack_strip(D: np.ndarray, W: np.ndarray, R: Optional[np.ndarray] = None,
                 sky: float = 0.0, rej_k: float = REJ_K,
                 rej_max_frac: float = REJ_MAX_FRAC,
-                frame_sig: Optional[np.ndarray] = None
+                frame_sig: Optional[np.ndarray] = None,
+                lsp_acc: Optional[dict] = None
                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """排异 + 唯一一次加权平均：S = Σ W·D / Σ W
 
@@ -1890,6 +1892,13 @@ def stack_strip(D: np.ndarray, W: np.ndarray, R: Optional[np.ndarray] = None,
         _nlo = nbad - _nhi
         _one = (_nlo <= 0.05 * n) & (_nhi - expected <= 0.7 * n)
         bad &= (_ok | _one)[None] if _ok.ndim == 0 else (_ok | _one)
+        if lsp_acc is not None:
+            # 大尺度排异（LSPR）所需的「半阈值可疑样本」累加：只加一次原子/一次乘，
+            # 事后若该像素落在细长结构里，就用代数把可疑部分整体减掉（无需第二遍读盘）
+            _elev = dev > (_lsp_half * thr)
+            lsp_acc['we'] += (W * _elev).sum(axis=0, dtype=np.float32)
+            lsp_acc['wde'] += (W * D * _elev).sum(axis=0, dtype=np.float32)
+            lsp_acc['cnte'] += _elev.sum(axis=0)
         rej_rate = float(bad.mean())
         W = np.where(bad, np.float32(0.0), W)
     else:
@@ -4399,7 +4408,11 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             _use_wgpu = False
         _wmap = None
         _PF = {'mul': 1.0}      # 两遍 drizzle：第二遍把液滴放大，只补未覆盖像素
+        _lsp_acc = None
+        _lsp = False
         def _do_stack():
+            _lsp_acc = None
+            _lsp = False
             if _use_wgpu:
                 _H2, _W2 = int(drz_plan['H']), int(drz_plan['W'])
                 _yy = np.clip(((np.arange(_H2) - float(drz_plan['oy'])) / float(drz_plan['s'])).astype(int), 0, h - 1)
@@ -4634,6 +4647,35 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         Stk = r_d['stack']
         neff = r_d['neff']
         cov_map = r_d.get('ncov')
+        _lspd = r_d.get('lsp')
+        if _lspd:
+            try:
+                import lsp as _lsp_mod
+                _cs = _lspd.get('cnte')
+                _S0 = Stk if Stk.ndim == 2 else None
+                if _S0 is not None and _cs is not None and _cs.size == _S0.size:
+                    _ht = _lspd.get('hits')
+                    _rate = (_cs / np.maximum(_ht if _ht is not None else 1.0, 1.0)).reshape(_S0.shape)
+                    if os.environ.get('DWT_LSP_DUMP'):
+                        np.save(os.environ['DWT_LSP_DUMP'], _rate.astype(np.float32))
+                    _M = _lsp_mod.detect(_rate, 1, R=R, logf=log)
+                    if _M is not None and bool(_M.any()):
+                        _cw = (cov_map if cov_map is not None else r_d.get('cov'))
+                        _cw = np.asarray(_cw, np.float32)
+                        _we = _lspd['we'].reshape(_S0.shape)
+                        _wde = _lspd['wde'].reshape(_S0.shape)
+                        _den = _cw - _we
+                        _ok = _M & (_den > 0.25 * np.maximum(_cw, 1e-12))
+                        if bool(_ok.any()):
+                            _num = _S0 * _cw - _wde
+                            _corr = _num / np.maximum(_den, 1e-12)
+                            _S0[_ok] = _corr[_ok].astype(np.float32)
+                            log('[LSPR] 大尺度排异：结构 %d 像素（%.3f%%），修正 %d'
+                                % (int(_M.sum()), 100.0 * float(_M.mean()), int(_ok.sum())))
+                        else:
+                            log('[LSPR] 检出结构 %d 像素，可用样本不足，未改动' % int(_M.sum()))
+            except Exception as _e_lsp:
+                log('[LSPR] 后处理失败（%s: %s），维持原结果' % (type(_e_lsp).__name__, _e_lsp))
         rej_rate = float(r_d['rej_rate'])
         wmax = [float(r_d['wmax'])]
         del r_d
@@ -4646,6 +4688,14 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         strip = plan_strip(n, w, fs.resident_bytes, workers=max(1, nw), logf=log)
         Stk = np.empty((h, w), np.float32)
         neff = np.empty((h, w), np.float32)
+        _lsp = bool(int(os.environ.get('DWT_LSP', '0')))
+        _lsp_acc = None
+        if _lsp:
+            _lsp_acc = {'we': np.zeros((h, w), np.float32),
+                        'wde': np.zeros((h, w), np.float32),
+                        'cnte': np.zeros((h, w), np.float32),
+                        'sw': np.zeros((h, w), np.float32),
+                        'swd': np.zeros((h, w), np.float32)}
         t2 = time.perf_counter()
         rej_num = rej_den = 0.0
         wmax = []
@@ -4697,7 +4747,13 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         D = fs.stack_strips(y0, y1)
                         s, ne, rr = stack_strip(D, W, R[y0:y1], fs.sky0, rej_k=rej_k,
                                                 rej_max_frac=rej_gate,
-                                                frame_sig=(fs.sigma if _rej_z else None))
+                                                frame_sig=(fs.sigma if _rej_z else None),
+                                                lsp_acc=({'we': _lsp_acc['we'][y0:y1],
+                                                          'wde': _lsp_acc['wde'][y0:y1],
+                                                          'cnte': _lsp_acc['cnte'][y0:y1]} if _lsp_acc else None))
+                        if _lsp_acc is not None:
+                            _lsp_acc['sw'][y0:y1] = W.sum(axis=0, dtype=np.float32)
+                            _lsp_acc['swd'][y0:y1] = (W * D).sum(axis=0, dtype=np.float32)
                         Stk[y0:y1] = s
                         neff[y0:y1] = ne
                         cnt = float(s.size)
@@ -4738,6 +4794,24 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             # 正常跑完与中途终止都要清理临时帧文件（三通道共享时由 _run 收尾统一关）
             if not getattr(fs, '_shared', False):
                 fs.close(keep=keep_frames)
+    if _lsp_acc is not None:
+        try:
+            import lsp as _lsp_mod
+            _M = _lsp_mod.detect(_lsp_acc['cnte'], n, R=R, logf=log)
+            if _M is not None and bool(_M.any()):
+                _sw = _lsp_acc['sw']; _swd = _lsp_acc['swd']
+                _we = _lsp_acc['we']; _wde = _lsp_acc['wde']
+                _den = _sw - _we
+                _ok = _M & (_den > 0.25 * np.maximum(_sw, 1e-12))
+                if bool(_ok.any()):
+                    _corr = (_swd - _wde) / np.maximum(_den, 1e-12)
+                    Stk[_ok] = _corr[_ok].astype(np.float32)
+                    log('[LSPR] 大尺度排异：结构覆盖 %d 像素（%.3f%%），可修正 %d，已扣除可疑样本'
+                        % (int(_M.sum()), 100.0 * float(_M.mean()), int(_ok.sum())))
+                else:
+                    log('[LSPR] 检出结构 %d 像素，但可修正样本不足，未改动' % int(_M.sum()))
+        except Exception as _e_lsp:
+            log('[LSPR] 后处理失败（%s: %s），维持原结果' % (type(_e_lsp).__name__, _e_lsp))
     # 条带全部落位后一次回乘（串行/并行在此汇合，只乘一次；元素级乘法与切分无关）
     Stk *= np.float32(scale_out)
     log(f'[量纲] 成品回乘 ×{scale_out:g}（曝光中位 {t_med:g}s / 归一基准 {EXPTIME_REF:g}s），'
@@ -4918,6 +4992,21 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                             % (np.array2string(np.round(_g / _gm, 4), separator=','), _sp))
             except Exception as _e:
                 log('[CFA] 去格点失败（%s），跳过' % _e)
+        # ── 大尺度结构排异（LSPR 等价）：在叠加域检出细长直线结构并扣除 ──
+        # 判据不是“像素离群”而是“该像素属于一个跳很多像素的细长直线”；
+        # 只在 |d-中心| ≤ 4w 的带内做加性扣除，带外像素逐位不变。DWT_LSPR=0 关闭。
+        _lspn = 0
+        if str(os.environ.get('DWT_LSPR', '1')).strip() != '0':
+            try:
+                import lsp as _lsp_new
+                _t_lsp = time.time()
+                _lspn, _lspx = _lsp_new.process_auto(Stk, logf=log)
+                log('[LSPR] 结构排异：检出并扣除 %d 条细长结构，改动 %d 像素'
+                    '（%.3f%%），用时 %.2fs'
+                    % (_lspn, _lspx, 100.0 * _lspx / float(max(1, Stk.size)), time.time() - _t_lsp))
+            except Exception as _e_lsp2:
+                log('[LSPR] 结构排异跳过（%s: %s）'
+                    % (type(_e_lsp2).__name__, _e_lsp2))
         # 成品有效性门禁：几乎全空的图不该写盘（否则用户拿到一张全黑图还收到"完成"）
         _fin = np.isfinite(Stk)
         _vfrac = float(np.count_nonzero(_fin)) / float(max(1, Stk.size))
@@ -4974,6 +5063,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                'FwhmOutput': float(f_out),
                                'NeffMedian': float(np.median(neff)),
                                'SigmaFrameMedian': float(np.median(sig_out)),
+                               'LsprStruct': int(_lspn),
                                'SigmaSky': sky_sd})
         # 辅助数组（R 场 / N_eff / 覆盖）整幅各约 417 MB，三通道就要 1.25 GB。
         # 权重场页与评价页默认读 1/4 分辨率版本（每个约 26 MB，块平均，够看结构）；
