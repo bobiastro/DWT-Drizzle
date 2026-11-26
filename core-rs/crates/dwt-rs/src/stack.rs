@@ -1,0 +1,273 @@
+//! Fusion weights, per-pixel rejection and the single weighted mean.
+//! Direct port of `strip_weights` / `stack_strip` in `core/pws.py`.
+
+use rayon::prelude::*;
+
+use crate::image::{median, percentile, Img};
+
+/// `W[i,p] = C_i^(A·R_p) · S_i^(B·(1-R_p))`, log-clipped so that no single frame
+/// can own more than `cap` of the total weight, then normalized to `mean_i W = 1`.
+pub fn strip_weights(
+    c: &[f32],
+    s: &[f32],
+    r: &Img,
+    a_exp: f32,
+    b_exp: f32,
+    beta: f32,
+    cap: f32,
+) -> Vec<Img> {
+    let n = c.len();
+    let (h, w) = (r.h, r.w);
+    let npx = h * w;
+    let lc: Vec<f32> = c.iter().map(|v| v.max(1e-12).ln()).collect();
+    let ls: Vec<f32> = s.iter().map(|v| v.max(1e-12).ln()).collect();
+    let mut l_cap = f32::INFINITY;
+    if cap > 0.0 && cap < 1.0 && n > 1 {
+        l_cap = 0.5 * (((n - 1) as f32 * cap / (1.0 - cap)).max(1e-9)).ln();
+    }
+    // log-weight per (frame, pixel), then normalize per pixel
+    let mut lw = vec![0.0f32; n * npx];
+    lw.par_chunks_mut(npx).enumerate().for_each(|(i, row)| {
+        for p in 0..npx {
+            let rp = r.d[p];
+            let mut v = a_exp * rp * lc[i] + (b_exp * (1.0 - rp) + beta * rp) * ls[i];
+            if l_cap.is_finite() {
+                v = v.clamp(-l_cap, l_cap);
+            }
+            row[p] = v;
+        }
+    });
+    let mut mean = vec![0.0f32; npx];
+    for i in 0..n {
+        for p in 0..npx {
+            mean[p] += lw[i * npx + p].exp();
+        }
+    }
+    for v in &mut mean {
+        *v = (*v / n as f32).max(1e-30);
+    }
+    let mut out: Vec<Img> = (0..n).map(|_| Img::new(w, h)).collect();
+    for i in 0..n {
+        let row = &lw[i * npx..(i + 1) * npx];
+        for p in 0..npx {
+            out[i].d[p] = row[p].exp() / mean[p];
+        }
+    }
+    out
+}
+
+pub struct StackResult {
+    pub image: Img,
+    pub neff: Vec<f32>,
+    pub reject_rate: f32,
+}
+
+/// Zero out rejected weights in place. Returns the fraction of dropped samples.
+pub fn reject(
+    d: &[Img],
+    wts: &mut [Img],
+    r: Option<&Img>,
+    sky: f32,
+    rej_k: f32,
+    rej_max_frac: f32,
+    frame_sig: Option<&[f32]>,
+) -> f32 {
+    let n = d.len();
+    let h = d[0].h;
+    let w = d[0].w;
+    let npx = h * w;
+    let mut rej_rate = 0.0f32;
+
+    if rej_k > 0.0 {
+        let mut vals = vec![0.0f32; n];
+        let mut dev = vec![0.0f32; n * npx];
+        let mut anchor = vec![0.0f32; npx];
+        for p in 0..npx {
+            for i in 0..n {
+                vals[i] = d[i].d[p];
+            }
+            let a = median(&mut vals);
+            anchor[p] = a;
+            for i in 0..n {
+                let mut dv = (d[i].d[p] - a).abs();
+                if let Some(sig) = frame_sig {
+                    dv /= sig[i].max(1e-12);
+                }
+                dev[i * npx + p] = dv;
+            }
+        }
+        let mut mad = vec![0.0f32; npx];
+        for p in 0..npx {
+            let mut v: Vec<f32> = (0..n).map(|i| dev[i * npx + p]).collect();
+            mad[p] = 1.4826 * median(&mut v);
+        }
+        // detail allowance m: per-frame P99 of dev/signal over R>0.5, then median
+        let mut m = 0.0f32;
+        let mut sig_det: Option<Vec<f32>> = None;
+        if let Some(rr) = r {
+            let sig: Vec<f32> = (0..npx).map(|p| (anchor[p] - sky).max(0.0)).collect();
+            let core: Vec<usize> =
+                (0..npx).filter(|p| rr.d[*p] > 0.5 && sig[*p] > 0.0).collect();
+            if !core.is_empty() {
+                let ratios: Vec<f32> = (0..n)
+                    .into_par_iter()
+                    .map(|i| {
+                        let mut v: Vec<f32> =
+                            core.iter().map(|p| dev[i * npx + p] / sig[*p]).collect();
+                        percentile(&mut v, 99.0)
+                    })
+                    .collect();
+                let mut ratios = ratios;
+                m = median(&mut ratios);
+            }
+            sig_det = Some(sig);
+        }
+
+        let expected = n as f32 * erfc(rej_k / std::f32::consts::SQRT_2);
+        let limit = (rej_max_frac * n as f32).max(1.0);
+
+        // sky-region one-sided rejection (R < 0.1), computed per pixel over frames
+        let sky_mask: Vec<bool> = match r {
+            Some(rr) => (0..npx).map(|p| rr.d[p] < 0.1).collect(),
+            None => vec![false; npx],
+        };
+        let any_sky = sky_mask.iter().any(|v| *v);
+        let mut sky_bad = vec![false; n * npx];
+        let mut sky_dim = vec![false; npx]; // pixels where the 0.8n guard failed
+
+        if any_sky {
+            let mut col = vec![0.0f32; n];
+            for p in 0..npx {
+                if !sky_mask[p] {
+                    continue;
+                }
+                for i in 0..n {
+                    let mut v = d[i].d[p];
+                    if let Some(sig) = frame_sig {
+                        v /= sig[i].max(1e-12);
+                    }
+                    col[i] = v;
+                }
+                let a = percentile(&mut col.clone(), 25.0);
+                let mut ad: Vec<f32> = col.iter().map(|v| (*v - a).abs()).collect();
+                let s = (1.4826 * median(&mut ad)).max(1e-12);
+                let mut nb = 0usize;
+                for i in 0..n {
+                    let hit = (col[i] - a) / s > rej_k;
+                    sky_bad[i * npx + p] = hit;
+                    if hit {
+                        nb += 1;
+                    }
+                }
+                if (nb as f32) > 0.8 * n as f32 {
+                    sky_dim[p] = true;
+                }
+            }
+        }
+
+        let mut nbad_total = 0usize;
+        let mut thr = vec![0.0f32; n];
+        let mut bad = vec![false; n];
+        for p in 0..npx {
+            for i in 0..n {
+                let mut t = rej_k * mad[p];
+                if let (Some(rr), Some(sig)) = (r, sig_det.as_ref()) {
+                    let mut extra = m * rr.d[p] * sig[p];
+                    if let Some(fs) = frame_sig {
+                        extra /= fs[i].max(1e-12);
+                    }
+                    t += extra;
+                }
+                thr[i] = t;
+            }
+            let n = n;
+            for i in 0..n {
+                bad[i] = dev[i * npx + p] > thr[i];
+            }
+            if sky_mask[p] {
+                for i in 0..n {
+                    bad[i] = !sky_dim[p] && sky_bad[i * npx + p];
+                }
+            }
+            let mut nbad = 0usize;
+            let mut nhi = 0usize;
+            for i in 0..n {
+                if bad[i] {
+                    nbad += 1;
+                    if dev[i * npx + p] > thr[i] && d[i].d[p] > anchor[p] {
+                        nhi += 1;
+                    }
+                }
+            }
+            let nbadf = nbad as f32;
+            let nhif = nhi as f32;
+            let ok = nbadf - expected <= limit;
+            let one = (nbadf - nhif) <= 0.05 * n as f32 && (nhif - expected) <= 0.7 * n as f32;
+            let keep = ok || one;
+            nbad_total += if keep { nbad } else { 0 };
+            for i in 0..n {
+                if bad[i] && keep {
+                    wts[i].d[p] = 0.0;
+                }
+            }
+        }
+        rej_rate = nbad_total as f32 / (n as f32 * npx as f32);
+    }
+    rej_rate
+}
+
+/// Rejection + weighted mean for already sky-shifted frames.
+pub fn stack_strip(
+    d: &[Img],
+    wts: &mut [Img],
+    r: Option<&Img>,
+    sky: f32,
+    rej_k: f32,
+    rej_max_frac: f32,
+    frame_sig: Option<&[f32]>,
+) -> StackResult {
+    let rej_rate = reject(d, wts, r, sky, rej_k, rej_max_frac, frame_sig);
+    let n = d.len();
+    let h = d[0].h;
+    let w = d[0].w;
+    let npx = h * w;
+    let mut out = Img::new(w, h);
+    let mut neff = vec![0.0f32; npx];
+    for p in 0..npx {
+        let mut sw = 0.0f32;
+        let mut swd = 0.0f32;
+        let mut sw2 = 0.0f64;
+        for i in 0..n {
+            let wv = wts[i].d[p];
+            sw += wv;
+            swd += wv * d[i].d[p];
+            sw2 += (wv as f64) * (wv as f64);
+        }
+        let safe = if sw <= 0.0 { 1e-30 } else { sw };
+        out.d[p] = swd / safe;
+        if sw > 0.0 {
+            neff[p] = ((sw as f64) * (sw as f64) / sw2.max(1e-30)) as f32;
+        }
+    }
+    StackResult { image: out, neff, reject_rate: rej_rate }
+}
+
+/// `math.erfc` (Abramowitz & Stegun 7.1.26; ~1.5e-7 absolute error, far below the
+/// whole-frame-count tolerance it feeds).
+fn erfc(x: f32) -> f32 {
+    let x64 = x as f64;
+    let z = x64.abs();
+    let t = 1.0 / (1.0 + 0.5 * z);
+    let poly = -z * z
+        - 1.265_512_23
+        + t * (1.000_023_68
+            + t * (0.374_091_96
+                + t * (0.096_784_18
+                    + t * (-0.186_288_06
+                        + t * (0.278_868_07
+                            + t * (-1.135_203_98
+                                + t * (1.488_515_87 + t * (-0.822_152_23 + t * 0.170_872_77))))))));
+    let e = t * poly.exp();
+    let v = if x64 >= 0.0 { e } else { 2.0 - e };
+    v as f32
+}

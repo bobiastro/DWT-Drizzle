@@ -1,0 +1,17 @@
+//! dwt-rs — Rust port of the DWT-Drizzle partition-weighted stacking core.
+//!
+//! CPU MVP scope (branch `branch-E-rust`): monochrome (non-CFA) multi-frame
+//! stacking with drizzle, matching the Python pipeline for the
+//! `--aligned 1` (already-registered frames) case.
+
+pub mod bggrad;
+pub mod detect;
+pub mod drizzle;
+pub mod gpu;
+pub mod image;
+pub mod rfield;
+pub mod stack;
+pub mod xisf;
+
+#[cfg(test)]
+mod tests;
