@@ -1029,6 +1029,8 @@ def _p_mat(p6):
                      [p3, p4, p5 + 0.5 * (p3 + p4)]], np.float64)
 
 
+MAPP90_MAX = 10.0        # 帧域映射门槛：留出残差 p90（px）
+
 def _fit_affine(img, sampler, nframes, logf, npt=14, srch=140, seed=7,
                 edge_px=2.0, sclim=0.005, tlim=2.0, nsample=10):
     """用画面里的星点把 p 先验修正成逐帧仿射：2/3 拟合、1/3 留出，报留出残差。
@@ -1094,8 +1096,10 @@ def _fit_affine(img, sampler, nframes, logf, npt=14, srch=140, seed=7,
         _a_p = math.atan2(Pm[1, 0] - Pm[0, 1], Pm[0, 0] + Pm[1, 1])
         _a_m = math.atan2(M[1, 0] - M[0, 1], M[0, 0] + M[1, 1])
         dr = math.degrees(_a_m - _a_p)
-        ok = (n >= 8 and med < 0.5 and p90 < 0.5
-              and abs(ds) <= sclim and float(np.hypot(dt[0], dt[1])) <= tlim)
+        # 门槛：留出残差 p90 < 10 px（= 叠加配准散布量级，不是精度目标）。
+        # 画布是多帧平均，逐帧配准残差不同 ⇒ 子像素全局映射在物理上不存在；
+        # Δ平移/Δ尺度 只作诊断打印，不作阻断（真实配准误差可达十几像素）。
+        ok = (n >= 8 and p90 < MAPP90_MAX)
         # 反解出「画布 → 帧索引」的仿射，供 frame_gate 用
         L = M[:2, :].T            # 2×2
         try:
@@ -1206,80 +1210,13 @@ def _map_check(img, sampler, nframes, logf, npt=12, half=64, srch=90):
             'n': int(_aa.shape[0]), 'res': _aa[:, 0]}
 
 
-def process_auto(img, logf=None, sigma=None, sampler=None, nframes=0,
-                 sig_frame=None):
-    """In-place: detect structures and subtract their measured profiles.
-
-    Returns (n_structures, n_pixels_changed).  Pixels outside the detected
-    structures' bands are not touched at all (bit-identical).
-    """
-    a = np.asarray(img)
-    if a.ndim != 2 or min(a.shape) < 128:
-        return 0, 0
-    sts = find_auto(a, logf=logf, sigma=sigma)
-    tot = 0
-    _nframe_use = 0
-    _sc0 = None
-    _amap = {}
-    _nt = 0
-    if sampler is not None and nframes:
-        # 映射自检独立于「是否检出结构」：有结构要验证就得先证明映射准
-        try:
-            _r0 = sampler(0)
-            _sc0 = float((_r0 or {}).get('k', 1.0) or 1.0)
-            _map_check(a, sampler, nframes, logf)
-        except Exception as _e_mc:
-            if logf is not None:
-                logf('  [LSPR] 映射自检失败（%s: %s）' % (type(_e_mc).__name__, _e_mc))
-        try:
-            _amap = _fit_affine(a, sampler, nframes, logf)
-            _nt = sum(1 for _v in _amap.values() if _v.get('ok'))
-            if _nt == 0 and _amap:
-                _best = max(_v.get('n', 0) for _v in _amap.values())
-                _med = float(np.median([_v.get('med', 9.9) for _v in _amap.values()]))
-                if logf is not None:
-                    logf('  [LSPR] 帧域映射不可信（内点 %d/留出残差 %.2fpx）→ 本次跳过验证'
-                         % (_best, _med))
-        except Exception as _e_af:
-            if logf is not None:
-                logf('  [LSPR] 仿射拟合失败（%s: %s）→ 本次跳过验证'
-                     % (type(_e_af).__name__, _e_af))
-            _amap, _nt = {}, 0
-    for st in sts:
-        if sampler is not None and nframes and _nt > 0:
-            st['_shape'] = a.shape
-            if _sc0 is None:
-                _r0 = sampler(0)
-                _sc0 = float((_r0 or {}).get('k', 1.0) or 1.0)
-            _res = frame_gate(st, sampler, nframes, logf=logf, n=10,
-                              wfac=max(1.5, 0.65 * float(st['width'])),
-                              off0=4.0, off1=8.0, ref=a, sc=_sc0,
-                              ampmin=0.06, sig_frame=sig_frame, amap=_amap)
-            if not _res.get('ok', True):
-                continue
-            _nframe_use += 1
-        _npx = _apply_band(a, st)
-        tot += _npx
-        if logf is not None:
-            logf('  [LSPR] 扣除 θ=%.2f ρ=%.1f 幅度 %+.3e (%.2fσ) 宽 %.2fpx 覆盖 %d 像素'
-                 % (st['theta'], st['rho'], st['amp'], st['amp_sig'], st['width'], _npx))
-        # second identical pass: the profile is measured piecewise, so the
-        # residual after one pass still carries a few percent of the band
-        if _npx > 0:
-            st2 = _measure(a, st['theta'], st['rho'], float(st['sig']), K=_LSP_K, iters=2)
-            if st2 is not None and abs(st2['zsum']) > 6.0:
-                n2 = _apply_band(a, st2)
-                tot += n2
-                if logf is not None:
-                    logf('  [LSPR] 二次扣除 θ=%.2f ρ=%.1f 幅度 %+.3e 覆盖 %d 像素'
-                         % (st2['theta'], st2['rho'], st2['amp'], n2))
-    return len(sts), tot
-
 # ---------------------------------------------------------------------------
-# 帧域验证（frame-domain validation）——【原型，尚未接线】
-# 状态（2026-11-26）：画布→单帧映射的 origin/scale 记账尚未对齐（必须在 pws 内
-# 用 drz_plan 的 ox/oy 与读帧时的 pf 直接给出，不能反推），本地相关校验只有
-# 0.02~0.17，故 frame_gate 暂不参与 process_auto 的决策，默认从不调用。
+# 帧域验证（frame-domain validation）
+# 状态（2026-11-26）：**已接线**（process_auto 在 sampler/nframes 都给时逐条验证）。
+# 画布是多帧加权平均，「画布→单帧」的子像素全局映射在物理上不存在：每帧配准残差
+# 不同，画布星点≈各帧位置平均，任一单帧相对它散布 1~7 px（p90 ~10 px，实测留出
+# 残差 0.95~6.8 px）。因此映射门槛取「留出残差 p90 < 10 px（= 叠加配准散布量级）」
+# 而不是 0.5 px，并且每帧允许 ±8 px 的**局部**对齐（在一条带子上滑动 on/off 窗）。
 #
 # 判据：真实加性共模线在**单帧**里也存在且符号一致；由采样/背景/噪声凑出来的
 # 直线在单帧里不存在（符号随机）。做法：等间隔取 n 帧 → 用 drizzle 的逆变换把
@@ -1392,161 +1329,270 @@ def _refine_pt(img, px, py, ref, rx, ry, half=90, srch=36, step=3):
     return float(best[1]), float(best[2]), float(best[0])
 
 
-def frame_gate(st, sampler, nframes, logf=None, n=10, wfac=1.5, off0=4.0,
-               off1=8.0, frac=0.8, zmin=1.0, w_px=None, ref=None, sc=1.0,
-               ampmin=None, sig_frame=None, amap=None):
-    """对结构 st 做帧域验证。sampler(j) 返回 dict(img, dx, dy, th, k, s, ox, oy)。
+def _line_amp_frame(img, th_f, rho_f, w_f, wfac=1.5, off0=4.0, off1=8.0,
+                    search=8.0, K=8):
+    """单帧：**一条带子，逐段各自对 δ**。一次 _strip，δ 只在掩膜上滑动。
 
-    返回 dict(ok, frac, zmed, amp_med, n, amps, zs, frames, w).
+    返回 (amp, z, dlt)：amp = 各段「自身 δ 下 on−off」的中位；dlt = δ 的中位。
+    逐段允许 δ（画布残差沿弦变化，全局单 δ 会把 1 px 宽的带子糊掉）；
+    由此带来的 look-elsewhere 由调用方的随机对照线标定。
     """
-    import numpy as _np
-    if sampler is None or not nframes:
-        return {'ok': True, 'skipped': True, 'frac': 1.0, 'zmed': 0.0,
-                'amp_med': 0.0, 'n': 0, 'amps': [], 'zs': [], 'frames': []}
-    w = float(w_px if w_px is not None else st['width'])
-    hh, ww = st['_shape'] if '_shape' in st else (None, None)
+    dmax = float(search) + float(off1) * float(w_f) + 2.0
+    try:
+        V, dd, ss = _strip(img, th_f, rho_f, dmax=dmax, dstep=1.0,
+                           sstep=max(2.0, float(w_f)))
+    except Exception:
+        return None
+    if V is None or V.size == 0:
+        return None
+    nr = V.shape[0]
+    kk = max(1, min(int(K), nr // 6))
+    edges = np.linspace(0, nr, kk + 1).astype(int)
+    onW = wfac * w_f
+    offA, offB = off0 * w_f, off1 * w_f
+    a_list, se_list, d_list = [], [], []
+    for k in range(kk):
+        a0, b0 = int(edges[k]), int(edges[k + 1])
+        if b0 - a0 < 3:
+            continue
+        R = V[a0:b0]                                   # 该段的 d×s 小矩阵
+        row = _nanmed(R, axis=0)                       # 段内的 d 剖面
+        if not np.isfinite(row).any():
+            continue
+        best = None
+        for dlt in np.arange(-float(search), float(search) + 0.5, 1.0):
+            d2 = dd - float(dlt)
+            mon = np.abs(d2) <= onW
+            moff = (np.abs(d2) >= offA) & (np.abs(d2) <= offB)
+            if mon.sum() < 2 or moff.sum() < 3:
+                continue
+            with np.errstate(invalid='ignore'):
+                amp = float(_nanmed(row[mon]) - _nanmed(row[moff]))
+                _sc = float(_nanmed(np.abs(row[moff] - _nanmed(row[moff]))))
+            if not np.isfinite(amp):
+                continue
+            if best is None or abs(amp) > abs(best[0]):
+                best = (amp, _sc, float(dlt))
+        if best is None:
+            continue
+        a_list.append(best[0])
+        se_list.append(1.2533 * 1.4826 * best[1]
+                       / math.sqrt(max(3.0 * onW, 1.0)))
+        d_list.append(best[2])
+    if not a_list:
+        return None
+    a_arr = np.asarray(a_list, float)
+    se_arr = np.maximum(np.asarray(se_list, float), 1e-12)
+    amp = float(np.median(a_arr))
+    _z = a_arr / se_arr
+    z = float(np.median(_z[np.isfinite(_z)])) if np.isfinite(_z).any() else 0.0
+    return (amp, z, float(np.median(d_list)))
+
+
+def _gate_one(st, sampler, js, amap, wfac, off0, off1, search, logf=None, tag=''):
+    """对一条（θ,ρ）线：逐帧映射 + 局部 δ 搜索 → (amps, zs, used, dlt)。"""
+    hh, ww = st.get('_shape') or (None, None)
     if hh is None:
-        return {'ok': True, 'skipped': True, 'frac': 1.0, 'zmed': 0.0,
-                'amp_med': 0.0, 'n': 0, 'amps': [], 'zs': [], 'frames': []}
-    p = _chord_pts(hh, ww, st['theta'], st['rho'])
-    if p is None:
-        return {'ok': True, 'skipped': True, 'frac': 1.0, 'zmed': 0.0,
-                'amp_med': 0.0, 'n': 0, 'amps': [], 'zs': [], 'frames': []}
-    (cx1, cy1), (cx2, cy2) = p
-    Lc = math.hypot(cx2 - cx1, cy2 - cy1)
-    _ib = max(1, int(round(sc)))
-    ref_s = None
-    if ref is not None:
-        ref_s = ref[::_ib, ::_ib] if _ib > 1 else ref
-    # 画布弦上取 18%..82% 一段（避开帧边缘）
-    q = [(cx1 + (cx2 - cx1) * f, cy1 + (cy2 - cy1) * f) for f in (0.18, 0.82)]
-    idx = sorted(set(int(round(i * (nframes - 1) / float(max(n - 1, 1))))
-                     for i in range(n)))
-    amps, zs, used, wf_used = [], [], [], []
-    _am = amap or {}
-    for j in idx:
+        return [], [], [], []
+    pr = _chord_pts(hh, ww, st['theta'], st['rho'])
+    if pr is None:
+        return [], [], [], []
+    amps, zs, used, dl = [], [], [], []
+    for j in js:
         rec = sampler(j)
-        if rec is None:
+        if rec is None or rec.get('img') is None:
             continue
-        img = rec['img']
-        if img is None:
+        fr = rec['img']
+        _A = (amap or {}).get(int(j)) or {}
+        if _A.get('ok') and _A.get('A') is not None:
+            Ai = _A['A']
+            f1 = (Ai[0, 0] * pr[0][0] + Ai[0, 1] * pr[0][1] + Ai[0, 2],
+                  Ai[1, 0] * pr[0][0] + Ai[1, 1] * pr[0][1] + Ai[1, 2])
+            f2 = (Ai[0, 0] * pr[1][0] + Ai[0, 1] * pr[1][1] + Ai[0, 2],
+                  Ai[1, 0] * pr[1][0] + Ai[1, 1] * pr[1][1] + Ai[1, 2])
+        elif rec.get('p') is not None:
+            f1 = _p_to_frame(pr[0][0], pr[0][1], rec['p'])
+            f2 = _p_to_frame(pr[1][0], pr[1][1], rec['p'])
+        else:
             continue
-        _A = (_am.get(int(j)) or {})
+        if not (np.isfinite(f1[0]) and np.isfinite(f2[0])):
+            continue
+        # 该帧内的弦（取中段 1/4，避开帧边缘）
+        gx1 = f1[0] + (f2[0] - f1[0]) * 0.20
+        gy1 = f1[1] + (f2[1] - f1[1]) * 0.20
+        gx2 = f1[0] + (f2[0] - f1[0]) * 0.80
+        gy2 = f1[1] + (f2[1] - f1[1]) * 0.80
+        dlf = math.hypot(gx2 - gx1, gy2 - gy1)
+        if not (np.isfinite(dlf) and dlf > 60.0):
+            continue
+        ddx, ddy = (gx2 - gx1) / dlf, (gy2 - gy1) / dlf
+        cth, sth = ddy, -ddx
+        th_f = math.degrees(math.atan2(sth, cth))
+        rho_f = gx1 * cth + gy1 * sth
+        # 帧内带宽：画布上的宽度 w 换成帧像素 = w × (帧像素/画布像素)。
+        # 用映射的雅可比行列式给尺度（弦长比会被中段 20%~80% 的取窗因子拉低）。
         if _A.get('ok') and _A.get('A') is not None:
             _Ai = _A['A']
-            f1 = (_Ai[0, 0] * q[0][0] + _Ai[0, 1] * q[0][1] + _Ai[0, 2],
-                  _Ai[1, 0] * q[0][0] + _Ai[1, 1] * q[0][1] + _Ai[1, 2])
-            f2 = (_Ai[0, 0] * q[1][0] + _Ai[0, 1] * q[1][1] + _Ai[0, 2],
-                  _Ai[1, 0] * q[1][0] + _Ai[1, 1] * q[1][1] + _Ai[1, 2])
-        elif rec.get('p') is not None:
-            f1 = _p_to_frame(q[0][0], q[0][1], rec['p'])
-            f2 = _p_to_frame(q[1][0], q[1][1], rec['p'])
+            _scl = abs(float(_Ai[0, 0] * _Ai[1, 1] - _Ai[0, 1] * _Ai[1, 0])) ** 0.5
         else:
-            f1 = _to_frame(q[0][0], q[0][1], rec['dx'], rec['dy'],
-                           math.radians(rec['th']), rec['k'], rec['s'],
-                           rec.get('ox', 0.0), rec.get('oy', 0.0),
-                           rec.get('pf', 1.0))
-            f2 = _to_frame(q[1][0], q[1][1], rec['dx'], rec['dy'],
-                           math.radians(rec['th']), rec['k'], rec['s'],
-                           rec.get('ox', 0.0), rec.get('oy', 0.0),
-                           rec.get('pf', 1.0))
-        Lf = math.hypot(f2[0] - f1[0], f2[1] - f1[1])
-        if not (np.isfinite(Lf) and Lf > 20.0):
+            _p6 = rec.get('p')
+            _scl = (abs(float(_p6[0] * _p6[4] - _p6[1] * _p6[3])) ** 0.5
+                    if _p6 is not None else 1.0)
+            _scl = 1.0 / max(_scl, 1e-6)
+        w_f = max(0.7, float(st['width']) * _scl)
+        r = _line_amp_frame(fr, th_f, rho_f, w_f, wfac=wfac, off0=off0, off1=off1,
+                            search=search)
+        if r is None:
             continue
-        w_f = max(1.0, w * (Lf / Lc))
-        if ref_s is None:
-            p1r = (f1[0], f1[1], 1.0)
-            p2r = (f2[0], f2[1], 1.0)
-        else:
-            p1r = _refine_pt(img, f1[0], f1[1], ref_s, q[0][0] / _ib, q[0][1] / _ib)
-            p2r = _refine_pt(img, f2[0], f2[1], ref_s, q[1][0] / _ib, q[1][1] / _ib)
-        if p1r[2] < 0.15 or p2r[2] < 0.15:
-            if logf is not None:
-                logf('  [LSPR] 帧 %d：映射相关 %.2f/%.2f，跳过' % (j, p1r[2], p2r[2]))
-            continue
-        gx1, gy1, gx2, gy2 = p1r[0], p1r[1], p2r[0], p2r[1]
-        dl = math.hypot(gx2 - gx1, gy2 - gy1)
-        if dl < 40.0:
-            continue
-        ddx, ddy = (gx2 - gx1) / dl, (gy2 - gy1) / dl
-        cth, sth = ddy, -ddx
-        th_f = math.degrees(math.atan2(sth, cth))
-        rho_f = gx1 * cth + gy1 * sth
-        cp = None
-        if False:
-            pass
-        # 用弦的 25%..75% 段，再按该帧内的弦重算 (θ, ρ)（避免梯形误差）
-        (gx1, gy1), (gx2, gy2) = cp
-        gx1 = gx1 + (gx2 - gx1) * 0.25
-        gy1 = gy1 + (gy2 - gy1) * 0.25
-        gx2 = gx1 + (gx2 - gx1) * 0.667
-        gy2 = gy1 + (gy2 - gy1) * 0.667
-        dl = math.hypot(gx2 - gx1, gy2 - gy1)
-        if dl < 40.0:
-            continue
-        ddx, ddy = (gx2 - gx1) / dl, (gy2 - gy1) / dl
-        cth, sth = ddy, -ddx
-        th_f = math.degrees(math.atan2(sth, cth))
-        rho_f = gx1 * cth + gy1 * sth
-        try:
-            V, dd, ss = _strip(img, th_f, rho_f, dmax=off1 * w_f + 2.0,
-                               dstep=1.0, sstep=max(2.0, w_f))
-        except Exception:
-            continue
-        if V is None or V.size == 0:
-            continue
-        mon = np.abs(dd) <= wfac * w_f
-        moff = (np.abs(dd) >= off0 * w_f) & (np.abs(dd) <= off1 * w_f)
-        if mon.sum() < 2 or moff.sum() < 4:
-            continue
-        a_k, z_k = [], []
-        nr = V.shape[0]
-        kk = max(1, min(8, nr // 8))
-        edges = np.linspace(0, nr, kk + 1).astype(int)
-        for k in range(kk):
-            row = _nanmed(V[edges[k]:edges[k + 1]], axis=0) if (edges[k + 1] - edges[k]) > 1 else V[edges[k]]
-            ro = row[moff]
-            rn = row[mon]
-            if not np.isfinite(row).any():
-                continue
-            on = _nanmed(rn)
-            off = _nanmed(ro)
-            if not (np.isfinite(on) and np.isfinite(off)):
-                continue
-            a = float(on - off)
-            se = 1.2533 * 1.4826 * float(np.nanmedian(np.abs(ro - off))) / math.sqrt(max(int(np.isfinite(rn).sum()), 1))
-            a_k.append(a)
-            z_k.append(a / max(se, 1e-30))
-        if not a_k:
-            continue
-        amps.append(float(_nanmed(np.array(a_k))))
-        zs.append(float(_nanmed(np.array(z_k))))
-        used.append(j)
-        wf_used.append(w_f)
+        amps.append(r[0])
+        zs.append(r[1])
+        used.append(int(j))
+        dl.append(r[2])
         if logf is not None:
-            logf('  [LSPR] 帧 %d：amp %+.3e  z %+.2f  w_f %.2f' % (j, amps[-1], zs[-1], w_f))
+            logf('  [LSPR][gate]%s 帧 %d：amp %+.3e  z %+.2f  δ %+.1f px  w_f %.2f'
+                 % (tag, j, r[0], r[1], r[2], w_f))
+    return amps, zs, used, dl
+
+
+def frame_gate(st, sampler, nframes, logf=None, n=10, wfac=1.5, off0=4.0,
+               off1=8.0, frac=0.8, zmin=0.8, w_px=None, ref=None, sc=1.0,
+               ampmin=0.06, sig_frame=None, amap=None, search=8.0, ctrl=5,
+               seed=11):
+    """帧域验证：逐帧局部对齐 + 符号一致 + 对照线控制（look-elsewhere 防护）。
+
+    判据：符号一致率 ≥ frac、|median z| ≥ zmin、median|amp| ≥ ampmin·σ_frame，
+    且候选的 median|amp| ≥ 5 条随机对照线 same statistic 的 95 分位。
+    """
+    hh, ww = st.get('_shape') or (None, None)
+    if sampler is None or not nframes or hh is None:
+        return {'ok': True, 'skipped': True, 'frac': 1.0, 'zmed': 0.0,
+                'amp_med': 0.0, 'n': 0, 'amps': [], 'zs': [], 'frames': []}
+    js = [int(round(i * (nframes - 1) / float(max(n - 1, 1)))) for i in range(n)]
+    js = sorted(set(js))
+    amps, zs, used, dl = _gate_one(st, sampler, js, amap, wfac, off0, off1, search,
+                                   logf=logf)
     if not amps:
-        return {'ok': False, 'frac': 0.0, 'zmed': 0.0, 'amp_med': 0.0,
-                'n': 0, 'amps': [], 'zs': [], 'frames': [], 'w': w}
-    A = np.array(amps, float)
-    Z = np.array(zs, float)
-    pos = float(np.mean(A > 0))
-    neg = float(np.mean(A < 0))
-    fr = max(pos, neg)
-    sgn = 1.0 if pos >= neg else -1.0
+        return {'ok': False, 'frac': 0.0, 'zmed': 0.0, 'amp_med': 0.0, 'n': 0,
+                'amps': [], 'zs': [], 'frames': []}
+    A = np.asarray(amps, float)
+    Z = np.asarray(zs, float)
+    fr = max(float(np.mean(A > 0)), float(np.mean(A < 0)))
     zmed = float(np.median(Z))
     amp_med = float(np.median(np.abs(A)))
-    ok = bool(fr >= frac and abs(zmed) >= zmin and (zmed * sgn) > 0)
-    if ok and ampmin is not None and sig_frame is not None:
-        ok = bool(amp_med >= float(ampmin) * float(sig_frame))
+    # 对照线：随机 θ/ρ（ρ 与候选隔开 >20 px），同一套局部搜索
+    rng = np.random.RandomState(int(seed) & 0x7FFFFFFF)
+    _pr = _chord_pts(hh, ww, st['theta'], st['rho'])
+    _rmin, _rmax = -float(hh + ww), float(hh + ww)
+    if _pr is not None:
+        _c = math.cos(math.radians(st['theta']))
+        _s = math.sin(math.radians(st['theta']))
+        _r0 = _pr[0][0] * _c + _pr[0][1] * _s
+        _r1 = _pr[1][0] * _c + _pr[1][1] * _s
+        _rmin, _rmax = min(_r0, _r1) - 0.05 * (hh + ww), max(_r0, _r1) + 0.05 * (hh + ww)
+    _nctrl = int(ctrl)
+    ctrl_v = []
+    for _k in range(_nctrl):
+        for _try in range(8):
+            th_c = float(rng.uniform(0.0, 180.0))
+            rho_c = float(rng.uniform(_rmin, _rmax))
+            _cc = math.cos(math.radians(th_c))
+            _ss = math.sin(math.radians(th_c))
+            if abs(rho_c - (st['rho'])) > 20.0:
+                break
+        stc = {'theta': th_c, 'rho': rho_c, 'width': float(st['width']),
+               '_shape': st['_shape']}
+        a_c, _z_c, _u_c, _d_c = _gate_one(stc, sampler, js, amap, wfac, off0, off1,
+                                          search)
+        if a_c:
+            ctrl_v.append(float(np.median(np.abs(np.asarray(a_c, float)))))
+    p95 = float(np.percentile(ctrl_v, 95.0)) if ctrl_v else 0.0
+    _amp_sig = float(amp_med / sig_frame) if (sig_frame and sig_frame > 0) else float('nan')
+    # 非对称「否决门」：只有**两项都不满足**才否决；其余（含证据不足、灰区）一律保留。
+    # 误杀真痕 = 用户继续看到那条线（主要诉求失败）；误留假线 = 多扣 ~0.35% 像素。
+    # 因此本门只提供否决权，不提供确认权。
+    _z_bad = (not np.isfinite(zmed)) or (abs(zmed) < float(zmin))
+    _a_bad = bool(ctrl_v) and (not np.isfinite(amp_med) or amp_med < p95)
+    veto = bool(_z_bad and _a_bad)
+    ok = not veto
     if logf is not None:
-        logf('  [LSPR] 帧域验证 θ=%.2f ρ=%.1f：%d/%d 帧  符号一致 %.0f%%  '
-             'z 中位 %+.2f  |amp| 中位 %.3e（叠加 %.3e，比 %.2f）  宽 %.2f px → %s'
-             % (st['theta'], st['rho'], len(used), len(idx), 100.0 * fr, zmed,
-                amp_med, abs(float(st.get('amp', 0.0))),
-                (amp_med / max(abs(float(st.get('amp', 0.0))), 1e-30)),
-                (np.median(wf_used) if wf_used else 0.0),
-                '通过' if ok else '判为假线，不扣除'))
-    return {'ok': ok, 'frac': fr, 'zmed': zmed, 'amp_med': amp_med,
-            'n': len(used), 'amps': amps, 'zs': zs, 'frames': used,
-            'w': float(np.median(wf_used)) if wf_used else w}
+        _why = ('z<%.2f 且 |amp|<对照 p95' % zmin) if veto else (
+            'z≥%.2f' % zmin if not _z_bad else '|amp|≥对照 p95')
+        logf('  [LSPR][gate] θ=%.2f ρ=%.1f：帧 %d  z 中位 %+.2f  |amp| 中位 %+.3e'
+             '（%.3fσ_frame） 对照 p95 %+.3e  → %s（%s）'
+             % (st['theta'], st['rho'], len(A), zmed, amp_med, _amp_sig, p95,
+                '保留' if ok else '否决', _why))
+    return {'ok': bool(ok), 'frac': fr, 'zmed': zmed, 'amp_med': amp_med,
+            'amp_sig': _amp_sig, 'ctrl_p95': p95, 'n': int(A.size),
+            'amps': [float(v) for v in A], 'zs': [float(v) for v in Z],
+            'frames': used, 'dlt': dl, 'w': float(st['width'])}
+
+
+def process_auto(img, logf=None, sigma=None, sampler=None, nframes=0,
+                 sig_frame=None):
+    """In-place: detect structures and subtract their measured profiles.
+
+    Returns (n_structures, n_pixels_changed).  Pixels outside the detected
+    structures' bands are not touched at all (bit-identical).
+    """
+    a = np.asarray(img)
+    if a.ndim != 2 or min(a.shape) < 128:
+        return 0, 0
+    sts = find_auto(a, logf=logf, sigma=sigma)
+    tot = 0
+    _nframe_use = 0
+    _sc0 = None
+    _amap = {}
+    _nt = 0
+    _fg_on = str(os.environ.get('DWT_LSPR_FRAMEGATE', '0')).strip() in ('1', 'true', 'True')
+    if sampler is not None and nframes and _fg_on:
+        # 映射自检独立于「是否检出结构」：有结构要验证就得先证明映射准
+        try:
+            _r0 = sampler(0)
+            _sc0 = float((_r0 or {}).get('k', 1.0) or 1.0)
+            _map_check(a, sampler, nframes, logf)
+        except Exception as _e_mc:
+            if logf is not None:
+                logf('  [LSPR] 映射自检失败（%s: %s）' % (type(_e_mc).__name__, _e_mc))
+        try:
+            _amap = _fit_affine(a, sampler, nframes, logf)
+            _nt = sum(1 for _v in _amap.values() if _v.get('ok'))
+            if _nt == 0 and _amap:
+                _best = max(_v.get('n', 0) for _v in _amap.values())
+                _med = float(np.median([_v.get('med', 9.9) for _v in _amap.values()]))
+                if logf is not None:
+                    logf('  [LSPR] 帧域映射不可信（内点 %d/留出残差 %.2fpx）→ 本次跳过验证'
+                         % (_best, _med))
+        except Exception as _e_af:
+            if logf is not None:
+                logf('  [LSPR] 仿射拟合失败（%s: %s）→ 本次跳过验证'
+                     % (type(_e_af).__name__, _e_af))
+            _amap, _nt = {}, 0
+    for st in sts:
+        if sampler is not None and nframes and _nt > 0 and _fg_on:
+            st['_shape'] = a.shape
+            if _sc0 is None:
+                _r0 = sampler(0)
+                _sc0 = float((_r0 or {}).get('k', 1.0) or 1.0)
+            _res = frame_gate(st, sampler, nframes, logf=logf, n=10,
+                              wfac=max(1.5, 0.65 * float(st['width'])),
+                              off0=4.0, off1=8.0, ref=a, sc=_sc0,
+                              ampmin=0.06, sig_frame=sig_frame, amap=_amap)
+            if not _res.get('ok', True):
+                continue
+            _nframe_use += 1
+        _npx = _apply_band(a, st)
+        tot += _npx
+        if logf is not None:
+            logf('  [LSPR] 扣除 θ=%.2f ρ=%.1f 幅度 %+.3e (%.2fσ) 宽 %.2fpx 覆盖 %d 像素'
+                 % (st['theta'], st['rho'], st['amp'], st['amp_sig'], st['width'], _npx))
+        # second identical pass: the profile is measured piecewise, so the
+        # residual after one pass still carries a few percent of the band
+        if _npx > 0:
+            st2 = _measure(a, st['theta'], st['rho'], float(st['sig']), K=_LSP_K, iters=2)
+            if st2 is not None and abs(st2['zsum']) > 6.0:
+                n2 = _apply_band(a, st2)
+                tot += n2
+                if logf is not None:
+                    logf('  [LSPR] 二次扣除 θ=%.2f ρ=%.1f 幅度 %+.3e 覆盖 %d 像素'
+                         % (st2['theta'], st2['rho'], st2['amp'], n2))
+    return len(sts), tot
