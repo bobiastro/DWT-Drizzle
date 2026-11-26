@@ -1222,7 +1222,8 @@ def measure_fwhm_each(img: np.ndarray, stars: List[Tuple[int, int]],
 
 def measure_fwhm_frame(mm: np.ndarray, i: int, off: np.ndarray,
                        stars: List[Tuple[int, int]], fwhm_guess: float = 6.0,
-                       half: int = 16, fit_shape: int = 29, with_flux: bool = False):
+                       half: int = 16, fit_shape: int = 29, with_flux: bool = False,
+                       search: int = 0):
     """从帧后端（memmap）直接取星点小窗量 FWHM 中位 —— **不物化整帧**
 
     一帧 244 MiB，而 120 颗星的小窗合起来才 ~0.5 MiB。先 mm[i] − off 物化整帧
@@ -1237,7 +1238,22 @@ def measure_fwhm_frame(mm: np.ndarray, i: int, off: np.ndarray,
     def kut(xi: int, yi: int):
         if xi - half < 0 or yi - half < 0 or xi + half >= w or yi + half >= h:
             return None
-        return mm[i, yi - half:yi + half + 1, xi - half:xi + half + 1] - offi
+        # 逐帧重定心：帧间抖动会把星点挪出 seed 坐标，直接按 seed 坐标切窗会让
+        # 拟合吃到背景/星点边缘（实测同一批星在不同帧给出 8.4px 与 3.2px 的假值）。
+        # 在 ±search 内找最亮像元再把窗口居中到它；搜不到就退回原坐标。
+        cx, cy = xi, yi
+        if search > 0:
+            x0, x1 = max(0, xi - half - search), min(w, xi + half + search + 1)
+            y0, y1 = max(0, yi - half - search), min(h, yi + half + search + 1)
+            big = mm[i, y0:y1, x0:x1] - offi
+            if big.size:
+                k = int(np.argmax(big))
+                cy = y0 + k // big.shape[1]
+                cx = x0 + k % big.shape[1]
+                if (cx - half < 0 or cy - half < 0
+                        or cx + half >= w or cy + half >= h):
+                    cx, cy = xi, yi
+        return mm[i, cy - half:cy + half + 1, cx - half:cx + half + 1] - offi
 
     if with_flux:
         v, fl = _fwhm_each(kut, stars, fwhm_guess, half, fit_shape, with_flux=True)
@@ -2031,10 +2047,11 @@ def _task_fwhm(job) -> Tuple[int, float, int, int]:
     只从帧后端取星点小窗，不物化整帧 —— 一帧 244 MiB 而小窗合计 ~0.5 MiB，
             这一步因此从"每帧重读一整帧"变成"几乎免费"。
     """
-    i, stars = job
+    i, stars, srch = job
     # 拟合计数发生在子进程里，父进程看不见 → 用增量带回（并发时父进程累加）
     n0, c0 = _FIT_STAT['n'], _FIT_STAT['conv']
-    v, fx = measure_fwhm_frame(_MEM['mm'], i, _MEM['off'], stars, with_flux=True)
+    v, fx = measure_fwhm_frame(_MEM['mm'], i, _MEM['off'], stars, with_flux=True,
+                                search=int(srch or 0))
     return int(i), v, fx, _FIT_STAT['n'] - n0, _FIT_STAT['conv'] - c0
 
 
@@ -3434,9 +3451,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         if not _reuse_fw:
             _CFA['fwhm_cache'] = np.array(fwhms, np.float64, copy=True)
     elif nw > 1:
+        _srch = int(getattr(p, 'fwhm_search', 0) or 0)
         ex = ProcessPoolExecutor(max_workers=nw, initializer=ini, initargs=ini_args)
         try:
-            for i, v, fx, dn, dc in ex.map(_task_fwhm, ((i, _cs) for i in range(n)),
+            for i, v, fx, dn, dc in ex.map(_task_fwhm, ((i, _cs, _srch) for i in range(n)),
                                            chunksize=1):
                 _check_cancel()
                 fwhms[i] = v
@@ -3448,7 +3466,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     else:
         for i in range(n):
             _check_cancel()
-            fwhms[i] = measure_fwhm_frame(fs.mm, i, fs.off, _cs)
+            fwhms[i] = measure_fwhm_frame(fs.mm, i, fs.off, _cs,
+                                         search=int(getattr(p, 'fwhm_search', 0) or 0))
             _emit('测星点', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
     ok = np.isfinite(fwhms)
     if not bool(ok.any()):
