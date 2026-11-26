@@ -168,6 +168,18 @@ same but the rejection/merge is not bit-reproducible across runs.  The number
 that *is* achievable is the all-pixel `corr`, where dwt-rs (0.999867) is
 slightly better than the Python rerun (0.999412).
 
+Tail behaviour against the `max|d| <= 3.5e-4` bar (masked region):
+
+| run | > 3.5e-4 | > 1e-3 | > 3e-3 | mean 1 - A/B |
+|---|---|---|---|---|
+| Python rerun (ceiling) | 0.0193 % | 0.0012 % | 0.0000 % | -0.016 % |
+| dwt-rs, `--geom` | 0.0235 % | 0.0037 % | 0.0004 % | -0.107 % |
+| dwt-rs, own registration | 0.0286 % | 0.0040 % | 0.0005 % | -0.106 % |
+
+so the *fraction* of masked pixels over the bar is within 1.5x of Python's own
+reproducibility ceiling; only the single worst clump is 5x worse.  The
+`-0.106 %` bias is the background offset documented under Known limits.
+
 Attribution of the residual (each row is a real run, not a model):
 
 1. registration solution - **eliminated**: with `--geom` the fitted residual is
