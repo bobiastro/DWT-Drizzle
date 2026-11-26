@@ -37,6 +37,8 @@ Useful switches:
 | `--gpu on\|off` | wgpu kernels vs CPU (default: auto if an adapter exists) |
 | `--weights-from <txt>` | inject `idx fwhm C sigma S` table (parity harness) |
 | `--star-grow-fixed <v>` | bypass the automatic star-grow estimate |
+| `--fwhm-search N` | per-frame FWHM recentring radius in px (default 8, `0` = Python's pre-2.7.116 behaviour) |
+| `--per-frame-stars` | detect stars per frame instead of reusing the seed table |
 | `--save-aux` | write `PWS_t_R_q4.npy`, `PWS_t_neff_q4.npy`, `PWS_t_weights.txt` |
 | `--dump-frames/--dump-w/--dump-r <dir>` | dump intermediates as `.npy` |
 | `--report` | print the timing/statistics report |
@@ -48,34 +50,62 @@ Environment: `DWT_GPU_TIMING=1`, `DWT_GPU_REPS=N`, `DWT_BENCH_CPU=N`,
 ## Parity vs the Python reference
 
 Same input (`G:/HFG1-3/master3/calibrated`, `--pick O --limit 8 --crop 400
---drizzle --drizzle-scale 1 --A 6 --aligned 1`), 400×400 output.
+--drizzle --drizzle-scale 1 --A 6 --aligned 1`), 400×400 output, Python run with
+`--fwhm-search 8` (its new per-frame FWHM recentring).
 
-| run | corr | max\|diff\| | max\|diff\| / median(sky) | rms\|diff\| | wall |
+| run | corr | max\|diff\| | max\|diff\| per median(sky) | rms\|diff\| | wall |
 |---|---|---|---|---|---|
-| Rust CPU, C/S injected from the Python table | **1.00000000** | 1.024e-08 | 1.8e-06 | 6.32e-10 | 1.04 s |
-| Rust GPU, same inputs | **1.00000000** | 9.31e-09 | 1.6e-06 | 6.48e-10 | 2.35 s |
-| Rust CPU, native PSF/sky estimators | 0.98543842 | 4.882e-03 | 0.845 | 3.98e-05 | 1.01 s |
-| Python reference | — | — | — | — | 25.13 s |
+| Rust CPU, native estimators | **0.99991824** | 1.339e-04 | 0.02316 | 2.97e-06 | 1.02 s |
+| Rust CPU, C/S injected from the Python table | **1.00000000** | 2.980e-08 | 5.2e-06 | 1.2e-10 | 1.02 s |
+| Rust GPU, same inputs | **1.00000000** | 2.794e-09 | 4.8e-07 | 5.2e-10 | 2.53 s |
+| Python reference | — | — | — | — | 15.0 s (10.5 s internal) |
 
-The first two rows show the whole pipeline (sky normalisation, weights,
-rejection, weighted mean, xisf I/O) is bit-exact: 1e-8 is float32 rounding of a
-~1e-2 signal. The third row differs only through `C_i`, the per-frame PSF-size
-term.
+Criterion: `max|diff| / median(sky) <= 1e-3` (sky = 5.78e-3, sky noise
+1.15e-4). The native run lands at 0.023, the injected run is float32 rounding
+of a ~1e-2 signal. Everything except `C_i` is bit-exact; injecting Python's
+`C/S` reproduces its output to 2.98e-08.
 
-### Why the native `C_i` differs
+### Per-frame PSF size (`C_i`)
 
-`C_i = median(fwhm) / fwhm_i`. Python measures the FWHM with `photutils.fit_fwhm`
-on a fixed 33×33 window anchored at the star positions of one *seed* frame, for
-every frame. These frames are dithered by 3–16 px, so on frames far from the
-seed the star sits at the window edge and the fit inflates: the Python table
-reads `8.41, 8.34, 3.21, 2.84, 2.49, 2.27, 2.14, 2.15` where the physical PSF is
-~2.6 px on every frame (photutils itself returns 2.5–2.8 px when re-centred).
+`C_i = median(fwhm) / fwhm_i`, so only the *shape* of the per-frame PSF series
+matters. Python measures it with `photutils.fit_fwhm` at a fixed 33×33 window
+anchored on one seed frame's star table; `--fwhm-search 8` re-centres that
+window on the brightest pixel first. dwt-rs mirrors this exactly
+(`detect::recenter_brightest` + `measure_fwhm_search`, `--fwhm-search N`,
+default 8), with a σ-grid fit instead of a 7-parameter LM fit.
 
-dwt-rs measures each frame against its own star table (and refuses fits below
-`3σ`), giving `2.13–2.75 px, median 2.64 px`, i.e. the physically correct value.
-That is a deliberate difference; injecting Python's own `C/S` reproduces its
-output to 1e-8. Sensitivity: perturbing Python's `C` by ±5 % still yields
-corr 0.99994, so the remaining 1.5 % is the whole effect of this term.
+| frame | py fwhm | py C | rs fwhm | rs C | rs C / py C |
+|---|---|---|---|---|---|
+| 0 | 2.707 | 0.9391 | 2.846 | 0.9612 | 1.024 |
+| 1 | 2.624 | 0.9689 | 2.795 | 0.9785 | 1.010 |
+| 2 | 2.734 | 0.9300 | 2.916 | 0.9380 | 1.009 |
+| 3 | 2.699 | 0.9420 | 2.840 | 0.9633 | 1.023 |
+| 4 | 2.461 | 1.0332 | 2.675 | 1.0225 | 0.990 |
+| 5 | 2.232 | 1.1392 | 2.425 | 1.1278 | 0.990 |
+| 6 | 1.971 | 1.2899 | 2.307 | 1.1855 | 0.919 |
+| 7 | 2.078 | 1.2234 | 2.291 | 1.1937 | 0.976 |
+
+The absolute FWHM carries a +8 % bias (σ-grid fit on a fixed window), which
+cancels in the ratio; the residual is concentrated on the two sharpest frames.
+Isolation runs: injecting Python's `C/S` gives corr 1.00000000 and forcing
+`--star-grow-fixed 2.59` (Python's auto value) changes nothing (0.99992027), so
+C is the only divergent term - the S table is identical to the last digit and
+the flux term is off by default (`flux_pow=0`). Perturbing Python's C by ±5 %
+still yields corr 0.99994.
+
+### CPU wall time
+
+| case | dwt-rs | Python |
+|---|---|---|
+| 8 frames, crop 400 (160 kpx) | **1.02 s** (FWHM 0.34 s, stack 0.19 s) | 15.0 s wall / 10.5 s internal |
+| 60 frames, full frame 2758×2204 | **85.3 s** (FWHM 41 s, stack 40 s, 12 threads) | 138 s wall / 134 s internal |
+
+At 60 frames the full-frame correlation drops to 0.899: the C series is taken
+over 120 mostly-faint stars (Python's probe frame yields 66) and the σ-grid fit
+is biased on the sharpest frames, which also selects a slightly different
+reference image. The reference is built from the k=min(8,n) sharpest frames
+(`pws.py:4245`); using *all* frames instead costs 0.865 → fix that made this
+0.899.
 
 ## GPU
 
