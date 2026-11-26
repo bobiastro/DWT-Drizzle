@@ -3619,10 +3619,20 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         return _n
 
     drz_on = bool(getattr(p, 'drizzle', False))
-    if bool(int(getattr(p, 'aligned', 0) or 0)):
-        if drz_on:
-            log('[对齐] 输入已对齐模式：跳过配准与重采样，直接加权叠加')
-        drz_on = False
+    _aligned_in = bool(int(getattr(p, 'aligned', 0) or 0))
+    if _aligned_in:
+        # 旧行为：无条件关掉 drizzle → --drizzle-scale 被忽略，成品恒为 1×（bug）。
+        # 现在保留用户要求的倍率：已对齐的帧位移≈0，走 drizzle 只是把样本投到 s× 网格；
+        # s=1 时下面「已基本对齐 → 跳过重采样」会自动生效，等价于旧行为。
+        _s_al = float(getattr(p, 'drizzle_scale', 1.0) or 1.0)
+        if drz_on and _s_al > 1.001:
+            log('[对齐] 输入已对齐模式：跳过配准修正（位移≈0），仍按 ×%g 输出网格做 drizzle'
+                % _s_al)
+        else:
+            # ×1 且已对齐：直接加权叠加最锐（实测 2.55px vs drizzle 3.17px）
+            if drz_on:
+                log('[对齐] 输入已对齐且 ×1：不做 drizzle，直接加权叠加（最锐）')
+            drz_on = False
     # 非 drizzle 路径也要有 T/fp：默认等价于关闭吞吐权重
     fp = float(getattr(p, 'flux_pow', FLUX_POW) or 0.0)
     T = None
@@ -3851,6 +3861,20 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         # ---- 输入本身已经对齐（例如 WBPP 的 registered 帧）就别再插值一次 ----
         #   实测同一批 registered 帧：走 drizzle 1x = 2.66px，直接加权叠加 = 2.47px，
         #   差的 0.19px 全是重采样核的代价；DWT 原版叠 registered 帧也不插值。
+        if _aligned_in:
+            # 输入已由 WBPP 注册：几何就是单位变换。不再用我们自己的星点匹配结果
+            # （对已对齐帧只会引入几十分之一像素的抖动，叠加后等于多插值一次 ⇒ 更糊）。
+            dx = np.zeros_like(np.asarray(dx, np.float64))
+            dy = np.zeros_like(np.asarray(dy, np.float64))
+            th = np.zeros_like(np.asarray(th, np.float64))
+            kk = np.ones_like(np.asarray(kk, np.float64))
+            log('[对齐] 已对齐输入：位移/旋转/尺度置为 0/1，不再二次配准'
+                '（×1 时自动跳过重采样；>1 时只把样本投到 s× 网格）')
+        # 画布必须先算出来，下面的「已对齐→跳过 drizzle」判据要用它的尺寸
+        try:
+            drz_plan = plan_output(fs.shape, dx, dy, drz_s, theta=th, k=kk)
+        except Exception:
+            drz_plan = None
         _fin = np.isfinite(dx) & np.isfinite(dy)
         if drz_on and _fin.any():
             _mx = float(np.nanmax(np.abs(dx[_fin])))
@@ -3858,9 +3882,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             _mt = float(np.nanmax(np.abs(th[_fin])))
             _mk = float(np.nanmax(np.abs(kk[_fin] - 1.0)))
             _cfa_now = bool(_CFA.get('raw') and _CFA.get('ch'))
+            _fh, _fw = int(fs.shape[0]), int(fs.shape[1])
             _canvas_is_frame = (drz_plan is not None
-                                and int(drz_plan.get('H', 0)) == int(h)
-                                and int(drz_plan.get('W', 0)) == int(w))
+                                and int(drz_plan.get('H', 0)) == _fh
+                                and int(drz_plan.get('W', 0)) == _fw)
             if (_mx < 0.75 and _my < 0.75 and _mt < 0.05 and _mk < 0.002
                     and not _cfa_now and _canvas_is_frame):
                 drz_on = False
@@ -3873,7 +3898,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             elif (not _cfa_now) and (not _canvas_is_frame) and _mx < 0.75 and _my < 0.75:
                 log('[drizzle] 帧间已对齐，但输出画布 %dx%d ≠ 帧 %dx%d（亚像素余量），'
                     '仍走 drizzle 以保证 R 场与带内数据同一网格'
-                    % (int(drz_plan.get('W', 0)), int(drz_plan.get('H', 0)), w, h))
+                    % (int(drz_plan.get('W', 0)), int(drz_plan.get('H', 0)), _fw, _fh))
 
         # ---- 吞吐 T_i：在配准后的真实星点位置上测，跨帧同一颗星才有可比性 ----
         #   形状（C）和噪声（S）都不回答"这帧收了多少光"：通透的夜晚信号高、
