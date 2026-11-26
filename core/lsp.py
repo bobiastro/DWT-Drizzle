@@ -236,7 +236,8 @@ _LSP_SEEDS = 80          # 保留种子数
 _LSP_SCAN_DRHO = 48.0
 _LSP_SCAN_STEP = 16.0
 _LSP_COARSE = 6.0        # 粗筛 on/off 统计下限
-_LSP_NMEAS = 12          # 精测（_measure）上限
+_LSP_NMEAS = 12
+_LSP_NZ = 10          # 精测（_measure）上限
 _LSP_SAMPLES = 1.5e6
 # 帧域验证开关：1 = 用 10 帧复核（默认），0 = 退回纯叠加域判据
 _LSP_FRAMES = 1     # 目标采样点数（自适应 step）
@@ -527,6 +528,67 @@ def _dedupe(cands, dth=1.0, drho=12.0):
         else:
             out.append(c)
     return out
+
+
+def _seed_scan(F, dbins=8.0, keep_per_theta=12, topk=160, minz=4.0):
+    """全局粗条带扫描：在掩膜场上按 (θ, ρ) 直接算 Z，补充 `_candidates` 漏掉的种子。
+
+    动机：实测真痕在 _measure 下 zsum≈80 能过判据，但 _candidates 的 cell-Z
+    排序把它排到 25–80 名之外 ⇒ 根本进不了精测。这里用最便宜的投影统计
+    （每 θ 一次 bincount，1.5e6 样本约 30 ms）扫全 (θ,ρ)，把 |Z| 高的直接送
+    下游 `_coarse_rho` + `_measure`，不依赖 cell map 的分段假设。
+    """
+    x = np.asarray(F['x'], np.float64); y = np.asarray(F['y'], np.float64)
+    v = np.asarray(F['v'], np.float64)
+    ok = np.isfinite(v)
+    if ok.sum() < 1000:
+        return []
+    x, y, v = x[ok], y[ok], v[ok]
+    med = float(np.median(v)); mad = 1.4826 * float(np.median(np.abs(v - med)))
+    if not np.isfinite(mad) or mad <= 0:
+        return []
+    out = []
+    for th in np.arange(0.0, 180.0, 4.0):
+        c = math.cos(math.radians(float(th))); s = math.sin(math.radians(float(th)))
+        pr = x * c + y * s
+        p0 = float(pr.min())
+        b = np.floor((pr - p0) / dbins).astype(np.int64)
+        nb = int(b.max()) + 1
+        cnt = np.bincount(b, minlength=nb).astype(np.float64)
+        sm = np.bincount(b, weights=v, minlength=nb)
+        good = cnt >= 40.0
+        if not good.any():
+            continue
+        mean = np.zeros(nb, np.float64)
+        mean[good] = sm[good] / cnt[good]
+        # 用「同一 θ 下各 ρ 分箱均值的离散」做尺度，而不是 mad/sqrt(N)：
+        # 后者随 N 增大而爆掉，会被大尺度梯度/暗角主导（实测 z 上万）
+        resid = np.where(good, mean - med, 0.0)
+        gv = resid[good]
+        if gv.size < 8:
+            continue
+        sg = 1.4826 * float(np.median(np.abs(gv - np.median(gv))))
+        if not np.isfinite(sg) or sg <= 0:
+            continue
+        zz = np.where(good, resid / sg, 0.0)
+        for k in np.argsort(-np.abs(zz))[:keep_per_theta]:
+            z = float(zz[k])
+            if abs(z) < minz:
+                continue
+            out.append({'theta': float(th), 'rho': p0 + (float(k) + 0.5) * dbins,
+                        'z': z})
+    out.sort(key=lambda d: -abs(d['z']))
+    sel = []
+    for c in out:
+        for o in sel:
+            dd = abs(c['theta'] - o['theta']); dd = min(dd, 180.0 - dd)
+            if dd < 3.0 and abs(c['rho'] - o['rho']) < 40.0:
+                break
+        else:
+            sel.append(c)
+        if len(sel) >= topk:
+            break
+    return sel
 
 
 def _candidates(F, logf=None, tstep=4.0, zmin=6.0, topk=16, nper=3, zloc=6.0):
@@ -928,6 +990,15 @@ def find_auto(img, logf=None, sigma=None):
              % (F['n'], F['dens'], F['ds'], F['step'], sig))
     cand = _candidates(F, logf=logf, tstep=_LSP_TSTEP, zmin=cfg['zmin'],
                        topk=cfg['seeds'])
+    try:
+        _extra = _seed_scan(F)
+        if _extra:
+            cand = list(cand) + _extra
+            if logf is not None:
+                logf('  [LSPR] 额外种子 %d 条（全局粗条带扫描，|Z|>=4）' % len(_extra))
+    except Exception as _e_seed:
+        if logf is not None:
+            logf('  [LSPR] 种子扫描跳过（%s: %s）' % (type(_e_seed).__name__, _e_seed))
     # stage 1: locate the perpendicular offset of every candidate with a cheap
     # strip scan (the cell map's rho carries a bookkeeping offset of tens of px,
     # which is far outside the measurement window)
@@ -936,13 +1007,21 @@ def find_auto(img, logf=None, sigma=None):
         rb, zs = _coarse_rho(a, c['theta'], c['rho'], sig)
         if rb is None or abs(zs) < _LSP_COARSE:
             continue
-        scr.append((abs(zs), float(c['theta']), float(rb), zs))
+        scr.append((abs(zs), float(c['theta']), float(rb), zs, float(c.get('Z', 0.0))))
     scr.sort(reverse=True)
     if logf is not None:
         logf('  [LSPR] 粗筛 %d/%d 条通过（阈值 %.1f），精确测量前 %d 条'
              % (len(scr), len(cand), _LSP_COARSE, _LSP_NMEAS))
+    # 选谁去精测：|zs| 前 N 名 **并上** 单元图 Z 前 NZ 名。低对比长线的 cell-Z 往往很高
+    # 但 |zs| 排不进前 N（实测 HFG1 那条 0.35σ 的线：cell-Z 第 1、|zs| 第 40+），
+    # 并集把两条排序的互补性用上，代价约 +10 次 _measure（~1.5 s）。
+    sel = {}
+    for azs, th, rho, zs, cz in scr[:_LSP_NMEAS]:
+        sel[(round(th, 2), round(rho, 1))] = (th, rho)
+    for azs, th, rho, zs, cz in sorted(scr, key=lambda x: -x[4])[:_LSP_NZ]:
+        sel.setdefault((round(th, 2), round(rho, 1)), (th, rho))
     out = []
-    for azs, th, rho, zs in scr[:_LSP_NMEAS]:
+    for th, rho in sel.values():
         st = _measure(a, th, rho, sig, K=_LSP_K, iters=4)
         if st is None:
             continue
