@@ -316,8 +316,10 @@ aligned stacks (--aligned 1, no registration):
                   path bit for bit.
 registration (--aligned 0 / --register 1), used to stack un-aligned frames:
   --canvas-from F adopt the W/H of a reference stack; registration turns on
-                  automatically, and the run aborts when its own solution
-                  disagrees with the reference by >0.5 deg or >1% in scale.
+                  automatically.  Hard check, not a resize: the run aborts
+                  (exit 1, no file) when the solved bounding box differs from
+                  the reference by >2 px, or when rotation differs by >0.5 deg
+                  or scale by >1%.
   --geom F        inject an external 'idx dx dy theta k' registration table.
   --ref-frame N   the frame that is the identity of the similarity chain.
   --drop-mul F    drizzle drop side in output pixels; defaults to 2.0 when
