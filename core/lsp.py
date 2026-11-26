@@ -6,8 +6,28 @@
 但痕迹在空间上连成长条——形态学一放大就整条可见。
 """
 from __future__ import annotations
+import math
 import os
+import warnings
 import numpy as np
+
+
+def _nanmed(x, axis=None):
+    """nanmedian that never emits ``All-NaN slice`` and always returns finite.
+
+    Strip rows that fall entirely outside the finite part of the canvas are
+    legal (border tiles); for those the caller needs *some* value, not a
+    warning, so empty/NaN slices degrade to 0.0 (which is the same as "no
+    measurement" for the amplitude profile).
+    """
+    a = np.asarray(x, dtype=np.float64)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        m = np.nanmedian(a, axis=axis)
+    # NaN is kept on purpose: callers treat "no measurement" as an invalid
+    # segment and skip it (that is also what keeps the amplitude profile
+    # honest at the canvas border).
+    return float(m) if axis is None else m
 
 
 def _open(mask: np.ndarray, it: int = 1) -> np.ndarray:
@@ -581,7 +601,7 @@ def _profiles(V, K):
         for k in range(K):
             a = int(edges[k])
             b = int(max(a + 1, edges[k + 1]))
-            P[k] = np.nanmedian(V[a:b], axis=0)
+            P[k] = _nanmed(V[a:b], axis=0)
     return P
 
 
@@ -590,7 +610,7 @@ def _peak_of(row, d, wsearch=9.0, off0=5.0, off1=9.0, onmin=1.5):
     offm = (ad >= off0) & (ad <= off1)
     if not np.isfinite(row).any():
         return 0.0, 0.0, 1.0, False, onmin / 0.7
-    base = float(np.nanmedian(row[offm])) if offm.any() else 0.0
+    base = _nanmed(row[offm]) if offm.any() else 0.0
     idx = np.nonzero(ad <= wsearch)[0]
     if idx.size < 5:
         return 0.0, 0.0, 1.0, False, onmin / 0.7
@@ -616,7 +636,13 @@ def _peak_of(row, d, wsearch=9.0, off0=5.0, off1=9.0, onmin=1.5):
         fwhm = 2.0 * onmin
     sig = max(onmin / 0.7, fwhm / 2.355)
     noff = max(1, int(offm.sum()))
-    sd = 1.2533 * float(np.nanstd(row[offm])) / math.sqrt(noff) if noff > 2 else 1.0
+    if noff > 2 and np.isfinite(row[offm]).sum() > 2:
+        _o = row[offm]
+        _o = _o[np.isfinite(_o)]
+        _sd0 = 1.2533 * float(np.std(_o)) / math.sqrt(max(1, _o.size))
+        sd = _sd0 if np.isfinite(_sd0) and _sd0 > 0 else 1.0
+    else:
+        sd = 1.0
     return d0, amp, sd, True, sig
 
 
@@ -709,10 +735,10 @@ def _measure(img, th, rho, sig, K=32, iters=4, sstep=2.0, dstep=0.5, dmax=12.0):
                 continue
             von = blk[:, cols_on]
             voff = blk[:, cols_off]
-            a_on = float(np.nanmedian(von))
-            a_off = float(np.nanmedian(voff))
-            s_on = 1.4826 * float(np.nanmedian(np.abs(von - a_on)))
-            s_off = 1.4826 * float(np.nanmedian(np.abs(voff - a_off)))
+            a_on = _nanmed(von)
+            a_off = _nanmed(voff)
+            s_on = 1.4826 * _nanmed(np.abs(von - a_on))
+            s_off = 1.4826 * _nanmed(np.abs(voff - a_off))
             n_on = max(1.0, float(von.size))
             n_off = max(1.0, float(voff.size))
             amp[k] = a_on - a_off
@@ -860,8 +886,29 @@ def _coarse_rho(img, th, rho0, sig, drho=None, step=None, sstep=8.0, K=16,
     return best
 
 
+def _probe(img, th, rho, sig, K=16, sstep=12.0, dstep=2.0, dmax=18.0, iters=2):
+    """Cheap full-resolution strip measurement used only to *rank* candidates.
+
+    The ranker must look at the same per-segment medians as the final
+    acceptance: a whole-chord mean is diluted by the field's real bright
+    structures (that was the recall bottleneck), while a coarse strip that
+    takes the median of ~100 on-band pixels per segment keeps a 1sigma line
+    visible.  Cost is ~1/8 of a full ``_measure``.
+    """
+    st = _measure(img, float(th), float(rho), float(sig), K=int(K), iters=int(iters),
+                  sstep=float(sstep), dstep=float(dstep), dmax=float(dmax))
+    if st is None:
+        return None
+    if not (np.isfinite(st['zsum']) and np.isfinite(st['amp'])):
+        return None
+    return st
+
+
 def find_auto(img, logf=None, sigma=None):
-    """Detect large-scale straight structures in a stacked image."""
+    """Detect large-scale straight structures in a stacked image.
+
+    Returns a list of structure dicts; ``img`` is not modified.
+    """
     a = np.asarray(img)
     if a.ndim != 2 or min(a.shape) < 128:
         return []
@@ -879,18 +926,21 @@ def find_auto(img, logf=None, sigma=None):
              % (F['n'], F['dens'], F['ds'], F['step'], sig))
     cand = _candidates(F, logf=logf, tstep=_LSP_TSTEP, zmin=cfg['zmin'],
                        topk=cfg['seeds'])
+    # stage 1: locate the perpendicular offset of every candidate with a cheap
+    # strip scan (the cell map's rho carries a bookkeeping offset of tens of px,
+    # which is far outside the measurement window)
     scr = []
     for c in cand:
         rb, zs = _coarse_rho(a, c['theta'], c['rho'], sig)
         if rb is None or abs(zs) < _LSP_COARSE:
             continue
-        scr.append((abs(zs), float(c['theta']), float(rb)))
+        scr.append((abs(zs), float(c['theta']), float(rb), zs))
     scr.sort(reverse=True)
     if logf is not None:
         logf('  [LSPR] 粗筛 %d/%d 条通过（阈值 %.1f），精确测量前 %d 条'
              % (len(scr), len(cand), _LSP_COARSE, _LSP_NMEAS))
     out = []
-    for zs, th, rho in scr[:_LSP_NMEAS]:
+    for azs, th, rho, zs in scr[:_LSP_NMEAS]:
         st = _measure(a, th, rho, sig, K=_LSP_K, iters=4)
         if st is None:
             continue
