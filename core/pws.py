@@ -1793,13 +1793,16 @@ def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
     _gr = float(os.environ.get('DWT_WGAMMA', '') or 1.0)
     # 单帧份额上限：细节区的 C^A 会让某一帧独占绝大部分权重，此时该帧的
     # 缺陷（卫星线/宇宙线）不是"少数派"而是"多数派"，逐像素排异按定义抓不到。
-    # 做法：把 A·lnC 截到 ±L，使最大/最小权重比 ≤ ((n-1)·cap/(1-cap))，
-    # 从而任一帧的份额 ≤ cap。cap=0 关闭（保持旧行为）。
+    # 做法：把**总对数权重** ln(W) 截到 ±L，使最大/最小权重比 ≤ ((n-1)·cap/(1-cap))，
+    # 从而任一帧的份额 ≤ cap（只截 A·lnC 不够：S/T 仍能把份额推上去）。
+    # 注意 L 取**一半**的对数比：实测权重比 ≤ e^(2L)，故 2L = ln((n-1)cap/(1-cap))。
+    # cap=0 关闭（保持旧行为）。
     _alc = a * lc
+    _lw = _gr * (_alc + b * ls + fp * lt)
     if cap and 0.0 < cap < 1.0 and n > 1:
-        _L = float(np.log(max((n - 1) * cap / (1.0 - cap), 1e-9)))
-        _alc = np.clip(_alc, -_L, _L)
-    W = np.exp(_gr * (_alc + b * ls + fp * lt))
+        _L = 0.5 * float(np.log(max((n - 1) * cap / (1.0 - cap), 1e-9)))
+        _lw = np.clip(_lw, -_L, _L)
+    W = np.exp(_lw)
     W /= np.maximum(W.mean(axis=0), 1e-30)[None]
     return W.astype(np.float32)
 
@@ -4627,6 +4630,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         finally:
             if not getattr(fs, '_shared', False):
                 fs.close(keep=keep_frames)
+        globals()['_GPU_WMAX'] = True
         Stk = r_d['stack']
         neff = r_d['neff']
         cov_map = r_d.get('ncov')
@@ -4745,8 +4749,17 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         rej_rate = rej_num / max(rej_den, 1.0)
         log(f'[W] A={A:g} B={B:g}（B=2 为逆方差最优）  条带 {strip} 行 × '
             f'{int(np.ceil(h / strip))} 条  归一后 mean_i(W)=1')
-    log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
-        f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
+    if globals().get('_GPU_WMAX', False):
+        # GPU 路径返回的 'wmax' 是覆盖和（cov.max()），不是逐帧最大权重
+        log(f'[W] 单帧最大权重：GPU 路径不统计该量（这里的 {np.mean(wmax):.1f} 是覆盖和）')
+    else:
+        log(f'[W] 单帧最大权重（条带均值）{np.mean(wmax):.3f}  '
+            f'等权份额 = {1.0:.3f} → 最大独占约 {np.mean(wmax):.1f}× 份额')
+    _wc_used = float(getattr(p, 'max_share', 0.0) or 0.0)
+    if 0.0 < _wc_used < 1.0 and n > 1:
+        _L = 0.5 * float(np.log(max((n - 1) * _wc_used / (1.0 - _wc_used), 1e-9)))
+        log(f'[W] 份额上限 {_wc_used:.0%}：对数权重 clamp 到 ±{_L:.3f}'
+            f'（最重帧 ≤ 其余帧 {np.exp(2 * _L):.1f} 倍 → 任一帧份额 ≤ {_wc_used:.0%}）')
     log(f'[叠加] 完成 {time.perf_counter() - t2:.1f}s  排异剔除率 {rej_rate:.3%}')
     log(f'[叠加] N_eff 中位 {np.median(neff):.2f}/{n}  '
         f'P10 {np.percentile(neff, 10):.2f}  最小 {neff.min():.2f}')

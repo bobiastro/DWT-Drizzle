@@ -104,10 +104,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let c11 = ctile[u32(iy1) * u + u32(ix1)];
         lcg = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
       }
-      // 单帧份额上限：把 A·lnC 截在 ±capl（capl=0 表示不限额）
-      var alc = Q.wa * rr * lcg;
-      if (Q.capl > 0.0) { alc = clamp(alc, -Q.capl, Q.capl); }
-      let wgt = exp(alc + (Q.wb * (1.0 - rr) + Q.beta * rr) * Q.lns);
+      // 单帧份额上限：把**总对数权重**截在 ±capl（capl=0 表示不限额）
+      var le = Q.wa * rr * lcg + (Q.wb * (1.0 - rr) + Q.beta * rr) * Q.lns;
+      if (Q.capl > 0.0) { le = clamp(le, -Q.capl, Q.capl); }
+      let wgt = exp(le);
       let w = wgt * wx * wy / (Q.P * Q.P) * exp(Q.lnt);
 
       if (mode == 0) {
@@ -296,7 +296,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         _cap = 0.0
     _nf = int(np.atleast_1d(dx).size)
     if 0.0 < _cap < 1.0 and _nf > 1:
-        p[29] = np.float32(math.log(max((_nf - 1) * _cap / (1.0 - _cap), 1e-9)))
+        p[29] = np.float32(0.5 * math.log(max((_nf - 1) * _cap / (1.0 - _cap), 1e-9)))
     else:
         p[29] = np.float32(0.0)
     p[14] = np.float32(P)

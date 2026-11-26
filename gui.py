@@ -781,7 +781,7 @@ class App(tk.Tk):
             values=["关（推荐）", "开"]),
              "第一遍出图后按 64px 块估局部锐度再叠一遍；实测收益 <1%、耗时 +40%")
 
-        # ---- R 场包络（2.7.111-D 起可见）----
+        # ---- R 场包络（2.7.112-D 起可见）----
         # 这三个数决定「细节掩膜 R」的形状：哪算结构、结构边缘多宽、空白天压得多狠。
         # 默认值是标定过的，只有在特定目标上（暗弱大结构被压掉 / 星点外有硬边）才动。
         self.v_envw = tk.StringVar(value="2.0")
@@ -1447,7 +1447,7 @@ class App(tk.Tk):
         """关于：方法与原文出处（PWS，D.Cikey）"""
         messagebox.showinfo(
             "关于 DWT · Drizzle",
-            "DWT · Drizzle 2.7.111-D\n\n" + LICENSE_TEXT)
+            "DWT · Drizzle 2.7.112-D\n\n" + LICENSE_TEXT)
 
     def show_help(self):
         """打开内置使用说明（不依赖浏览器 / 外部程序）"""
