@@ -275,6 +275,38 @@ fn median_f32(v: &mut [f32]) -> f32 {
     v[v.len() / 2]
 }
 
+/// Python `fwhm_max` 筛帧：返回需要剔除的帧下标
+/// （core/pws.py:3833-3841：`_cut = np.nonzero(~(fwhms <= _fm))[0]`）。
+/// `limit <= 0` 表示不筛；非有限 FWHM 不参与判定（Python 里它们本来就是 nan）。
+pub fn fwhm_max_cut(fwhms: &[f32], limit: f32) -> Vec<usize> {
+    if !(limit > 0.0) {
+        return Vec::new();
+    }
+    (0..fwhms.len())
+        .filter(|&i| fwhms[i].is_finite() && fwhms[i] > limit)
+        .collect()
+}
+
+#[cfg(test)]
+mod fwhm_max_tests {
+    use super::*;
+
+    #[test]
+    fn default_limit_keeps_every_frame() {
+        let f = [2.0f32, 3.0, 9.0, f32::NAN];
+        assert!(fwhm_max_cut(&f, 0.0).is_empty(), "0 = 不筛（Python 默认）");
+        assert!(fwhm_max_cut(&f, -1.0).is_empty());
+    }
+
+    #[test]
+    fn cut_selects_only_frames_above_the_limit() {
+        let f = [2.0f32, 3.0, 3.5, f32::NAN, 1.0];
+        // 严格大于才剔；等于上限的保留（Python `fwhms <= _fm` 保留）
+        assert_eq!(fwhm_max_cut(&f, 3.0), vec![2]);
+        assert_eq!(fwhm_max_cut(&f, 1.5), vec![0, 1, 2]);
+    }
+}
+
 #[cfg(test)]
 mod throughput_tests {
     use super::*;

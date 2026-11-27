@@ -88,6 +88,7 @@ struct Args {
     rej_z: bool,
     sharp_w: f32,
     flux_pow: f32,
+    fwhm_max: f32,
     rej_mode: RejMode,
     star_grow: f32,
     r_floor: f32,
@@ -153,6 +154,7 @@ impl Default for Args {
             rej_z: true,
             sharp_w: 0.0, // Python: drizzle 合成里的 `sharp_w`（core/drizzle.py:1990-2010），默认 0 即无效
             flux_pow: 0.0, // Python: 吞吐权重 `T^fp`，默认 0 即无效
+            fwhm_max: 0.0, // Python: FWHM 上限筛帧（core/pws.py:3833-3841），0 即不筛
             rej_mode: RejMode::Winsor, // Python: `rej_mode` 默认 winsor
             star_grow: 100.0,
             r_floor: 0.0,
@@ -313,6 +315,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--flux-pow" => {
                 a.flux_pow = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--fwhm-max" => {
+                a.fwhm_max = num(val()?, flag)? as f32;
                 i += 2;
             }
             "--rej-mode" => {
@@ -1404,6 +1410,34 @@ fn run_pipeline(
             "[配准] 排除 {drop_n} 帧无法锚定的帧（不参与叠加），参与叠加 {} 帧",
             frames.len()
         );
+    }
+
+    // Python: FWHM 超过 `fwhm_max` 的帧整帧剔除，不参与叠加
+    // （core/pws.py:3833-3841: `_cut = np.nonzero(~(fwhms <= _fm))[0];
+    //  dx[_cut] = dy[_cut] = np.nan`，随后 idx 只保留有限 dx/dy）。
+    if a.fwhm_max > 0.0 {
+        let cut: Vec<usize> = dwt_rs::pws::fwhm_max_cut(&fwhms, a.fwhm_max);
+        if !cut.is_empty() {
+            if cut.len() == frames.len() {
+                return Err(format!("--fwhm-max {} 把所有帧都筛掉了", a.fwhm_max));
+            }
+            let keep: Vec<usize> = (0..frames.len()).filter(|i| !cut.contains(i)).collect();
+            let mut src: Vec<Option<Img>> =
+                std::mem::take(&mut frames).into_iter().map(Some).collect();
+            frames = keep.iter().map(|&i| src[i].take().expect("frame taken twice")).collect();
+            sims = keep.iter().map(|&i| sims[i]).collect();
+            fwhms = keep.iter().map(|&i| fwhms[i]).collect();
+            sigmas = keep.iter().map(|&i| sigmas[i]).collect();
+            probe = keep.iter().position(|&i| i == probe).unwrap_or(0);
+            println!(
+                "[筛选] 剔除 {} 帧 FWHM > {}（剩余 {} 帧）",
+                cut.len(),
+                a.fwhm_max,
+                frames.len()
+            );
+        } else {
+            println!("[筛选] 没有帧的 FWHM 超过 {}（{} 帧全保留）", a.fwhm_max, frames.len());
+        }
     }
 
     // Python builds the reference from the k *sharpest* frames only
