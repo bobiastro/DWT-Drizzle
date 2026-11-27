@@ -893,6 +893,30 @@ fn run_driver() -> Result<(), String> {
 
 
 #[allow(clippy::too_many_arguments)]
+/// GPU 叠加器（crates/dwt-rs/src/gpu.rs）只吃 A/B/β/cap/rej_k，不消费后接线的这些
+/// 参数；一旦用户把它们调离默认值，就退回 CPU 路径，免得「拨了没反应」。
+fn gpu_unhonored(a: &Args) -> Option<&'static str> {
+    if a.sharp_w != 0.0 {
+        return Some("--sharp-w");
+    }
+    if a.flux_pow != 0.0 {
+        return Some("--flux-pow");
+    }
+    if a.two_pass {
+        return Some("--two-pass");
+    }
+    if a.rej_mode != RejMode::Winsor {
+        return Some("--rej-mode");
+    }
+    if !a.rej_z {
+        return Some("--rej-z");
+    }
+    if a.kernel != "box" {
+        return Some("--kernel");
+    }
+    None
+}
+
 fn run_pipeline(
     a: &Args,
     files: Vec<PathBuf>,
@@ -1759,7 +1783,13 @@ fn run_pipeline(
     if register && a.gpu != "off" {
         println!("[GPU] 配准路径走 CPU（wgpu kernel 目前只支持平移）");
     }
-    let gpu_out: Option<(Img, Vec<f32>)> = if !register && a.gpu != "off" && dwt_rs::gpu::available() {
+    if let Some(why) = gpu_unhonored(&a) {
+        if a.gpu != "off" {
+            println!("[GPU] 跳过：{why} 只有 CPU 路径消费，改用 CPU 叠加");
+        }
+    }
+    let gpu_out: Option<(Img, Vec<f32>)> =
+        if !register && a.gpu != "off" && gpu_unhonored(&a).is_none() && dwt_rs::gpu::available() {
         let dx = vec![0.0f32; frames.len()];
         let dy = vec![0.0f32; frames.len()];
         let scale = if drz { a.dscale } else { 1.0 };
