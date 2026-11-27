@@ -63,7 +63,7 @@ To compare the detector against Python stage by stage, run it on an existing
 stack instead of a frame list:
 
 ```text
-dwt-rs --lsp-only path	ostack.xisf
+dwt-rs --lsp-only path-to-stack.xisf
 ```
 
 It prints the mask field, seed counts, the coarse-pass count, one line per
