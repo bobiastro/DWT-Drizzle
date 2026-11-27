@@ -5,6 +5,7 @@
 //! （`crates/dwt-backend/src/job.rs`）共同调用，保证两条路径数值一致。
 //! 每个函数的文档都注明它对应的 Python 行号：语义以 Python 为准。
 
+use crate::drizzle::Plan;
 use crate::image::{median_of, Img};
 
 
@@ -274,6 +275,120 @@ fn median_f32(v: &mut [f32]) -> f32 {
     }
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[v.len() / 2]
+}
+
+// ---------------------------------------------------------------------------
+// two_pass：瓦片清晰度场（Python pws.py:3150-3185 `_local_sharp_maps`）
+// ---------------------------------------------------------------------------
+
+/// 3x3 均值盒滤波（`nearest` 边界），对应 scipy `uniform_filter(a, 3, mode='nearest')`。
+fn box3(img: &Img) -> Img {
+    let (w, h) = (img.w, img.h);
+    let mut out = Img::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0f32;
+            for dy in -1i32..=1 {
+                let yy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+                for dx in -1i32..=1 {
+                    let xx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+                    acc += img.d[yy * w + xx];
+                }
+            }
+            out.d[y * w + x] = acc / 9.0;
+        }
+    }
+    out
+}
+
+/// 逐帧瓦片清晰度图（Python `pws.py:3150-3185`）：
+/// `hp = a - boxf(a,3)`，按 `ys = clip(arange(h)*plan.s + plan.oy, 0, H-1)`（行/列各自）
+/// 把 `hp²` 累到 64×64 的**输出**瓦片里取均值，再逐瓦片除以跨帧中位，`clip(0.5, 2.0)`。
+/// 返回每帧逐像素的乘数（源像素顺序，最近邻取瓦片值）；帧数 <3 或瓦片不足 4 个时 `None`。
+pub fn local_sharp_maps(frames: &[Img], plan: &Plan, blk: usize) -> Option<Vec<Vec<f32>>> {
+    let n = frames.len();
+    if n < 3 {
+        return None;
+    }
+    let (oh, ow) = (plan.h, plan.w);
+    if oh == 0 || ow == 0 {
+        return None;
+    }
+    let blk = blk.max(8);
+    let nby = oh.div_ceil(blk);
+    let nbx = ow.div_ceil(blk);
+    if nby * nbx < 4 {
+        return None;
+    }
+    let nb = nby * nbx;
+    let mut acc: Vec<Vec<f64>> = vec![vec![0.0; nb]; n];
+    let mut cnt: Vec<Vec<u32>> = vec![vec![0; nb]; n];
+    for (i, f) in frames.iter().enumerate() {
+        let hp = {
+            let b = box3(f);
+            let mut d = Img::new(f.w, f.h);
+            for p in 0..f.d.len() {
+                let v = f.d[p] - b.d[p];
+                d.d[p] = v * v;
+            }
+            d
+        };
+        let xs: Vec<usize> = (0..f.w)
+            .map(|x| ((x as f32 * plan.s + plan.ox) as isize).clamp(0, ow as isize - 1) as usize)
+            .collect();
+        for y in 0..f.h {
+            let oy = ((y as f32 * plan.s + plan.oy) as isize).clamp(0, oh as isize - 1) as usize;
+            let row_blk = (oy / blk) * nbx;
+            for x in 0..f.w {
+                let b = row_blk + xs[x] / blk;
+                acc[i][b] += hp.d[y * f.w + x] as f64;
+                cnt[i][b] += 1;
+            }
+        }
+        for b in 0..nb {
+            if cnt[i][b] > 0 {
+                acc[i][b] /= cnt[i][b] as f64;
+            }
+        }
+    }
+    // 逐瓦片跨帧中位 → 比值 → clip(0.5, 2.0)
+    let mut ratio: Vec<Vec<f32>> = vec![vec![1.0; nb]; n];
+    let mut finite_blocks = 0usize;
+    for b in 0..nb {
+        let mut col: Vec<f32> =
+            (0..n).map(|i| if cnt[i][b] > 0 { acc[i][b] as f32 } else { f32::NAN }).collect();
+        col.retain(|v| v.is_finite());
+        if col.len() < 3 {
+            continue;
+        }
+        finite_blocks += 1;
+        let med = median_of(&col.clone());
+        if !(med > 0.0) {
+            continue;
+        }
+        for i in 0..n {
+            if cnt[i][b] > 0 {
+                ratio[i][b] = (acc[i][b] as f32 / med).clamp(0.5, 2.0);
+            }
+        }
+    }
+    if finite_blocks < 4 {
+        return None;
+    }
+    // 最近邻放大到**输出网格**（Python `band_cfield` 的最近邻放大；Rust 的
+    // `strip_weights_ext` 按 R 场（输出网格）逐像素索引，长度必须与之一致）。
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut m = vec![1.0f32; oh * ow];
+        for y in 0..oh {
+            let row_blk = (y / blk) * nbx;
+            for x in 0..ow {
+                m[y * ow + x] = ratio[i][row_blk + x / blk];
+            }
+        }
+        out.push(m);
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +728,49 @@ pub fn fwhm_max_cut(fwhms: &[f32], limit: f32) -> Vec<usize> {
 }
 
 #[cfg(test)]
+mod two_pass_tests {
+    use super::*;
+
+    fn star_field(blur: bool) -> Img {
+        let mut im = Img::new(160, 160);
+        for &(cx, cy) in &[(40usize, 40usize), (80, 120), (120, 60)] {
+            for dy in -4i32..=4 {
+                for dx in -4i32..=4 {
+                    let rr = ((dx * dx + dy * dy) as f32).sqrt();
+                    if rr <= 4.0 {
+                        let x = (cx as i32 + dx) as usize;
+                        let y = (cy as i32 + dy) as usize;
+                        im.d[y * 160 + x] += 500.0 * (1.0 - rr / 5.0);
+                    }
+                }
+            }
+        }
+        if blur {
+            im = gaussian_blur_xy(&im, 1.5);
+        }
+        im
+    }
+
+    #[test]
+    fn tile_map_prefers_the_sharp_frame() {
+        let frames = vec![star_field(false), star_field(false), star_field(true)];
+        let plan = Plan { s: 1.0, ox: 0.0, oy: 0.0, w: 160, h: 160 };
+        let m = local_sharp_maps(&frames, &plan, 64).expect("3 帧应产出瓦片场");
+        let mean = |v: &Vec<f32>| v.iter().sum::<f32>() / v.len() as f32;
+        let sharp = mean(&m[0]);
+        let blurred = mean(&m[2]);
+        assert!(blurred < sharp, "模糊帧的瓦片乘数应更小：{blurred} vs {sharp}");
+        assert!(m[0].iter().all(|v| *v >= 0.5 && *v <= 2.0), "必须 clip 到 0.5..2.0");
+    }
+
+    #[test]
+    fn too_few_frames_disables_the_tile_map() {
+        let frames = vec![star_field(false), star_field(true)];
+        let plan = Plan { s: 1.0, ox: 0.0, oy: 0.0, w: 160, h: 160 };
+        assert!(local_sharp_maps(&frames, &plan, 64).is_none());
+    }
+}
+
 mod bg_r_tests {
     use super::*;
 

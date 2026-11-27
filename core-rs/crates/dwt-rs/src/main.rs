@@ -89,6 +89,7 @@ struct Args {
     sharp_w: f32,
     flux_pow: f32,
     fwhm_max: f32,
+    two_pass: bool,
     kernel: String,
     psf_target: f32,
     rej_mode: RejMode,
@@ -158,6 +159,7 @@ impl Default for Args {
             sharp_w: 0.0, // Python: drizzle 合成里的 `sharp_w`（core/drizzle.py:1990-2010），默认 0 即无效
             flux_pow: 0.0, // Python: 吞吐权重 `T^fp`，默认 0 即无效
             fwhm_max: 0.0, // Python: FWHM 上限筛帧（core/pws.py:3833-3841），0 即不筛
+            two_pass: false, // Python: `two_pass` 两遍加权（pws.py:4665-4690），默认关闭
             kernel: "box".to_string(), // Python: `kernel`（box/psfmatch），core/drizzle.py:2032-2130
             psf_target: 50.0, // Python: `psf_target` 百分位，默认 50
             rej_mode: RejMode::Winsor, // Python: `rej_mode` 默认 winsor
@@ -322,6 +324,15 @@ fn parse_args() -> Result<Args, String> {
             "--flux-pow" => {
                 a.flux_pow = num(val()?, flag)? as f32;
                 i += 2;
+            }
+            "--two-pass" => {
+                if has_val() {
+                    a.two_pass = num(val()?, flag)? != 0.0;
+                    i += 2;
+                } else {
+                    a.two_pass = true;
+                    i += 1;
+                }
             }
             "--kernel" => {
                 a.kernel = val()?.to_string();
@@ -1666,6 +1677,24 @@ fn run_pipeline(
         sharp_w: a.sharp_w,
         flux_pow: a.flux_pow,
     };
+    // 两遍加权（Python pws.py:4665-4690 `two_pass`）：先用 64×64 瓦片清晰度场
+    // （`_local_sharp_maps`）替代标量 C，再跑一遍加权。
+    let tiles: Option<Vec<Vec<f32>>> = if a.two_pass {
+        match dwt_rs::pws::local_sharp_maps(&frames, &plan_r, 64) {
+            Some(t) => {
+                let mn = t.iter().flatten().fold(f32::INFINITY, |m, v| m.min(*v));
+                let mx = t.iter().flatten().fold(f32::NEG_INFINITY, |m, v| m.max(*v));
+                println!("[两遍] 瓦片清晰度场 64px  {} 帧 范围 {:.3}~{:.3}", t.len(), mn, mx);
+                Some(t)
+            }
+            None => {
+                println!("[两遍] 帧数不足或瓦片太少，退回标量 C");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let wts = strip_weights_ext(
         &c,
         &s,
@@ -1676,7 +1705,7 @@ fn run_pipeline(
         a.max_share,
         wopts,
         tflux.as_deref(),
-        None,
+        tiles.as_deref(),
     );
     let t_prof_sw = t.elapsed().as_secs_f32();
     if let Some(dir) = &a.dump_w {
