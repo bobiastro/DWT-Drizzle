@@ -49,6 +49,7 @@ struct Args {
     aligned: bool,
     register: Option<bool>,
     canvas_from: Option<String>,
+    lsp_only: Option<String>,
     rej_k: f32,
     star_grow: f32,
     r_floor: f32,
@@ -92,6 +93,7 @@ impl Default for Args {
             aligned: true,
             register: None,
             canvas_from: None,
+            lsp_only: None,
             rej_k: REJ_K,
             star_grow: 100.0,
             r_floor: 0.0,
@@ -285,6 +287,13 @@ fn parse_args() -> Result<Args, String> {
                 a.dump_w = Some(val()?.to_string());
                 i += 2;
             }
+            // LSPR-only mode: read one finished stack and run the structure
+            // rejection on it, no frame list, no stacking.  Exists so the
+            // detector can be compared against `core/lsp.py` stage by stage.
+            "--lsp-only" => {
+                a.lsp_only = Some(val()?.to_string());
+                i += 2;
+            }
             "--report" => {
                 a.report = true;
                 i += 1;
@@ -333,6 +342,19 @@ fn run() -> Result<(), String> {
     let a = parse_args()?;
     if a.jobs > 0 {
         let _ = rayon::ThreadPoolBuilder::new().num_threads(a.jobs).build_global();
+    }
+    if let Some(src) = a.lsp_only.clone() {
+        let t = Instant::now();
+        let (_m, mut img) =
+            read_xisf(Path::new(&src)).map_err(|e| format!("read {src}: {e}"))?;
+        println!("[LSPR] 单图模式 {src}（{}x{}）", img.w, img.h);
+        let (n, px) = dwt_rs::lsp::process_auto(&mut img, None, None, None, None);
+        println!(
+            "[LSPR] 结构排异：检出并扣除 {n} 条细长结构，改动 {px} 像素（{:.3}%），用时 {:.2}s",
+            px as f64 * 100.0 / (img.w * img.h) as f64,
+            t.elapsed().as_secs_f64()
+        );
+        return Ok(());
     }
     let t_all = Instant::now();
     std::fs::create_dir_all(&a.out).map_err(|e| format!("mkdir {}: {e}", a.out.display()))?;

@@ -59,6 +59,16 @@ stack it leaves `-0.146 sigma` along the line. Rust subtracts once; the first
 pass already reproduces Python's first-pass pixel count exactly (73,100 px on
 that stack) and leaves the line at the `-0.05 sigma` level.
 
+To compare the detector against Python stage by stage, run it on an existing
+stack instead of a frame list:
+
+```text
+dwt-rs --lsp-only path	ostack.xisf
+```
+
+It prints the mask field, seed counts, the coarse-pass count, one line per
+measured seed and the accepted count, without touching registration.
+
 ## Build and test
 
 ```powershell

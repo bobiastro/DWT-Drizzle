@@ -681,6 +681,12 @@ fn seed_scan(f: &Field) -> Vec<Cand> {
             }
         }
     }
+    // core/lsp.py:find_auto -- the coarse-pass union ranks the second half by
+    // `c.get("Z", 0.0)`, and `_seed_scan` dicts only carry `z`, so scan seeds
+    // enter that ranking as 0 and can never displace a cell-map candidate.
+    for c in &mut sel {
+        c.z = 0.0;
+    }
     sel
 }
 
