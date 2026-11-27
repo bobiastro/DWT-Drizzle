@@ -89,6 +89,8 @@ struct Args {
     sharp_w: f32,
     flux_pow: f32,
     fwhm_max: f32,
+    kernel: String,
+    psf_target: f32,
     rej_mode: RejMode,
     star_grow: f32,
     r_floor: f32,
@@ -155,6 +157,8 @@ impl Default for Args {
             sharp_w: 0.0, // Python: drizzle 合成里的 `sharp_w`（core/drizzle.py:1990-2010），默认 0 即无效
             flux_pow: 0.0, // Python: 吞吐权重 `T^fp`，默认 0 即无效
             fwhm_max: 0.0, // Python: FWHM 上限筛帧（core/pws.py:3833-3841），0 即不筛
+            kernel: "box".to_string(), // Python: `kernel`（box/psfmatch），core/drizzle.py:2032-2130
+            psf_target: 50.0, // Python: `psf_target` 百分位，默认 50
             rej_mode: RejMode::Winsor, // Python: `rej_mode` 默认 winsor
             star_grow: 100.0,
             r_floor: 0.0,
@@ -315,6 +319,17 @@ fn parse_args() -> Result<Args, String> {
             }
             "--flux-pow" => {
                 a.flux_pow = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--kernel" => {
+                a.kernel = val()?.to_string();
+                if a.kernel != "box" && a.kernel != "psfmatch" && a.kernel != "psf" {
+                    return Err(format!("unknown --kernel {}（box|psfmatch）", a.kernel));
+                }
+                i += 2;
+            }
+            "--psf-target" => {
+                a.psf_target = num(val()?, flag)? as f32;
                 i += 2;
             }
             "--fwhm-max" => {
@@ -1846,12 +1861,40 @@ fn run_pipeline(
         // Band-parallel drizzle: every output pixel still receives each frame's
         // contribution in frame order, so the result is bit-identical to the
         // per-frame serial loop this replaces.
+        // Python `kernel='psfmatch'`：按 PSF 目标把每帧的核换成更宽的高斯
+        // （core/drizzle.py:2032-2130；`_psfmatch_blur` 用 `extra/s` 源像素 σ）。
+        let pm_frames: Option<Vec<Img>> = if a.kernel == "psfmatch" || a.kernel == "psf" {
+            let v = dwt_rs::pws::psfmatch_frames(&frames, &fwhms, plan.s, a.psf_target);
+            match &v {
+                Some(pm) => {
+                    let extra = dwt_rs::pws::psfmatch_extra_sigma(&fwhms, plan.s, a.psf_target)
+                        .unwrap_or_default();
+                    println!(
+                        "[核] psfmatch：目标 {} 百分位 σ_psf={:.3}px（输出网格），额外 σ(源像素) = {}",
+                        a.psf_target,
+                        extra.iter().fold(0.0f32, |m, v| m.max(*v)),
+                        extra.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(" ")
+                    );
+                    let _ = pm;
+                }
+                None => println!("[核] psfmatch：有效 FWHM 帧数 <4，退回 box 核"),
+            }
+            v
+        } else {
+            None
+        };
         let places: Vec<FramePlace<'_>> = frames
             .iter()
             .enumerate()
             .map(|(i, f)| {
                 let s = sims[i];
-                let img = if cfa_mask.is_some() { &mosaics[i] } else { f };
+                let img: &Img = if cfa_mask.is_some() {
+                    &mosaics[i]
+                } else if let Some(pm) = pm_frames.as_ref() {
+                    &pm[i]
+                } else {
+                    f
+                };
                 FramePlace {
                     img,
                     ux: s.ux,

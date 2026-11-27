@@ -5,6 +5,7 @@
 //! （`crates/dwt-backend/src/job.rs`）共同调用，保证两条路径数值一致。
 //! 每个函数的文档都注明它对应的 Python 行号：语义以 Python 为准。
 
+use crate::image::Img;
 
 
 /// 噪声权重 `S_i = median(σ)/σ_i`，再按 `snr_clip` 限幅。
@@ -275,6 +276,114 @@ fn median_f32(v: &mut [f32]) -> f32 {
     v[v.len() / 2]
 }
 
+// ---------------------------------------------------------------------------
+// kernel = psfmatch：按 PSF 目标把每帧的核换成更宽的高斯
+// ---------------------------------------------------------------------------
+
+/// Python `np.percentile(a, q)`（默认 linear 插值）。
+pub fn percentile_linear(v: &mut [f32], q: f32) -> f32 {
+    let n = v.len();
+    if n == 0 {
+        return f32::NAN;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let q = q.clamp(0.0, 100.0);
+    let pos = (n as f32 - 1.0) * q / 100.0;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        v[lo]
+    } else {
+        let t = pos - lo as f32;
+        v[lo] * (1.0 - t) + v[hi] * t
+    }
+}
+
+/// Python drizzle.py:2032-2130：`_sg = fwhms/2.3548*plan['s']`（输出网格 σ）；
+/// 有效帧 ≥4 时 `_tgt = percentile(_sg, clip(psf_target,1,99))`，
+/// `_ex = sqrt(max(0, _tgt² - _sg²))`（输出网格），逐帧用 `_ex/plan.s` 源像素 σ 做高斯模糊。
+/// 返回每帧的额外 σ（**源像素**），`None` 表示不做 psfmatch。
+pub fn psfmatch_extra_sigma(fwhms: &[f32], s: f32, psf_target: f32) -> Option<Vec<f32>> {
+    let sg: Vec<f32> = fwhms
+        .iter()
+        .map(|v| if v.is_finite() && *v > 0.0 { *v / 2.3548 * s } else { f32::NAN })
+        .collect();
+    let mut fin: Vec<f32> = sg.iter().copied().filter(|v| v.is_finite()).collect();
+    if fin.len() < 4 {
+        return None;
+    }
+    let tgt = percentile_linear(&mut fin, psf_target.clamp(1.0, 99.0));
+    let inv_s = if s.abs() > 1e-9 { 1.0 / s } else { 1.0 };
+    Some(
+        sg.iter()
+            .map(|v| {
+                if !v.is_finite() {
+                    0.0
+                } else {
+                    ((tgt * tgt - v * v).max(0.0)).sqrt() * inv_s
+                }
+            })
+            .collect(),
+    )
+}
+
+/// 可分离高斯模糊，`mode='nearest'` 边界（对应 scipy `gaussian_filter1d`）。
+pub fn gaussian_blur_xy(img: &Img, sigma: f32) -> Img {
+    if !(sigma > 0.05) || img.w == 0 || img.h == 0 {
+        return img.clone();
+    }
+    let radius = (4.0 * sigma).ceil() as isize;
+    let mut k: Vec<f32> = (-radius..=radius)
+        .map(|i| (-(i as f32) * (i as f32) / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let sum: f32 = k.iter().sum();
+    k.iter_mut().for_each(|v| *v /= sum);
+    let mut mid = Img::new(img.w, img.h);
+    // 先 x 后 y，与 Python `axis=1 then axis=0` 同序
+    for y in 0..img.h {
+        for x in 0..img.w {
+            let mut acc = 0.0f32;
+            for (t, &kv) in k.iter().enumerate() {
+                let sx = (x as isize + t as isize - radius).clamp(0, img.w as isize - 1) as usize;
+                acc += kv * img.d[y * img.w + sx];
+            }
+            mid.d[y * img.w + x] = acc;
+        }
+    }
+    let mut out = Img::new(img.w, img.h);
+    for y in 0..img.h {
+        for x in 0..img.w {
+            let mut acc = 0.0f32;
+            for (t, &kv) in k.iter().enumerate() {
+                let sy = (y as isize + t as isize - radius).clamp(0, img.h as isize - 1) as usize;
+                acc += kv * mid.d[sy * img.w + x];
+            }
+            out.d[y * img.w + x] = acc;
+        }
+    }
+    out
+}
+
+/// 逐帧 psfmatch 模糊；不做 psfmatch（帧数不足/额外 σ 全为 0）时返回 `None`。
+pub fn psfmatch_frames(
+    frames: &[Img],
+    fwhms: &[f32],
+    s: f32,
+    psf_target: f32,
+) -> Option<Vec<Img>> {
+    let extra = psfmatch_extra_sigma(fwhms, s, psf_target)?;
+    if extra.iter().all(|v| !(*v > 0.05)) {
+        return None;
+    }
+    Some(
+        frames
+            .iter()
+            .zip(extra.iter())
+            .map(|(f, e)| gaussian_blur_xy(f, *e))
+            .collect(),
+    )
+}
+
 /// Python `fwhm_max` 筛帧：返回需要剔除的帧下标
 /// （core/pws.py:3833-3841：`_cut = np.nonzero(~(fwhms <= _fm))[0]`）。
 /// `limit <= 0` 表示不筛；非有限 FWHM 不参与判定（Python 里它们本来就是 nan）。
@@ -288,6 +397,40 @@ pub fn fwhm_max_cut(fwhms: &[f32], limit: f32) -> Vec<usize> {
 }
 
 #[cfg(test)]
+mod psfmatch_tests {
+    use super::*;
+
+    #[test]
+    fn blur_with_zero_sigma_is_identity() {
+        let mut im = Img::new(8, 6);
+        im.d.iter_mut().enumerate().for_each(|(i, v)| *v = i as f32);
+        let out = gaussian_blur_xy(&im, 0.0);
+        assert_eq!(out.d, im.d);
+    }
+
+    #[test]
+    fn psfmatch_extra_sigma_matches_python_formula() {
+        let fwhms = [2.3548f32, 2.3548 * 1.5, 2.3548 * 0.5, 2.3548];
+        let ex = psfmatch_extra_sigma(&fwhms, 1.0, 50.0).expect("4 帧有效应启用");
+        // sg = [1.0, 1.5, 0.5, 1.0]；p50 = 1.0 → 只有 sg < 1 的帧需要加宽
+        assert!(ex[2] > 0.5, "最锐利的帧要加宽最多：{ex:?}");
+        assert_eq!(ex[0], 0.0);
+        assert_eq!(ex[1], 0.0);
+        // 帧数不足 4 → 不启用
+        assert!(psfmatch_extra_sigma(&fwhms[..3], 1.0, 50.0).is_none());
+    }
+
+    #[test]
+    fn blur_widens_a_peak() {
+        let mut im = Img::new(41, 41);
+        im.d[20 * 41 + 20] = 1000.0;
+        let out = gaussian_blur_xy(&im, 2.0);
+        let centre = out.d[20 * 41 + 20];
+        assert!(centre < 1000.0 && centre > 1.0, "峰值应被摊平: {centre}");
+        assert!(out.d[20 * 41 + 22] > 0.0, "能量应扩散到邻近像素");
+    }
+}
+
 mod fwhm_max_tests {
     use super::*;
 
