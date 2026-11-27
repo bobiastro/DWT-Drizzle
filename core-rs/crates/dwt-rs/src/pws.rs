@@ -5,7 +5,7 @@
 //! （`crates/dwt-backend/src/job.rs`）共同调用，保证两条路径数值一致。
 //! 每个函数的文档都注明它对应的 Python 行号：语义以 Python 为准。
 
-use crate::image::Img;
+use crate::image::{median_of, Img};
 
 
 /// 噪声权重 `S_i = median(σ)/σ_i`，再按 `snr_clip` 限幅。
@@ -277,6 +277,222 @@ fn median_f32(v: &mut [f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// bg_r：径向偶次项背景（core/bggrad.py fit_grid(rdeg) / model_strip(rcoef)）
+// ---------------------------------------------------------------------------
+
+pub const BG_BLOCK: usize = 32;
+const BG_CLIP: f64 = 3.0;
+const BG_ITERS: usize = 3;
+
+fn bg_design(deg: usize, y: f64, x: f64) -> Vec<f64> {
+    let mut v = vec![1.0, y, x];
+    if deg >= 2 {
+        v.push(y * y);
+        v.push(x * y);
+        v.push(x * x);
+    }
+    v
+}
+
+fn bg_lstsq(a: &[Vec<f64>], rhs: &[f64], ncol: usize) -> Option<Vec<f64>> {
+    let mut m = vec![vec![0.0f64; ncol + 1]; ncol];
+    for i in 0..ncol {
+        for j in 0..ncol {
+            let mut s = 0.0;
+            for row in a {
+                s += row[i] * row[j];
+            }
+            m[i][j] = s;
+        }
+        let mut s = 0.0;
+        for (row, rr) in a.iter().zip(rhs.iter()) {
+            s += row[i] * rr;
+        }
+        m[i][ncol] = s;
+    }
+    for col in 0..ncol {
+        let mut piv = col;
+        for r in col + 1..ncol {
+            if m[r][col].abs() > m[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if m[piv][col].abs() < 1e-300 {
+            return None;
+        }
+        m.swap(col, piv);
+        let d = m[col][col];
+        for j in col..=ncol {
+            m[col][j] /= d;
+        }
+        for r in 0..ncol {
+            if r != col && m[r][col] != 0.0 {
+                let f = m[r][col];
+                for j in col..=ncol {
+                    m[r][j] -= f * m[col][j];
+                }
+            }
+        }
+    }
+    Some((0..ncol).map(|i| m[i][ncol]).collect())
+}
+
+/// 拟合并扣掉「低阶面 + 径向偶次项」背景，语义照 core/bggrad.py:fit_grid / model_strip：
+/// 块中位网格（32px）、3 轮 3σ 裁剪、常数项取 `-median(poly)`；
+/// `rdeg>0` 时对去面残差再拟 `r^2`（`rdeg>=4` 再拟 `r^4`），半径按
+/// `rr = sqrt((y*h/w)^2 + x^2)` 归一化，去模型时按 `sqrt((h/w)^2+1)` 归一化。
+/// 返回 (amp, resid, 径向幅度)；`None` = 无法拟合（与 flatten 一致，不改动图像）。
+pub fn bg_radial_subtract(img: &mut Img, deg: usize, rdeg: usize) -> Option<(f32, f32, f32)> {
+    if deg == 0 {
+        return None;
+    }
+    let grid = crate::bggrad::block_medians(img, BG_BLOCK)?;
+    let b = BG_BLOCK as f64;
+    let (h, w) = (img.h as f64, img.w as f64);
+    let (gh, gw) = (grid.h, grid.w);
+    let mut rows: Vec<Vec<f64>> = Vec::with_capacity(gh * gw);
+    let mut vals: Vec<f64> = Vec::with_capacity(gh * gw);
+    for i in 0..gh {
+        let y = (i as f64 + 0.5) * b / h.max(1.0);
+        for j in 0..gw {
+            let x = (j as f64 + 0.5) * b / w.max(1.0);
+            rows.push(bg_design(deg, y, x));
+            vals.push(grid.d[i * gw + j] as f64);
+        }
+    }
+    let ncol = rows[0].len();
+    let ok: Vec<bool> = vals.iter().map(|v| v.is_finite()).collect();
+    let n_all = ok.iter().filter(|v| **v).count();
+    if n_all < 8.max((0.2 * vals.len() as f64) as usize) {
+        return None;
+    }
+    let mut mask = ok.clone();
+    let mut coef: Option<Vec<f64>> = None;
+    for _ in 0..BG_ITERS {
+        if mask.iter().filter(|v| **v).count() < ncol + 3 {
+            break;
+        }
+        let a: Vec<Vec<f64>> =
+            rows.iter().zip(&mask).filter(|(_, m)| **m).map(|(r, _)| r.clone()).collect();
+        let rhs: Vec<f64> = vals.iter().zip(&mask).filter(|(_, m)| **m).map(|(v, _)| *v).collect();
+        let c = match bg_lstsq(&a, &rhs, ncol) {
+            Some(c) => c,
+            None => break,
+        };
+        let r: Vec<f64> = rows
+            .iter()
+            .zip(&vals)
+            .map(|(row, v)| v - row.iter().zip(&c).map(|(a, b)| a * b).sum::<f64>())
+            .collect();
+        let rv: Vec<f32> =
+            r.iter().zip(&mask).filter(|(_, m)| **m).map(|(v, _)| *v as f32).collect();
+        let cm = median_of(&rv) as f64;
+        let dev: Vec<f32> = rv.iter().map(|v| (*v - cm as f32).abs() as f32).collect();
+        let sg = 1.4826 * median_of(&dev) as f64;
+        coef = Some(c.clone());
+        if !sg.is_finite() || sg <= 0.0 {
+            break;
+        }
+        let new_mask: Vec<bool> =
+            ok.iter().zip(&r).map(|(o, rr)| *o && (rr - cm).abs() <= BG_CLIP * sg).collect();
+        let same = new_mask.iter().filter(|v| **v).count() == mask.iter().filter(|v| **v).count();
+        mask = new_mask;
+        if same {
+            break;
+        }
+    }
+    let c = coef?;
+    if !c.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let r: Vec<f64> = rows
+        .iter()
+        .zip(&vals)
+        .map(|(row, v)| v - row.iter().zip(&c).map(|(a, b)| a * b).sum::<f64>())
+        .collect();
+    let rv: Vec<f32> = r.iter().zip(&mask).filter(|(_, m)| **m).map(|(v, _)| *v as f32).collect();
+    let cm = median_of(&rv) as f64;
+    let dev: Vec<f32> = rv.iter().map(|v| (*v - cm as f32).abs() as f32).collect();
+    let resid = 1.4826 * median_of(&dev) as f64;
+    let poly: Vec<f64> = rows
+        .iter()
+        .map(|row| row[1..].iter().zip(&c[1..]).map(|(a, b)| a * b).sum::<f64>())
+        .collect();
+    let pm: Vec<f32> =
+        poly.iter().zip(&mask).filter(|(_, m)| **m).map(|(v, _)| *v as f32).collect();
+    let const_term = -(median_of(&pm) as f64);
+    let used: Vec<f64> = poly.iter().zip(&mask).filter(|(_, m)| **m).map(|(v, _)| *v).collect();
+    let amp = used.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+        - used.iter().cloned().fold(f64::INFINITY, f64::min);
+
+    // 径向偶次项（core/bggrad.py:143-153）
+    let mut rc = [0.0f64; 2];
+    if rdeg > 0 {
+        let nrb = if rdeg >= 4 { 2 } else { 1 };
+        let mut br: Vec<Vec<f64>> = Vec::with_capacity(gh * gw);
+        let mut rmax = 0.0f64;
+        for i in 0..gh {
+            let y = (i as f64 + 0.5) * b / h.max(1.0);
+            for j in 0..gw {
+                let x = (j as f64 + 0.5) * b / w.max(1.0);
+                br.push(vec![0.0, 0.0]);
+                let rr = ((y * h / w.max(1.0)).powi(2) + x * x).sqrt();
+                if rr > rmax {
+                    rmax = rr;
+                }
+                let _ = j;
+            }
+        }
+        let rmax = rmax.max(1e-9);
+        let mut k = 0usize;
+        for i in 0..gh {
+            let y = (i as f64 + 0.5) * b / h.max(1.0);
+            for j in 0..gw {
+                let x = (j as f64 + 0.5) * b / w.max(1.0);
+                let rr = (((y * h / w.max(1.0)).powi(2)) + x * x).sqrt() / rmax;
+                br[k][0] = rr * rr;
+                if nrb >= 2 {
+                    br[k][1] = rr.powi(4);
+                }
+                k += 1;
+            }
+        }
+        let a: Vec<Vec<f64>> =
+            br.iter().zip(&mask).filter(|(_, m)| **m).map(|(r0, _)| r0[..nrb].to_vec()).collect();
+        let rhs: Vec<f64> = r.iter().zip(&mask).filter(|(_, m)| **m).map(|(v, _)| *v).collect();
+        if let Some(cc) = bg_lstsq(&a, &rhs, nrb) {
+            if cc.iter().all(|v| v.is_finite()) {
+                rc[..nrb].copy_from_slice(&cc);
+            }
+        }
+    }
+
+    // 逐像素扣模型（core/bggrad.py:model_strip）
+    let hw = h / w.max(1.0);
+    let rnorm = ((hw * hw + 1.0).sqrt()).max(1e-9);
+    let (h_, w_) = (img.h, img.w);
+    for y in 0..h_ {
+        let yv = (y as f64 + 0.5) / (h_ as f64).max(1.0);
+        for x in 0..w_ {
+            let xv = (x as f64 + 0.5) / (w_ as f64).max(1.0);
+            let mut m = c[1] * yv + c[2] * xv + const_term;
+            if deg >= 2 {
+                m += c[3] * (yv * yv) + c[4] * (yv * xv) + c[5] * (xv * xv);
+            }
+            if rdeg > 0 {
+                let rw = (((yv * h_ as f64 / w_ as f64).powi(2)) + xv * xv).sqrt() / rnorm;
+                m += rc[0] * (rw * rw) + rc[1] * (rw.powi(4));
+            }
+            // 与 bggrad::subtract_model 完全同序（减 f32 舍入后的模型），
+            // 这样 rdeg=0 时结果与 flatten 逐位一致。
+            img.d[y * w_ + x] -= m as f32;
+        }
+    }
+    let ramp = rc[0].abs() + rc[1].abs();
+    Some((amp as f32, resid as f32, ramp as f32))
+}
+
+// ---------------------------------------------------------------------------
 // kernel = psfmatch：按 PSF 目标把每帧的核换成更宽的高斯
 // ---------------------------------------------------------------------------
 
@@ -397,6 +613,66 @@ pub fn fwhm_max_cut(fwhms: &[f32], limit: f32) -> Vec<usize> {
 }
 
 #[cfg(test)]
+mod bg_r_tests {
+    use super::*;
+
+    fn plane_with_bowl(w: usize, h: usize) -> Img {
+        let mut im = Img::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let yv = (y as f32 + 0.5) / h as f32;
+                let xv = (x as f32 + 0.5) / w as f32;
+                let rr = (((yv * h as f32 / w as f32).powi(2)) + xv * xv).sqrt();
+                im.d[y * w + x] = 100.0 + 20.0 * yv + 8.0 * xv + 900.0 * rr * rr;
+            }
+        }
+        im
+    }
+
+    #[test]
+    fn rdeg_zero_reproduces_the_plain_plane_fit() {
+        let a = plane_with_bowl(192, 192);
+        let mut b = a.clone();
+        let f = crate::bggrad::flatten(&mut b, 1).expect("plane fit");
+        let mut c = a.clone();
+        let (amp, resid, ramp) = bg_radial_subtract(&mut c, 1, 0).expect("radial fit");
+        assert!((amp as f64 - f.amp).abs() < 1e-3, "amp 应与 flatten 一致");
+        assert!((resid as f64 - f.resid).abs() < 1e-3);
+        assert_eq!(ramp, 0.0, "rdeg=0 时没有径向项");
+        let dmax = b.d.iter().zip(c.d.iter()).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        assert_eq!(dmax, 0.0, "rdeg=0 的扣除结果应与 flatten 逐位一致：{dmax}");
+    }
+
+    #[test]
+    fn radial_term_changes_the_model_by_a_normalised_r_squared() {
+        let src = plane_with_bowl(192, 192);
+        let mut plain = src.clone();
+        bg_radial_subtract(&mut plain, 1, 0).expect("plane fit");
+        let mut radial = src.clone();
+        let (_a, _r, ramp) = bg_radial_subtract(&mut radial, 1, 2).expect("radial fit");
+        assert!(ramp > 0.0, "rdeg=2 应给出非零径向系数，实际 {ramp}");
+
+        // 两种模型的差就是 `-rc0 * rw^2`，rw = sqrt((y*h/w)^2 + x^2) / sqrt((h/w)^2+1)。
+        // 用中心/左上角两点的比值检验形状（纯比值，不依赖 rc0 的具体数值）。
+        let (w, h) = (192.0f32, 192.0f32);
+        let rw = |x: usize, y: usize| {
+            let yv = (y as f32 + 0.5) / h;
+            let xv = (x as f32 + 0.5) / w;
+            (((yv * h / w).powi(2) + xv * xv).sqrt()) / ((h / w).powi(2) + 1.0).sqrt()
+        };
+        let d = |i: usize| radial.d[i] - plain.d[i];
+        let centre = d(96 * 192 + 96);
+        let inner = d(24 * 192 + 24);
+        assert!(centre.abs() > 1e-4, "径向项必须真的改变模型：{centre}");
+        let want = (rw(96, 96) / rw(24, 24)).powi(2);
+        let got = centre / inner;
+        assert!(
+            (got / want - 1.0).abs() < 0.02,
+            "差分应遵循 rw^2 形状：got {got} want {want}"
+        );
+    }
+}
+
 mod psfmatch_tests {
     use super::*;
 

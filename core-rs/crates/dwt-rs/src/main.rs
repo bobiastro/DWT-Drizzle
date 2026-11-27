@@ -99,6 +99,7 @@ struct Args {
     r_k: f32,
     drop_mul: f32,
     bgdeg: usize,
+    bg_r: f32,
     star_grow_fixed: f32,
     dump_r: Option<String>,
     save_aux: bool,
@@ -167,6 +168,7 @@ impl Default for Args {
             r_k: 3.0,
             drop_mul: 0.0,
             bgdeg: 1,
+            bg_r: 0.0, // Python: `bg_r` 径向偶次项阶数（core/bggrad.py:143-153），0 即关闭
             star_grow_fixed: -1.0,
             dump_r: None,
             save_aux: false,
@@ -366,6 +368,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--drop-mul" => {
                 a.drop_mul = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--bg-r" => {
+                a.bg_r = num(val()?, flag)? as f32;
                 i += 2;
             }
             "--bgdeg" => {
@@ -991,8 +997,22 @@ fn run_pipeline(
         let tb = Instant::now();
         let mut rs: Vec<f32> = Vec::new();
         let mut amps: Vec<f32> = Vec::new();
+        let mut ramp_warned = false;
         for d in frames.iter_mut() {
-            if let Some(f) = bggrad::flatten(d, a.bgdeg) {
+            // `bg_r > 0` 时用「低阶面 + 径向偶次项」的模型（Python bggrad.py:86-153，
+            // fit_grid 的 rdeg 分支），否则原样走 flatten。
+            if a.bg_r > 0.0 {
+                if let Some((amp, resid, ramp)) =
+                    dwt_rs::pws::bg_radial_subtract(d, a.bgdeg, a.bg_r as usize)
+                {
+                    if !ramp_warned {
+                        println!("[背景] bg_r={} 径向项 |rc|={:.6e}", a.bg_r, ramp);
+                        ramp_warned = true;
+                    }
+                    rs.push(resid);
+                    amps.push(amp);
+                }
+            } else if let Some(f) = bggrad::flatten(d, a.bgdeg) {
                 rs.push(f.resid as f32);
                 amps.push(f.amp as f32);
             }
