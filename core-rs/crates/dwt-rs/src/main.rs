@@ -23,6 +23,8 @@ use dwt_rs::xisf::{read_xisf, read_xisf_luma, write_npy_f32, write_xisf, write_x
 const EXPTIME_REF: f64 = 300.0;
 const A_SHARP: f32 = 20.0;
 const REJ_K: f32 = 3.5;
+/// `snr_clip`：S 权重限幅（Python 默认 3.0，与 `rej_gate` 无关）
+const SNR_CLIP: f32 = 3.0;
 const REJ_GATE: f32 = 1.0 / 3.0;
 const MAX_SHARE: f32 = 0.25;
 const R_DEC: usize = 2;
@@ -77,6 +79,7 @@ struct Args {
     canvas_from: Option<String>,
     lsp_only: Option<String>,
     rej_k: f32,
+    snr_clip: f32,
     star_grow: f32,
     r_floor: f32,
     drop_mul: f32,
@@ -133,6 +136,7 @@ impl Default for Args {
             canvas_from: None,
             lsp_only: None,
             rej_k: REJ_K,
+            snr_clip: SNR_CLIP,
             star_grow: 100.0,
             r_floor: 0.0,
             drop_mul: 0.0,
@@ -270,6 +274,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--rej-k" => {
                 a.rej_k = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--snr-clip" => {
+                a.snr_clip = num(val()?, flag)? as f32;
                 i += 2;
             }
             "--star-grow" => {
@@ -1372,7 +1380,7 @@ fn run_pipeline(
     let finite: Vec<f32> = fwhms.iter().copied().filter(|v| v.is_finite() && *v > 0.5 && *v < 40.0).collect();
     let mut fmed = if finite.is_empty() { 1.0 } else { median_of(&finite) };
     let mut c: Vec<f32> = fwhms.iter().map(|v| if v.is_finite() && *v > 0.0 { fmed / *v } else { 1.0 }).collect();
-    let mut s: Vec<f32> = sigmas.iter().map(|v| (sig_med / (*v).max(1e-30)).clamp(1.0 / 3.0, 3.0)).collect();
+    let mut s: Vec<f32> = dwt_rs::pws::snr_weights(&sigmas, sig_med, a.snr_clip);
     // --weights-from: inject an external C/S table (python's PWS_t_weights.txt) so the
     // rest of the pipeline can be compared without the PSF-metrology difference.
     if let Some(p) = &a.weights_from {

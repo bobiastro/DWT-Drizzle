@@ -15,6 +15,7 @@ pub mod gpu;
 pub mod gpu;
 pub mod image;
 pub mod lsp;
+pub mod pws;
 pub mod register;
 pub mod rfield;
 pub mod stack;
