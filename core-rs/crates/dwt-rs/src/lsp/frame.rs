@@ -328,6 +328,11 @@ pub struct GateResult {
     pub amp_sig: f64,
     pub ctrl_p95: f64,
     pub n: usize,
+    /// The three pieces of evidence, exposed so tests and probes can show the
+    /// exact branch Python's `veto` takes.
+    pub z_bad: bool,
+    pub f_bad: bool,
+    pub a_bad: bool,
 }
 
 /// `frame_gate`: veto when the line is not visible in the frames themselves.
@@ -360,7 +365,17 @@ pub fn frame_gate(
     let (amps, zs, _used, _dl) =
         gate_one(theta, rho, width, hh, ww, frames, maps, &js, wfac, off0, off1, search, "");
     if amps.is_empty() {
-        return Some(GateResult { ok: false, zmed: 0.0, amp_med: 0.0, amp_sig: f64::NAN, ctrl_p95: 0.0, n: 0 });
+        return Some(GateResult {
+            ok: false,
+            zmed: 0.0,
+            amp_med: 0.0,
+            amp_sig: f64::NAN,
+            ctrl_p95: 0.0,
+            n: 0,
+            z_bad: true,
+            f_bad: true,
+            a_bad: true,
+        });
     }
     let mut zmed = nanmed(&zs);
     if !zmed.is_finite() {
@@ -403,9 +418,9 @@ pub fn frame_gate(
     let z_bad = !zmed.is_finite() || zmed.abs() < zmin;
     let f_bad = sig_frame > 0.0 && (!amp_sig.is_finite() || amp_sig < ampmin);
     let a_bad = !ctrl_v.is_empty() && (!amp_med.is_finite() || amp_med < p95);
-    // 只否决：三条证据（显著性 / 绝对幅度 / 对照线 p95）全部指向「帧里没有这条线」
-    // 才否决；任一条支持候选即保留。本门无确认权。
-    let veto = z_bad && f_bad && a_bad;
+    // core/lsp.py:1596 -- 任一条证据不满足即否决（z / 绝对幅度 / 对照线 p95）。
+    // 本门只提供否决权，不提供确认权；三条全过才算「帧里确实有这条线」。
+    let veto = z_bad || f_bad || a_bad;
     let ok = !veto;
     let why = if !veto {
         format!("z≥{zmin:.2} 且 |amp|≥{ampmin:.2}σ_frame 且 ≥对照 p95")
@@ -434,5 +449,15 @@ pub fn frame_gate(
         if ok { "保留" } else { "否决" },
         why
     );
-    Some(GateResult { ok, zmed, amp_med, amp_sig, ctrl_p95: p95, n: amps.len() })
+    Some(GateResult {
+        ok,
+        zmed,
+        amp_med,
+        amp_sig,
+        ctrl_p95: p95,
+        n: amps.len(),
+        z_bad,
+        f_bad,
+        a_bad,
+    })
 }
