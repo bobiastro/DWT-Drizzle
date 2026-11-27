@@ -118,7 +118,7 @@ pub fn prepare(pts: &[[f64; 2]], max_pts: usize, cell: f64) -> Option<TriPrep> {
         let c = dist(p[t[2] as usize], p[t[0] as usize]);
         // sid e order: longest first, mirroring `np.argsort(-sides)`.
         let mut sides = [(a, 0u8), (b, 1), (c, 2)];
-        sides.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+        sides.sort_by(|x, y| y.0.total_cmp(&x.0));
         let s0 = sides[0].0;
         let s1 = sides[1].0;
         let s2 = sides[2].0;
@@ -333,7 +333,7 @@ pub fn solve(
                 }
             }
         }
-        local.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        local.sort_by(|a, b| a.0.total_cmp(&b.0));
         for &(dd, j) in local.iter().take(kk.max(1)) {
             cands.push((dd, i as u32, j));
         }
@@ -341,7 +341,7 @@ pub fn solve(
     if cands.is_empty() {
         return None;
     }
-    cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
     let ref_grid = Grid::new(refp, inlier_px.max(0.5) * 2.0);
     let want = (want_frac * src.len().max(1) as f64).max(1.0);
     let mut best: Option<(usize, f64, [[f64; 2]; 2], [f64; 2])> = None;

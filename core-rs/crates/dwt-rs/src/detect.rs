@@ -83,11 +83,18 @@ pub fn build_star_table(sref: &Img, n_star: usize, margin: usize, iso_px: f32) -
 
 /// Circular-Gaussian model fit on a 33x33 patch, returned as FWHM in pixels.
 ///
-/// `photutils.psf.fit_fwhm` fits the same model (`B + A*exp(-r^2/2s^2)` with a
-/// free centre) by Levenberg-Marquardt. Here the centre is fixed after a
-/// flux-weighted recentring and `sigma` is picked from a grid with `A`/`B` solved
-/// by linear least squares, which is deterministic and uses every patch pixel --
-/// essential because these frames sit at only a few sigma per pixel.
+/// `photutils.psf.fit_fwhm` fits `B + A*exp(-r^2/2s^2)` with a **free centre**
+/// (Levenberg-Marquardt over flux, x_0, y_0 and fwhm).  Pinning the centre to
+/// the window middle -- which is what this function used to do -- measures the
+/// *dither*, not the PSF: a star wanders up to +-20 px between the HFG1-3 O
+/// exposures, so a pinned window sits on the star's wing and the fit answers
+/// 7-40 px where the frame truth is 3.0 px.  The median of those numbers
+/// (`[C] 120 星 FWHM 中位 13.74px`) then set `sigma_psf` 4.5x too wide and every
+/// downstream weight inherited the error (over-smoothed product).
+///
+/// This is now the same five-parameter fit as photutils, seeded from the
+/// parabolic peak of the patch, so `search` (per-frame recentring) is only a
+/// convergence accelerator instead of a correctness requirement.
 fn fwhm_at(img: &Img, x: usize, y: usize, half: usize) -> Option<f32> {
     let (x, y) = (x as isize, y as isize);
     let r = half as isize;
@@ -133,122 +140,253 @@ fn fwhm_at(img: &Img, x: usize, y: usize, half: usize) -> Option<f32> {
     let m = median_of(&outer);
     let dev: Vec<f32> = outer.iter().map(|q| (q - m).abs()).collect();
     let noise = (1.4826 * median_of(&dev)).max(1e-12);
-    // Python `_fwhm_each` fits every window with a fixed `xypos=[(16,16)]`; the
-    // dither is handled by `recenter_brightest` before the fit, exactly like
-    // `measure_fwhm_frame(..., search=N)` in core/pws.py.
-    let (cx, cy) = (0.0f32, 0.0f32);
-    // grid search over sigma with A/B solved in closed form
-    let mut best = (f64::INFINITY, 0.0f32, 0.0f32);
-    for step in 0..48 {
-        let sigma = 0.35 * (1.09f32).powi(step); // 0.35 .. ~22 px
-        if sigma > 14.0 {
-            break;
+
+    // ---- seed: parabolic sub-pixel peak + a coarse sigma scan --------------
+    let (mut cx, mut cy) = subpixel_peak(&p, n);
+    let mut best = (f64::INFINITY, 1.3f32, 0.0f64, 0.0f64);
+    for step in 0..22 {
+        let sigma = 0.45 * (1.13f32).powi(step); // 0.45 .. ~7.4 px
+        if let Some((a, b, c2)) = linear_amp(&p, n, cx, cy, sigma) {
+            if c2 < best.0 {
+                best = (c2, sigma, a, b);
+            }
         }
+    }
+    if !best.0.is_finite() {
+        return None;
+    }
+    let mut sigma = best.1;
+    let mut a = best.2;
+    let mut b = best.3;
+    let mut chi = best.0;
+
+    // ---- five-parameter Levenberg-Marquardt (A, B, cx, cy, sigma) ----------
+    let mut lambda = 1e-3f64;
+    for _ in 0..48 {
         let inv = 1.0 / (2.0 * sigma * sigma);
-        // accumulate normal equations for basis [g, 1]
-        let (mut sgg, mut sg, mut s1, mut sgp, mut sp) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        let mut gsum = vec![0.0f32; n * n];
+        let s2 = (sigma * sigma) as f64;
+        let mut jtj = [[0.0f64; 5]; 5];
+        let mut jtr = [0.0f64; 5];
         for k in 0..n * n {
             let (i, j) = (k % n, k / n);
-            let dx = i as f32 - r as f32 - cx as f32;
-            let dy = j as f32 - r as f32 - cy as f32;
-            let g = (-(dx * dx + dy * dy) * inv).exp();
-            gsum[k] = g;
-            let g = g as f64;
-            let v = p[k] as f64;
-            sgg += g * g;
-            sg += g;
-            s1 += 1.0;
-            sgp += g * v;
-            sp += v;
+            let dx = i as f32 - cx;
+            let dy = j as f32 - cy;
+            let q = dx * dx + dy * dy;
+            let g = (-q * inv).exp() as f64;
+            let jac = [
+                g,
+                1.0,
+                a * g * dx as f64 / s2,
+                a * g * dy as f64 / s2,
+                a * g * q as f64 / (s2 * sigma as f64),
+            ];
+            let res = p[k] as f64 - (b + a * g);
+            for u in 0..5 {
+                jtr[u] += jac[u] * res;
+                for v in u..5 {
+                    jtj[u][v] += jac[u] * jac[v];
+                }
+            }
         }
-        let det = sgg * s1 - sg * sg;
-        if det.abs() < 1e-12 {
+        for u in 0..5 {
+            for v in 0..u {
+                jtj[u][v] = jtj[v][u];
+            }
+        }
+        // column scaling keeps the 5x5 solve conditioned (A ~ 1e-2, cx ~ 16)
+        let mut d = [1.0f64; 5];
+        for u in 0..5 {
+            d[u] = jtj[u][u].abs().sqrt().max(1e-12);
+        }
+        let mut mm = [[0.0f64; 5]; 5];
+        let mut rhs = [0.0f64; 5];
+        for u in 0..5 {
+            rhs[u] = jtr[u] / d[u];
+            for v in 0..5 {
+                mm[u][v] = jtj[u][v] / (d[u] * d[v]);
+            }
+            mm[u][u] += lambda;
+        }
+        let Some(sol) = solve5(mm, rhs) else { break };
+        let step = [
+            sol[0] / d[0],
+            sol[1] / d[1],
+            sol[2] / d[2],
+            sol[3] / d[3],
+            sol[4] / d[4],
+        ];
+        let na = a + step[0];
+        let nb = b + step[1];
+        let ncx = (cx + (step[2] as f32).clamp(-2.0, 2.0)).clamp(2.0, (n - 3) as f32);
+        let ncy = (cy + (step[3] as f32).clamp(-2.0, 2.0)).clamp(2.0, (n - 3) as f32);
+        let nsig = (sigma + (step[4] as f32).clamp(-0.5, 0.5)).clamp(0.35, 15.0);
+        if !(na.is_finite() && nb.is_finite() && nsig.is_finite()) {
+            break;
+        }
+        if na <= 0.0 {
+            lambda *= 6.0;
+            if lambda > 1e7 {
+                break;
+            }
             continue;
         }
-        let a = (sgp * s1 - sg * sp) / det;
-        let b = (sgg * sp - sg * sgp) / det;
-        if a <= 0.0 {
-            continue;
-        }
-        let mut chi2 = 0.0f64;
-        for k in 0..n * n {
-            let model = b + a * gsum[k] as f64;
-            let d = p[k] as f64 - model;
-            chi2 += d * d;
-        }
-        if chi2 < best.0 {
-            best = (chi2, sigma, a as f32);
-        }
-    }
-    let (chi2, _sigma0, mut amp) = best;
-    // refine: 1.09^k grid quantises FWHM to ~9%, far too coarse for the C ratio
-    let mut sigma = best.1;
-    let mut best_chi = chi2;
-    let mut lo = sigma / 1.09;
-    let mut hi = sigma * 1.09;
-    for _ in 0..12 {
-        let probes = [lo + (hi - lo) * 0.25, (lo + hi) * 0.5, hi - (hi - lo) * 0.25];
-        let mut bestp = (f64::INFINITY, 0.0f32, 0.0f32);
-        for &sg in &probes {
-            let inv = 1.0 / (2.0 * sg * sg);
-            let (mut sgg, mut sg1, mut s1, mut sgp, mut sp) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
-            for k in 0..n * n {
-                let (i, j) = (k % n, k / n);
-                let dx = i as f32 - r as f32;
-                let dy = j as f32 - r as f32;
-                let g = (-(dx * dx + dy * dy) * inv).exp() as f64;
-                let v = p[k] as f64;
-                sgg += g * g;
-                sg1 += g;
-                s1 += 1.0;
-                sgp += g * v;
-                sp += v;
+        let nchi = chi2_model(&p, n, na, nb, ncx, ncy, nsig);
+        if nchi.is_finite() && nchi < chi {
+            let gain = (chi - nchi) / chi.max(1e-30);
+            a = na;
+            b = nb;
+            cx = ncx;
+            cy = ncy;
+            sigma = nsig;
+            chi = nchi;
+            lambda = (lambda * 0.4).max(1e-9);
+            if gain < 1e-9 {
+                break;
             }
-            let det = sgg * s1 - sg1 * sg1;
-            if det.abs() < 1e-12 {
-                continue;
-            }
-            let a = (sgp * s1 - sg1 * sp) / det;
-            let b = (sgg * sp - sg1 * sgp) / det;
-            if a <= 0.0 {
-                continue;
-            }
-            let mut c2 = 0.0f64;
-            for k in 0..n * n {
-                let (i, j) = (k % n, k / n);
-                let dx = i as f32 - r as f32;
-                let dy = j as f32 - r as f32;
-                let g = (-(dx * dx + dy * dy) * inv).exp() as f64;
-                let d = p[k] as f64 - (b + a * g);
-                c2 += d * d;
-            }
-            if c2 < bestp.0 {
-                bestp = (c2, sg, a as f32);
-            }
-        }
-        if bestp.0.is_finite() && bestp.0 <= best_chi {
-            best_chi = bestp.0;
-            sigma = bestp.1;
-            amp = bestp.2;
-            lo = sigma / 1.09;
-            hi = sigma * 1.09;
         } else {
-            lo = lo + (hi - lo) * 0.25;
-            hi = hi - (hi - lo) * 0.25;
+            lambda *= 6.0;
+            if lambda > 1e7 {
+                break;
+            }
         }
     }
-    let chi2 = best_chi;
-    if !chi2.is_finite() || sigma <= 0.0 {
+
+    if !chi.is_finite() || !(sigma > 0.0) || !a.is_finite() || a <= 0.0 {
         return None;
     }
     // photutils 的 `fit_fwhm` 没有额外的振幅门限，只由调用方筛 0.5<v<40；
     // 加了门限会把"窗边被截断"的伪影值丢掉，与 Python 的 C 就对不上了。
-    let _ = (amp, noise);
-    if std::env::var("DWT_RS_NO_AMP_GATE").is_err() && amp < 3.0 * noise {
+    let _ = b;
+    if std::env::var("DWT_RS_NO_AMP_GATE").is_err() && a < 3.0 * noise as f64 {
         return None;
     }
     Some(2.3548 * sigma)
+}
+
+/// Parabolic sub-pixel peak of the patch: brightest pixel plus a 2D parabola
+/// through its 3x3 neighbourhood, each axis clipped to +-0.5 px.
+fn subpixel_peak(p: &[f32], n: usize) -> (f32, f32) {
+    let mut bi = 0usize;
+    let mut bv = f32::NEG_INFINITY;
+    for k in 0..n * n {
+        if p[k] > bv {
+            bv = p[k];
+            bi = k;
+        }
+    }
+    let (i, j) = (bi % n, bi / n);
+    if i == 0 || j == 0 || i + 1 >= n || j + 1 >= n {
+        return (i as f32, j as f32);
+    }
+    let dx = parab_offset(p[j * n + i - 1], bv, p[j * n + i + 1]);
+    let dy = parab_offset(p[(j - 1) * n + i], bv, p[(j + 1) * n + i]);
+    (i as f32 + dx, j as f32 + dy)
+}
+
+/// Offset of a 1D parabola vertex through (lo, mid, hi), clipped to +-0.5 px.
+fn parab_offset(lo: f32, mid: f32, hi: f32) -> f32 {
+    let den = lo - 2.0 * mid + hi;
+    if den.abs() < 1e-20 {
+        return 0.0;
+    }
+    let d = 0.5 * (lo - hi) / den;
+    if d.is_finite() {
+        d.clamp(-0.5, 0.5)
+    } else {
+        0.0
+    }
+}
+
+/// Closed-form amplitude/background for a fixed centre and sigma.
+fn linear_amp(p: &[f32], n: usize, cx: f32, cy: f32, sigma: f32) -> Option<(f64, f64, f64)> {
+    let inv = 1.0 / (2.0 * sigma * sigma);
+    let (mut sgg, mut sg, mut s1, mut sgp, mut sp) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut gs = vec![0.0f32; n * n];
+    for k in 0..n * n {
+        let (i, j) = (k % n, k / n);
+        let dx = i as f32 - cx;
+        let dy = j as f32 - cy;
+        let g = (-(dx * dx + dy * dy) * inv).exp();
+        gs[k] = g;
+        let g = g as f64;
+        let v = p[k] as f64;
+        sgg += g * g;
+        sg += g;
+        s1 += 1.0;
+        sgp += g * v;
+        sp += v;
+    }
+    let det = sgg * s1 - sg * sg;
+    if !det.is_finite() || det.abs() < 1e-18 {
+        return None;
+    }
+    let a = (sgp * s1 - sg * sp) / det;
+    let b = (sgg * sp - sgp * sg) / det;
+    if !(a.is_finite() && b.is_finite()) || a <= 0.0 {
+        return None;
+    }
+    let mut chi2 = 0.0f64;
+    for k in 0..n * n {
+        let d = p[k] as f64 - (b + a * gs[k] as f64);
+        chi2 += d * d;
+    }
+    Some((a, b, chi2))
+}
+
+fn chi2_model(p: &[f32], n: usize, a: f64, b: f64, cx: f32, cy: f32, sigma: f32) -> f64 {
+    let inv = 1.0 / (2.0 * sigma * sigma);
+    let mut chi2 = 0.0f64;
+    for k in 0..n * n {
+        let (i, j) = (k % n, k / n);
+        let dx = i as f32 - cx;
+        let dy = j as f32 - cy;
+        let g = (-(dx * dx + dy * dy) * inv).exp() as f64;
+        let d = p[k] as f64 - (b + a * g);
+        chi2 += d * d;
+    }
+    chi2
+}
+
+/// Gaussian elimination with partial pivoting on a 5x5 system.
+fn solve5(mut m: [[f64; 5]; 5], mut v: [f64; 5]) -> Option<[f64; 5]> {
+    for col in 0..5 {
+        let mut piv = col;
+        for row in col + 1..5 {
+            if m[row][col].abs() > m[piv][col].abs() {
+                piv = row;
+            }
+        }
+        if m[piv][col].abs() < 1e-14 || !m[piv][col].is_finite() {
+            return None;
+        }
+        if piv != col {
+            m.swap(piv, col);
+            v.swap(piv, col);
+        }
+        let d = m[col][col];
+        for row in col + 1..5 {
+            let f = m[row][col] / d;
+            if f == 0.0 {
+                continue;
+            }
+            for c in col..5 {
+                m[row][c] -= f * m[col][c];
+            }
+            v[row] -= f * v[col];
+        }
+    }
+    let mut out = [0.0f64; 5];
+    for row in (0..5).rev() {
+        let mut s = v[row];
+        for c in row + 1..5 {
+            s -= m[row][c] * out[c];
+        }
+        out[row] = s / m[row][row];
+        if !out[row].is_finite() {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// Python's per-frame recentring (`measure_fwhm_frame(..., search=N)`).
@@ -431,4 +569,62 @@ pub fn measure_trail(img: &Img, stars: &[(usize, usize)], sigma_psf: f32) -> (f3
         return (f32::NAN, f32::NAN);
     }
     (median_of(&l1s), 0.5 * (vy as f32).atan2(vx as f32))
+}
+
+#[cfg(test)]
+mod fwhm_tests {
+    use super::*;
+
+    /// 合成一个圆形高斯星，中心可任意偏离窗口中心（模拟帧间抖动/指向漂移）。
+    fn synth(w: usize, h: usize, cx: f32, cy: f32, sigma: f32, amp: f32, sky: f32) -> Img {
+        let mut img = Img::new(w, h);
+        for yy in 0..h {
+            for xx in 0..w {
+                let dx = xx as f32 - cx;
+                let dy = yy as f32 - cy;
+                img.d[yy * w + xx] =
+                    sky + amp * (-(dx * dx + dy * dy) / (2.0 * sigma * sigma)).exp();
+            }
+        }
+        img
+    }
+
+    /// 回归（P1 根因）：旧的 `fwhm_at` 把高斯中心钉死在窗口中心
+    /// (`let (cx, cy) = (0.0f32, 0.0f32)`)，星点偏 4–5px 就被读成 9–40px
+    /// （真值 2.9px）。自由中心拟合必须让「偏心」和「居中」读到同一个 FWHM。
+    #[test]
+    fn fwhm_tracks_an_offset_star() {
+        let truth = 2.9f32;
+        let sigma = truth / 2.3548;
+        let centred = synth(64, 64, 32.0, 32.0, sigma, 1.0, 0.01);
+        let offset = synth(64, 64, 32.0 + 4.0, 32.0 - 5.0, sigma, 1.0, 0.01);
+        let f_c = fwhm_at(&centred, 32, 32, 16).expect("居中星必须测得出");
+        let f_o = fwhm_at(&offset, 32, 32, 16).expect("偏心星必须测得出");
+        assert!((f_c - truth).abs() < 0.3, "居中星 FWHM={f_c}，真值 {truth}");
+        assert!((f_o - truth).abs() < 0.3, "偏心星 FWHM={f_o}，真值 {truth}");
+        assert!((f_o - f_c).abs() < 0.3, "偏心 {f_o} 与居中 {f_c} 差得太多");
+    }
+
+    /// 不同 σ 的星必须单调可分（权重 C=fwhm_med/fwhm_i 依赖这一点）。
+    #[test]
+    fn fwhm_is_monotone_in_sigma() {
+        let mut last = 0.0f32;
+        for sigma in [0.9f32, 1.2, 1.6, 2.1, 2.8] {
+            let img = synth(64, 64, 30.5, 33.5, sigma, 1.0, 0.01);
+            let f = fwhm_at(&img, 32, 32, 16).expect("star");
+            let want = sigma * 2.3548;
+            assert!((f - want).abs() < 0.25, "σ={sigma}: FWHM={f}，期望 {want}");
+            assert!(f > last, "σ={sigma}: FWHM 不单调 ({f} <= {last})");
+            last = f;
+        }
+    }
+
+    /// 窗口里混进 NaN 像素（坏像素/饱和标记）时不许 panic。
+    #[test]
+    fn fwhm_survives_nan_pixels() {
+        let mut img = synth(64, 64, 32.0, 32.0, 1.2, 1.0, 0.01);
+        img.d[32 * 64 + 32] = f32::NAN;
+        img.d[10 * 64 + 10] = f32::NAN;
+        let _ = fwhm_at(&img, 32, 32, 16);
+    }
 }

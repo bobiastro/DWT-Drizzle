@@ -492,7 +492,7 @@ pub fn run_job_with_progress(
     // Reference = median of the sharpest frames (8 like the CLI, unless fewer).
     let k = frames.len().min(8).max(1);
     let mut order: Vec<usize> = (0..frames.len()).collect();
-    order.sort_by(|&a, &b| fwhms[a].partial_cmp(&fwhms[b]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| fwhms[a].total_cmp(&fwhms[b]));
     let ref_idx: Vec<usize> = order.into_iter().take(k).collect();
     let refs: Vec<&Img> = ref_idx.iter().map(|&i| &frames[i]).collect();
     let sref = image::stack_median(&refs);
@@ -1134,7 +1134,7 @@ fn median_f64(v: &[f64]) -> f64 {
     if x.is_empty() {
         return 0.0;
     }
-    x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    x.sort_by(|a, b| a.total_cmp(b));
     x[x.len() / 2]
 }
 
@@ -1192,7 +1192,7 @@ fn locate_center(files: &[PathBuf], w: usize, h: usize) -> Option<(f32, f32)> {
         }
         yy += bs;
     }
-    blocks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    blocks.sort_by(|a, b| b.0.total_cmp(&a.0));
     blocks.first().map(|&(_, bx, by)| (bx as f32 * 4.0, by as f32 * 4.0))
 }
 

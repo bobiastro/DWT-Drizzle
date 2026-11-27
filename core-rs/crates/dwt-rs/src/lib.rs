@@ -13,6 +13,7 @@ pub mod cfa;
 pub mod cropcover;
 pub mod detect;
 pub mod drizzle;
+pub mod drzrej;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(not(feature = "gpu"))]

@@ -172,7 +172,7 @@ fn stat_block(data: &[f32], percent: bool) -> StatBlock {
     let gt50 = v.iter().filter(|x| **x > 50.0).count() as f32 / n as f32;
     let lt10 = v.iter().filter(|x| **x < 10.0).count() as f32 / n as f32;
     let (min, max) = v.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), x| (a.min(*x), b.max(*x)));
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|a, b| a.total_cmp(b));
     let p10 = image::percentile(&mut v, 10.0);
     let p50 = image::median(&mut v);
     let p90 = image::percentile(&mut v, 90.0);

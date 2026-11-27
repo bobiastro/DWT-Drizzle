@@ -273,7 +273,7 @@ fn median_f32(v: &mut [f32]) -> f32 {
     if v.is_empty() {
         return f32::NAN;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(|a, b| a.total_cmp(b));
     v[v.len() / 2]
 }
 
@@ -617,7 +617,7 @@ pub fn percentile_linear(v: &mut [f32], q: f32) -> f32 {
     if n == 0 {
         return f32::NAN;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|a, b| a.total_cmp(b));
     let q = q.clamp(0.0, 100.0);
     let pos = (n as f32 - 1.0) * q / 100.0;
     let lo = pos.floor() as usize;

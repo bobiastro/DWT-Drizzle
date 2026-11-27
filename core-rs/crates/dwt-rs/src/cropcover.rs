@@ -37,7 +37,7 @@ pub fn nan_percentile(a: &[f32], q: f64) -> f64 {
     if v.is_empty() {
         return f64::NAN;
     }
-    v.sort_by(|p, q2| p.partial_cmp(q2).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|p, q2| p.total_cmp(q2));
     let pos = (q / 100.0) * (v.len() as f64 - 1.0);
     let lo = pos.floor() as usize;
     let hi = pos.ceil() as usize;

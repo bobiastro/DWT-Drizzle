@@ -15,7 +15,7 @@ use dwt_rs::detect::{build_star_table, measure_fwhm_search, noise_sigma};
 use dwt_rs::cfa;
 use dwt_rs::drizzle::{drizzle_add_many, Acc, FramePlace, Plan};
 use dwt_rs::register::Sim;
-use dwt_rs::image::{coverage_count, median, median_of, percentile, sky_sigma, stack_median, Img};
+use dwt_rs::image::{coverage_count, median, median_of, percentile, sky_sigma, Img};
 use dwt_rs::rfield::{build_r_field_ext, RMode};
 use dwt_rs::stack::{
     reject_ext, stack_strip, stack_strip_mode, strip_weights_ext, RejMode, WeightOpts,
@@ -183,7 +183,13 @@ impl Default for Args {
             geom: None,
             fixed_probe: false,
             per_frame_stars: false,
-            fwhm_search: 0, // Python: `fwhm_search` 默认 0（不做搜索）
+            // 32 px, not Python's 0: this stack is dithered by tens of pixels
+            // (the 176°-flipped frames move a star by >20 px), so measuring a
+            // frame at the *seed* coordinates lands the 33×33 window on sky and
+            // the free-centre fit then collapses to the σ floor (0.35 px,
+            // FWHM 0.82 px).  Those bogus "sharpest" frames then get C = fmed/fwhm
+            // = 3.4× (clamped to 11.4×) weight and dominate the stack.
+            fwhm_search: 32,
             report: false,
             gpu: "auto".into(), // Python: `gpu` 默认 auto
             jobs: 0,
@@ -922,6 +928,19 @@ fn gpu_unhonored(a: &Args) -> Option<&'static str> {
     None
 }
 
+/// 按 FWHM 升序给出帧下标（`kref` 选最锐帧、`--fwhm-max` 之后的排序都用它）。
+///
+/// 必须用 `total_cmp`：`partial_cmp(..).unwrap_or(Equal)` 会让 NaN 与**任何**值
+/// 都「相等」，等价关系不具传递性，而 `slice::sort_by` 的 driftsort 会校验全序，
+/// 一旦发现就 panic `user-provided comparison function does not correctly
+/// implement a total order`（M81 60 帧配准全成功后崩在这里）。`total_cmp` 把
+/// NaN 放在 `+inf` 之后、`-NaN` 放在 `-inf` 之前，是一个真正的全序。
+fn sharpest_order(fwhms: &[f32]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..fwhms.len()).collect();
+    order.sort_by(|&i, &j| fwhms[i].total_cmp(&fwhms[j]));
+    order
+}
+
 fn run_pipeline(
     a: &Args,
     files: Vec<PathBuf>,
@@ -1074,7 +1093,7 @@ fn run_pipeline(
     // sky anchor = the frame closest to the median sky, then flatten to it
     let sky_med = median_of(&skies);
     let anchor = (0..skies.len())
-        .min_by(|&i, &j| (skies[i] - sky_med).abs().partial_cmp(&(skies[j] - sky_med).abs()).unwrap())
+        .min_by(|&i, &j| (skies[i] - sky_med).abs().total_cmp(&(skies[j] - sky_med).abs()))
         .unwrap();
     let sky0 = skies[anchor];
     for (i, d) in frames.iter_mut().enumerate() {
@@ -1519,8 +1538,7 @@ fn run_pipeline(
     // (core/pws.py:4245: k = max(1, min(refn=8, n)); idx = argsort(fwhms)[:k]).
     // Taking a median over every frame instead would blur the dithered PSF cores.
     let kref = 8.min(frames.len());
-    let mut order: Vec<usize> = (0..frames.len()).collect();
-    order.sort_by(|&i, &j| fwhms[i].partial_cmp(&fwhms[j]).unwrap_or(std::cmp::Ordering::Equal));
+    let order = sharpest_order(&fwhms);
     let ref_idx: Vec<usize> = order[..kref].to_vec();
     // Python builds this reference on the *output* grid from frames placed at
     // their own offsets (`drizzle.py:_sharp_ref_shift`): roll each sharpest frame
@@ -1541,8 +1559,18 @@ fn run_pipeline(
     } else if tmax < 0.5 && kmax < 0.005 {
         sharp_ref(&frames, &ref_idx, &sims, &plan_r, &stars, probe)
     } else {
-        let refs: Vec<&Img> = ref_idx.iter().map(|&i| &frames[i]).collect();
-        (stack_median(&refs), None)
+        // Rotated/translated stack: a median of the sharpest frames smears the
+        // PSF by the dither itself (this field moves by 20+ px between frames),
+        // and the R envelope then reads that smear as real structure — R came
+        // out at a median of 0.085 on HFG1 where the (drizzled) Python reference
+        // gives 0.026, which pushed `A·R` to 1.7 in the *sky* and let the C term
+        // shred the effective frame count there.  Take the sharpest single frame
+        // instead: its PSF is the real one, so R is honest in the sky and saturates
+        // only on real stars.
+        let i = ref_idx[0];
+        let fw = fwhms[i];
+        let sig = if fw.is_finite() && fw > 0.5 { Some(fw / 2.3548) } else { None };
+        (frames[i].clone(), sig)
     };
     println!(
         "[R] 参考像 = 最锐 {kref} 帧等权中位（{}）",
@@ -1849,23 +1877,6 @@ fn run_pipeline(
     let (stk, mut neff, rej_rate) = if let Some((img, nf)) = gpu_out {
         (img, nf, f32::NAN)
     } else if drz {
-        // Python's drizzle path rejects with plain sigma-clip + detail allowance
-        // (core/drizzle.py:1938-1982): no sky branch, no one-sided exemption.
-        let t_prof_rj = Instant::now();
-        // Python 的 drizzle 排异不带逐帧 σ（frame_sig 只存在于非 drizzle 的
-        // stack_strip，见 core/pws.py:1855/4834/4867），`rej_z` 因此只影响叠加路径。
-        let rate = reject_ext(
-            &frames,
-            &mut wts,
-            Some(&rfield),
-            sky0,
-            a.rej_k,
-            REJ_GATE,
-            None,
-            true,
-            a.rej_mode,
-        );
-        let d_prof_rj = t_prof_rj.elapsed().as_secs_f32();
         let dx = vec![0.0f32; frames.len()];
         let dy = vec![0.0f32; frames.len()];
         if std::env::var("DWT_RS_DEBUG").is_ok() {
@@ -1909,13 +1920,19 @@ fn run_pipeline(
         }
         lsp_plan = Some(plan);
         out_plan = Some(plan);
-        let mut acc = Acc::new(plan);
-        let t_prof_dz = Instant::now();
-        // core/drizzle.py:1867 -- the rotating branch passes
-        // `Pi = pixfrac * s * kk * _pm` with `_pm` defaulting to 2.0 (a 2x drop
-        // side, so that the phase holes left by a thin dither still fill in).
-        // The non-rotating branch uses `P = pixfrac * s` (drizzle.py:2083), so the
-        // multiplier only applies when a similarity transform is in play.
+        // Rejection is a *cross-frame* decision, so it has to be taken where the
+        // frames actually co-register: on the output canvas, after each frame's
+        // similarity transform.  On the raw frame stack a dithered (here:
+        // 176°-rotated, ±30px) star core looks like "every frame is an outlier";
+        // the drizzle-style rescue rule then writes the sky value into the core,
+        // which is exactly the black hole seen in the product.
+        // Python does the same thing on the output grid (core/drizzle.py:1900-1985).
+        let t_prof_rj = Instant::now();
+        // The drop geometry is needed by the rejection as well: the anchor and the
+        // per-pixel scale must be built with the *same* pixfrac as the stack, or
+        // the comparison runs at two different smoothing levels (a pixfrac-1
+        // anchor against pixfrac-2 samples looks far more scattered than it is and
+        // the clip fires on pure smoothing mismatch).
         let dmul = if a.drop_mul > 0.0 {
             a.drop_mul
         } else if register {
@@ -1923,25 +1940,107 @@ fn run_pipeline(
         } else {
             1.0
         };
+        let pf = if raw {
+            let pfx = if a.dpix < 1.0 { 1.0 } else { a.dpix };
+            pfx * 2.0 * 1.15
+        } else {
+            a.dpix * dmul
+        };
+        let rate = if a.rej_k > 0.0 {
+            if register || a.geom.is_some() {
+                let (_, _, sig) = sharp_ref_sim(&frames, &ref_idx, &sims, &plan, &stars, probe, pf);
+                // Anchor: the equal-weight mean of the *whole* stack, drizzled at
+                // the stack's own pixfrac.  A median of the k sharpest frames has
+                // √8 more noise of its own, and rejecting on |v − noisy anchor|
+                // pumps that anchor noise straight into the product (measured:
+                // 10.8% rejection → 2.93e-5, 15.2% → 3.44e-5, vs 2.09e-5 with the
+                // clip off).  Python's scatter kernel rejects against a running
+                // mean over all frames, i.e. an anchor with negligible noise.
+                let ones = vec![1.0f32; frames[0].d.len()];
+                let places: Vec<FramePlace> = frames
+                    .iter()
+                    .zip(sims.iter())
+                    .map(|(f, s)| FramePlace {
+                        img: f,
+                        ux: s.ux,
+                        uy: s.uy,
+                        theta: s.theta,
+                        k: s.k,
+                        w: &ones,
+                        cfa: None,
+                    })
+                    .collect();
+                let mut acc_a = Acc::new(plan);
+                dwt_rs::drizzle::drizzle_add_many(&mut acc_a, &places, pf);
+                let anchor = acc_a.finish();
+                // Scale: MAD over a stratified sample of the stack (never the
+                // sharpest frames — they are also the cleanest, see below).
+                let nf = frames.len();
+                let step = (nf / 16).max(1);
+                let spread: Vec<usize> = (0..nf).step_by(step).take(16).collect();
+                let (_, sc, _) = sharp_ref_sim(&frames, &spread, &sims, &plan, &stars, probe, pf);
+                println!(
+                    "[排异] 画布锚 = 全栈 {} 帧等权 drizzle 均值（输出网格，pixfrac {}），尺度 = {} 帧分层抽样 MAD 中位 {:.3e}；参考像自量 FWHM {:.2}px",
+                    nf,
+                    pf,
+                    spread.len(),
+                    median_of(&sc.d.iter().copied().filter(|v| v.is_finite()).collect::<Vec<f32>>()),
+                    sig.map(|v| v * 2.3548).unwrap_or(f32::NAN)
+                );
+                let rule = dwt_rs::drzrej::CanvasRule {
+                    anchor: &anchor,
+                    scale: &sc,
+                    r: dwt_rs::drzrej::RGrid::Frame(&rfield),
+                    sky: sky0,
+                    // Python's drizzle backend clips at `max(1, rej_k/2)` in esd
+                    // mode (core/gpu_wgpu_cfa_fatom.py: p[31]) — the mode name
+                    // promises a stronger test than the nominal k.
+                    kclip: if a.rej_mode == RejMode::Esd {
+                        (0.5 * a.rej_k).max(1.0)
+                    } else {
+                        a.rej_k
+                    },
+                    rej_k: a.rej_k,
+                    gate: REJ_GATE,
+
+                };
+                dwt_rs::drzrej::canvas_reject(&frames, &mut wts, &sims, plan, &rule, 24)
+            } else {
+                // Pre-aligned stack: the frames already share a pixel grid, so the
+                // frame-space rule is the right one.
+                // Python 的 drizzle 排异不带逐帧 σ（frame_sig 只存在于非 drizzle 的
+                // stack_strip，见 core/pws.py:1855/4834/4867），`rej_z` 因此只影响叠加路径。
+                reject_ext(
+                    &frames,
+                    &mut wts,
+                    Some(&rfield),
+                    sky0,
+                    a.rej_k,
+                    REJ_GATE,
+                    None,
+                    true,
+                    a.rej_mode,
+                )
+            }
+        } else {
+            0.0
+        };
+        let d_prof_rj = t_prof_rj.elapsed().as_secs_f32();
+        let mut acc = Acc::new(plan);
+        let t_prof_dz = Instant::now();
         let cfa_mask = if raw {
             cfa::mask2(pattern.unwrap_or("RGGB"), ch.unwrap_or('G'))
         } else {
             None
         };
-        // core/drizzle.py: a CFA drop must cover the 2x2 cell of one colour.
-        // Python raises pixfrac to 1.0 (`0.9 -> 1.0`) and uses a drop side of
-        // `pixfrac * s * 2.0 * 1.15`; Rust's full side is `s * pf`, hence pf =
-        // pixfrac * 2 * 1.15 (2.3 at pixfrac 1).  The usual registration 2x
-        // multiplier must NOT be applied on top of it.
-        let pf = if cfa_mask.is_some() {
-            let pfx = if a.dpix < 1.0 { 1.0 } else { a.dpix };
-            if a.dpix < 1.0 {
-                println!("[CFA] 液滴边长按同色格点铺满：pixfrac {} → 1.0", a.dpix);
-            }
-            pfx * 2.0 * 1.15
-        } else {
-            a.dpix * dmul
-        };
+        // `pf` (and the registration 2x multiplier behind it) is computed before
+        // the rejection: core/drizzle.py: a CFA drop must cover the 2x2 cell of
+        // one colour, so Python raises pixfrac to 1.0 and uses a drop side of
+        // `pixfrac * s * 2.0 * 1.15`; Rust's full side is `s * pf`, hence
+        // pf = pixfrac * 2 * 1.15 (2.3 at pixfrac 1).
+        if cfa_mask.is_some() && a.dpix < 1.0 {
+            println!("[CFA] 液滴边长按同色格点铺满：pixfrac {} → 1.0", a.dpix);
+        }
         // Band-parallel drizzle: every output pixel still receives each frame's
         // contribution in frame order, so the result is bit-identical to the
         // per-frame serial loop this replaces.
@@ -2388,6 +2487,102 @@ fn sharp_ref(
     (out, sigma)
 }
 
+/// [`sharp_ref`] for a *rotated* stack: the k sharpest frames are drizzled onto
+/// the output canvas at their own similarity transform and median-combined
+/// there.
+///
+/// `sharp_ref` can only roll frames by an integer shift, which is why the caller
+/// gated it behind `tmax < 0.5`.  A 176°-rotated stack therefore fell through to
+/// a *frame-space* `stack_median`: the R field, the "参考像自量" width and (with
+/// the old rule) the rejection anchor were all built on an image that is not on
+/// the output grid — so σ_psf came out in frame pixels while everything
+/// downstream consumed it as output pixels.
+///
+/// Returns the canvas reference, its per-pixel across-frame scale (1.4826·MAD of
+/// the k samples) and the reference's own σ measured on the output grid.
+fn sharp_ref_sim(
+    frames: &[Img],
+    idx: &[usize],
+    sims: &[dwt_rs::register::Sim],
+    plan: &Plan,
+    stars: &[(usize, usize)],
+    probe: usize,
+    pixfrac: f32,
+) -> (Img, Img, Option<f32>) {
+    let k = idx.len().max(1);
+    let mut planes: Vec<Img> = Vec::with_capacity(k);
+    let mut ones: Vec<f32> = Vec::new();
+    for &i in idx {
+        let s = sims[i];
+        if ones.len() != frames[i].d.len() {
+            ones = vec![1.0f32; frames[i].d.len()];
+        }
+        let mut acc = dwt_rs::drizzle::Acc::new(*plan);
+        dwt_rs::drizzle::drizzle_add(&mut acc, &frames[i], s.ux, s.uy, s.theta, s.k, pixfrac, &ones);
+        planes.push(acc.finish());
+    }
+    let n = plan.w * plan.h;
+    let mut med = Img::new(plan.w, plan.h);
+    let mut sc = Img::new(plan.w, plan.h);
+    let mut col: Vec<f32> = vec![0.0f32; k];
+    let mut ad: Vec<f32> = vec![0.0f32; k];
+    for p in 0..n {
+        let mut cnt = 0usize;
+        for pl in planes.iter() {
+            let v = pl.d[p];
+            if v.is_finite() {
+                col[cnt] = v;
+                cnt += 1;
+            }
+        }
+        if cnt == 0 {
+            med.d[p] = f32::NAN;
+            sc.d[p] = f32::NAN;
+            continue;
+        }
+        let vals = &col[..cnt];
+        let mm = median_of(vals);
+        med.d[p] = mm;
+        if cnt >= 3 {
+            for j in 0..cnt {
+                ad[j] = (vals[j] - mm).abs();
+            }
+            sc.d[p] = 1.4826 * median_of(&ad[..cnt]);
+        } else {
+            sc.d[p] = f32::NAN;
+        }
+    }
+    let s = sims[probe];
+    let th = s.theta.to_radians();
+    let (ct, st) = (th.cos(), th.sin());
+    let pts: Vec<(usize, usize)> = stars
+        .iter()
+        .map(|&(x, y)| {
+            let (xf, yf) = (x as f32 + 0.5, y as f32 + 0.5);
+            let cx = plan.s * (s.k * (ct * xf - st * yf) + s.ux) + plan.ox;
+            let cy = plan.s * (s.k * (st * xf + ct * yf) + s.uy) + plan.oy;
+            (cx.floor().max(0.0) as usize, cy.floor().max(0.0) as usize)
+        })
+        .collect();
+    let fw = dwt_rs::detect::measure_fwhm_search(&med, &pts, 16, 2);
+    if std::env::var("DWT_RS_DEBUG").is_ok() {
+        let per: Vec<f32> = planes
+            .iter()
+            .map(|p| dwt_rs::detect::measure_fwhm_search(p, &pts, 16, 2))
+            .collect();
+        let mut srt = per.clone();
+        srt.sort_by(|a, b| a.total_cmp(b));
+        eprintln!(
+            "[dbg] sharp_ref_sim 单帧画布 FWHM {:?} 中位 {:.2}  中位合成 {:.2}",
+            per.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>(),
+            median_of(&srt),
+            fw
+        );
+    }
+    let sigma = if fw.is_finite() && fw > 0.5 { Some(fw / 2.3548) } else { None };
+    (med, sc, sigma)
+}
+
 fn median_strided(img: &Img, step: usize) -> f32 {
     let mut v: Vec<f32> = Vec::new();
     let mut y = 0;
@@ -2497,12 +2692,18 @@ fn filter_hint(p: &Path) -> String {
 mod args_defaults_tests {
     use super::*;
 
-    /// CLI 默认值必须与 Python 版一致：`fwhm_search=0`、`cfa_raw=auto`、`gpu=auto`，
-    /// 以及新接线的那些参数各自的「不生效」默认。
+    /// CLI 默认值必须与 Python 版一致：`cfa_raw=auto`、`gpu=auto`，以及新接线的那些
+    /// 参数各自的「不生效」默认。
+    ///
+    /// 唯一的例外是 `fwhm_search`：Python 默认 0，本实现默认 32。星表取自单一探针帧，
+    /// 而本组数据的帧间抖动最大到 ~20px，`search=0` 时 33x33 窗口会落到天空上，
+    /// 自由中心拟合收敛到 σ 下限（0.35px）⇒ 帧 FWHM 读数 0.82px、清晰度权重被放大
+    /// 到 clamp 上限 11.4 倍，坏帧主导叠加、参考像被拉宽到 7.9px。默认 32 让读数
+    /// 落在单帧真值 2.5–3.7px（见 detect.rs::fwhm_tests 与 hfg 实跑日志）。
     #[test]
     fn defaults_match_the_python_reference() {
         let a = Args::default();
-        assert_eq!(a.fwhm_search, 0);
+        assert_eq!(a.fwhm_search, 32);
         assert_eq!(a.cfa_raw, "auto");
         assert_eq!(a.gpu, "auto");
         assert_eq!(a.snr_clip, 3.0);
@@ -2520,5 +2721,50 @@ mod args_defaults_tests {
         assert_eq!(a.fwhm_max, 0.0);
         // 默认参数下 GPU 门控不触发（gpu=auto 仍按老行为走 GPU）
         assert!(gpu_unhonored(&a).is_none());
+    }
+}
+
+#[cfg(test)]
+mod nan_sort_tests {
+    use super::*;
+
+    /// 回归：M81 60 帧在 `--limit 60` 时 `fwhms` 里混进了 NaN（某帧 FWHM 测不出来），
+    /// 旧的 `partial_cmp(..).unwrap_or(Equal)` 比较器违反全序，`sort_by` 直接 panic。
+    /// 现在用 `total_cmp`：含 NaN 的向量必须排完不 panic，且 NaN 落在末尾。
+    #[test]
+    fn sharpest_order_survives_nan() {
+        let vals = [3.5f32, f32::NAN, 1.25, f32::NEG_INFINITY, 2.0, f32::NAN, 0.9];
+        let order = sharpest_order(&vals);
+        assert_eq!(order.len(), vals.len());
+        assert_eq!(order, vec![3, 6, 2, 4, 0, 1, 5]);
+        assert!(vals[order[5]].is_nan() && vals[order[6]].is_nan());
+    }
+
+    /// 200 个元素 + 29 个 NaN：旧比较器在这规模上必 panic（driftsort 的
+    /// bidirectional_merge 会检出非全序），这里断言排完且下标是排列。
+    #[test]
+    fn sharpest_order_no_panic_many_nans() {
+        let vals: Vec<f32> = (0..200)
+            .map(|i| if i % 7 == 0 { f32::NAN } else { (i as f32 * 0.37).sin() })
+            .collect();
+        let order = sharpest_order(&vals);
+        let mut seen = vec![false; vals.len()];
+        for &i in &order {
+            assert!(!seen[i], "下标 {i} 重复");
+            seen[i] = true;
+        }
+        assert!(seen.iter().all(|&s| s));
+        // 有限值全部排在 NaN 之前
+        let first_nan = order.iter().position(|&i| vals[i].is_nan()).unwrap();
+        assert!(order[first_nan..].iter().all(|&i| vals[i].is_nan()));
+        assert_eq!(order.len() - first_nan, 29);
+    }
+
+    /// 全是 NaN 也不能崩，并且保持原顺序（全序下互相相等，稳定排序）。
+    #[test]
+    fn sharpest_order_all_nan() {
+        let vals = [f32::NAN; 5];
+        assert_eq!(sharpest_order(&vals), vec![0, 1, 2, 3, 4]);
+        assert!(sharpest_order(&[]).is_empty());
     }
 }

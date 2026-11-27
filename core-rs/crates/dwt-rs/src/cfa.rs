@@ -259,7 +259,7 @@ pub fn nanmedian(v: &[f32]) -> f32 {
     if f.is_empty() {
         return f32::NAN;
     }
-    f.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    f.sort_by(|a, b| a.total_cmp(b));
     f[f.len() / 2]
 }
 

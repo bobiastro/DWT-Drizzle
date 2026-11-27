@@ -726,7 +726,7 @@ pub fn median_f64(v: &[f64]) -> f64 {
         return f64::NAN;
     }
     let mut s = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| a.total_cmp(b));
     let n = s.len();
     if n % 2 == 1 {
         s[n / 2]

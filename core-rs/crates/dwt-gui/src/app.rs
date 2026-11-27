@@ -1426,7 +1426,7 @@ fn map_panel(
 
 fn build_texture(ctx: &egui::Context, map: &NpyMap, log: bool, name: &str) -> TextureHandle {
     let mut vals: Vec<f32> = map.data.iter().copied().filter(|v| v.is_finite()).collect();
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    vals.sort_by(|a, b| a.total_cmp(b));
     let lo = if vals.is_empty() { 0.0 } else { vals[(vals.len() as f32 * 0.02) as usize] };
     let hi = if vals.is_empty() { 1.0 } else { vals[(vals.len() as f32 * 0.98) as usize].max(lo + 1e-6) };
     let mut img = ColorImage::new([map.w, map.h], Color32::BLACK);
@@ -1450,7 +1450,7 @@ fn build_texture(ctx: &egui::Context, map: &NpyMap, log: bool, name: &str) -> Te
 
 fn blit_map(rgba: &mut [u8], stride_w: usize, map: &NpyMap, ox: usize, oy: usize, log: bool) {
     let mut vals: Vec<f32> = map.data.iter().copied().filter(|v| v.is_finite()).collect();
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    vals.sort_by(|a, b| a.total_cmp(b));
     let lo = vals.first().copied().unwrap_or(0.0);
     let hi = vals.last().copied().unwrap_or(1.0).max(lo + 1e-6);
     for y in 0..map.h {

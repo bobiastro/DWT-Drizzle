@@ -142,7 +142,7 @@ fn vmedian(v: &mut Vec<f32>) -> f32 {
     if v.is_empty() {
         return 0.0;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|a, b| a.total_cmp(b));
     median_of(v)
 }
 
