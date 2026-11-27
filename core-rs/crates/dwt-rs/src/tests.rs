@@ -1,6 +1,6 @@
 //! Unit tests for the CPU core: weights, rejection, drizzle sampling, XISF I/O.
 
-use crate::drizzle::{drizzle_add, drizzle_add_gather, Acc, Plan};
+use crate::drizzle::{drizzle_add, drizzle_add_gather, drizzle_add_many, Acc, FramePlace, Plan};
 use crate::image::Img;
 use crate::stack::{reject, stack_strip, strip_weights};
 use crate::xisf::{read_xisf, write_xisf, OutMeta};
@@ -150,6 +150,46 @@ fn drizzle_scatter_equals_gather() {
     for i in 0..a.num.len() {
         assert!((a.num[i] - b.num[i]).abs() < 1e-4, "num {i}: {} vs {}", a.num[i], b.num[i]);
         assert!((a.den[i] - b.den[i]).abs() < 1e-4, "den {i}: {} vs {}", a.den[i], b.den[i]);
+    }
+}
+
+/// The band-parallel accumulate must reproduce the per-frame serial loop bit for
+/// bit: rotation makes a row's drops land far from their source row, so this also
+/// pins down the row cull and the band clipping.
+#[test]
+fn drizzle_many_matches_serial() {
+    let (fw, fh) = (24usize, 20usize);
+    let mut f = Img::from_vec(fw, fh, vec![0.0f32; fw * fh]);
+    for y in 0..fh {
+        for x in 0..fw {
+            f.d[y * fw + x] = 1.0 + x as f32 * 0.5 + (y % 3) as f32;
+        }
+    }
+    let wmap: Vec<f32> = (0..fw * fh).map(|i| 0.5 + (i % 5) as f32 * 0.25).collect();
+    let dxs = [0.0f32, 1.5, -2.0, 0.75];
+    let dys = [0.0f32, -0.5, 1.25, 2.0];
+    let plan = Plan::new(fw, fh, &dxs, &dys, 1.0, 1.0);
+    let placements = [
+        (0.0f32, 0.0f32, 0.0f32, 1.0f32),
+        (1.5, -0.5, 9.0, 1.0),
+        (-2.0, 1.25, -14.0, 1.02),
+        (0.75, 2.0, 33.0, 0.98),
+    ];
+    let mut a = Acc::new(plan);
+    for &(ux, uy, th, k) in &placements {
+        drizzle_add(&mut a, &f, ux, uy, th, k, 1.0, &wmap);
+    }
+    let mut b = Acc::new(plan);
+    let places: Vec<FramePlace<'_>> = placements
+        .iter()
+        .map(|&(ux, uy, theta, k)| FramePlace { img: &f, ux, uy, theta, k, w: &wmap, cfa: None })
+        .collect();
+    drizzle_add_many(&mut b, &places, 1.0);
+    assert_eq!(a.num.len(), b.num.len());
+    for i in 0..a.num.len() {
+        assert_eq!(a.num[i].to_bits(), b.num[i].to_bits(), "num {i}: {} vs {}", a.num[i], b.num[i]);
+        assert_eq!(a.den[i].to_bits(), b.den[i].to_bits(), "den {i}: {} vs {}", a.den[i], b.den[i]);
+        assert_eq!(a.cov[i].to_bits(), b.cov[i].to_bits(), "cov {i}: {} vs {}", a.cov[i], b.cov[i]);
     }
 }
 

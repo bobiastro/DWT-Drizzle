@@ -6,6 +6,8 @@
 //! `X = s*k*(x+0.5+ux) + ox`, and the drop is a square of side `pixfrac*s` centred
 //! on `X-0.5` (so a `pixfrac=1` drop at `s=2` exactly tiles 2x2 output pixels).
 
+use rayon::prelude::*;
+
 use crate::image::Img;
 
 #[derive(Clone, Copy, Debug)]
@@ -180,6 +182,28 @@ pub fn drizzle_add_cfa(
     scatter(acc, mosaic, ux, uy, theta_deg, k, pixfrac, wmap, Some((mask, oy, ox)));
 }
 
+/// One frame's placement, ready for [`drizzle_add_many`].
+pub struct FramePlace<'a> {
+    pub img: &'a Img,
+    pub ux: f32,
+    pub uy: f32,
+    pub theta: f32,
+    pub k: f32,
+    pub w: &'a [f32],
+    /// CFA sampling: `(mask, oy parity, ox parity)`.
+    pub cfa: Option<(&'a [[bool; 2]; 2], usize, usize)>,
+}
+
+/// The per-frame constants of one drop kernel.
+struct Drop {
+    ux: f32,
+    uy: f32,
+    ct: f32,
+    st: f32,
+    k: f32,
+    fp: f32,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scatter(
     acc: &mut Acc,
@@ -194,16 +218,107 @@ fn scatter(
 ) {
     acc.epoch = acc.epoch.wrapping_add(1);
     let epoch = acc.epoch;
-    let s = acc.plan.s;
-    let fp = 0.5 * s * pixfrac; // half-side of the drop, in output pixels
     let th = theta_deg.to_radians();
-    let (ct, st) = (th.cos(), th.sin());
-    let ow = acc.plan.w as i64;
-    let oh = acc.plan.h as i64;
+    let drop = Drop { ux, uy, ct: th.cos(), st: th.sin(), k, fp: 0.5 * acc.plan.s * pixfrac };
+    let plan = acc.plan;
+    let Acc { num, den, cov, seen, .. } = acc;
+    scatter_band(num, den, cov, seen, epoch, &plan, 0, plan.h, frame, &drop, wmap, cfa);
+}
+
+/// Scatter every frame into `acc`, in parallel over disjoint bands of *output*
+/// rows.
+///
+/// Drizzle is a scatter, so a band of output rows only needs the source pixels
+/// whose drop actually reaches it, and every output pixel still receives its
+/// contributions in the original order (frames in order, then source pixels in
+/// row-major order).  The result is therefore bit-identical to calling
+/// [`drizzle_add`] once per frame in the same order, which is what makes the
+/// frame loop in the caller parallelisable at all.
+pub fn drizzle_add_many(acc: &mut Acc, frames: &[FramePlace<'_>], pixfrac: f32) {
+    let plan = acc.plan;
+    let (ow, oh) = (plan.w, plan.h);
+    if frames.is_empty() || ow == 0 || oh == 0 {
+        return;
+    }
+    let s = plan.s;
+    // A frame's drops cover the canvas unevenly (rotated borders and the
+    // uncovered corners are empty), so take several bands per thread.
+    let nband = (rayon::current_num_threads().max(1) * 4).clamp(1, oh);
+    let bh = oh.div_ceil(nband).max(1);
+    acc.epoch = acc.epoch.wrapping_add(frames.len() as u32);
+    let Acc { num, den, cov, .. } = acc;
+    num.par_chunks_mut(bh * ow)
+        .zip(den.par_chunks_mut(bh * ow))
+        .zip(cov.par_chunks_mut(bh * ow))
+        .enumerate()
+        .for_each(|(b, ((num, den), cov))| {
+            let r0 = b * bh;
+            let r1 = (r0 + bh).min(oh);
+            // `cov` counts *frames* per output pixel, not samples, so it needs
+            // the same epoch bookkeeping as the serial path.
+            let mut seen = vec![0u32; num.len()];
+            for (i, f) in frames.iter().enumerate() {
+                let th = f.theta.to_radians();
+                let drop = Drop { ux: f.ux, uy: f.uy, ct: th.cos(), st: th.sin(), k: f.k, fp: 0.5 * s * pixfrac };
+                scatter_band(
+                    num,
+                    den,
+                    cov,
+                    &mut seen,
+                    i as u32 + 1,
+                    &plan,
+                    r0,
+                    r1,
+                    f.img,
+                    &drop,
+                    f.w,
+                    f.cfa,
+                );
+            }
+        });
+}
+
+/// Scatter `frame` into the output rows `[r0, r1)` of a band-local accumulator
+/// (`num`/`den`/`cov` are `(r1 - r0) * plan.w` long, `r0` rows up from the
+/// bottom of the canvas).
+#[allow(clippy::too_many_arguments)]
+fn scatter_band(
+    num: &mut [f32],
+    den: &mut [f32],
+    cov: &mut [f32],
+    seen: &mut [u32],
+    epoch: u32,
+    plan: &Plan,
+    r0: usize,
+    r1: usize,
+    frame: &Img,
+    d: &Drop,
+    wmap: &[f32],
+    cfa: Option<(&[[bool; 2]; 2], usize, usize)>,
+) {
+    let ow = plan.w as i64;
+    let (fp, ct, st, k) = (d.fp, d.ct, d.st, d.k);
+    let fw = frame.w;
+    let (r0f, r1f) = (r0 as f32, r1 as f32);
     for y in 0..frame.h {
         let yc = y as f32 + 0.5;
-        let cy0 = s * (k * (st * (0.0) + ct * yc) + uy) + acc.plan.oy;
-        if cy0 + fp < -1.0 || cy0 - fp > oh as f32 + 1.0 {
+        // The serial path culls whole rows with a single sample at `xc = 0.0`.
+        // That test is *not* a conservative bound once the frame is rotated (the
+        // drops of one row can travel thousands of pixels along x), so it loses
+        // contributions — reproducing it verbatim is what keeps the mosaic
+        // bit-identical to the per-frame loop this replaces.
+        let cy0 = plan.s * (k * (ct * yc) + d.uy) + plan.oy;
+        if cy0 + fp < -1.0 || cy0 - fp > plan.h as f32 + 1.0 {
+            continue;
+        }
+        // `cy` is affine in `xc`, so its value at the two ends of the row bounds
+        // every drop in that row: skip the row outright when the span misses the
+        // band.  This is what keeps the per-band rescans cheap, and it is exact —
+        // a row whose span misses the band would add nothing to it.
+        let cy_a = plan.s * (k * (st * 0.5 + ct * yc) + d.uy) + plan.oy;
+        let cy_b = plan.s * (k * (st * (fw as f32 - 0.5) + ct * yc) + d.uy) + plan.oy;
+        let (cy_lo, cy_hi) = if cy_a <= cy_b { (cy_a, cy_b) } else { (cy_b, cy_a) };
+        if cy_hi + fp <= r0f || cy_lo - fp - 1.0 >= r1f {
             continue;
         }
         for x in 0..frame.w {
@@ -213,37 +328,41 @@ fn scatter(
                 }
             }
             let xc = x as f32 + 0.5;
-            let cx = s * (k * (ct * xc - st * yc) + ux) + acc.plan.ox;
-            let cy = s * (k * (st * xc + ct * yc) + uy) + acc.plan.oy;
-            let y0 = (cy - fp - 1.0).floor() as i64;
-            let y1 = (cy + fp).ceil() as i64;
+            let cx = plan.s * (k * (ct * xc - st * yc) + d.ux) + plan.ox;
+            let cy = plan.s * (k * (st * xc + ct * yc) + d.uy) + plan.oy;
+            let y0 = ((cy - fp - 1.0).floor() as i64).max(r0 as i64);
+            let y1 = ((cy + fp).ceil() as i64).min(r1 as i64);
+            if y1 <= y0 {
+                continue;
+            }
             let x0 = (cx - fp - 1.0).floor() as i64;
             let x1 = (cx + fp).ceil() as i64;
             if x1 <= 0 || x0 >= ow {
                 continue;
             }
-            let wt = wmap[y * frame.w + x];
+            let wt = wmap[y * fw + x];
             if !(wt > 0.0) {
                 continue;
             }
-            let v = frame.d[y * frame.w + x] * wt;
-            for oy_i in y0.max(0)..y1.min(oh) {
+            let v = frame.d[y * fw + x] * wt;
+            for oy_i in y0..y1 {
                 let wy = overlap(fp, oy_i as f32 + 0.5 - cy);
                 if wy <= 0.0 {
                     continue;
                 }
+                let row = (oy_i - r0 as i64) as usize * ow as usize;
                 for ox_i in x0.max(0)..x1.min(ow) {
                     let wx = overlap(fp, ox_i as f32 + 0.5 - cx);
                     if wx <= 0.0 {
                         continue;
                     }
                     let a = wx * wy;
-                    let q = (oy_i * ow + ox_i) as usize;
-                    acc.num[q] += v * a;
-                    acc.den[q] += a * wt;
-                    if acc.seen[q] != epoch {
-                        acc.seen[q] = epoch;
-                        acc.cov[q] += 1.0;
+                    let q = row + ox_i as usize;
+                    num[q] += v * a;
+                    den[q] += a * wt;
+                    if seen[q] != epoch {
+                        seen[q] = epoch;
+                        cov[q] += 1.0;
                     }
                 }
             }

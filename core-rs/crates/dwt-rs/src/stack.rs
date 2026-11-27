@@ -25,37 +25,45 @@ pub fn strip_weights(
     if cap > 0.0 && cap < 1.0 && n > 1 {
         l_cap = 0.5 * (((n - 1) as f32 * cap / (1.0 - cap)).max(1e-9)).ln();
     }
-    // log-weight per (frame, pixel), then normalize per pixel
-    let mut lw = vec![0.0f32; n * npx];
-    lw.par_chunks_mut(npx).enumerate().for_each(|(i, row)| {
+    // The normalization needs, for every pixel, the sum of `exp(log-weight)` over
+    // all frames.  Storing the whole (frame, pixel) weight matrix first would be
+    // `n · npx · 4` bytes — 9.6 GB on a 393-frame stack, which is what used to
+    // page this stage out.  Compute it blocked over pixels instead, then
+    // recompute each weight (cheap arithmetic) in the write-out pass.
+    const PBLK: usize = 1024;
+    let mut mean = vec![0.0f32; npx];
+    mean.par_chunks_mut(PBLK).enumerate().for_each(|(b, m)| {
+        let p0 = b * PBLK;
+        let pe = (p0 + m.len()).min(npx);
+        for (p, pj) in (p0..pe).enumerate() {
+            let rp = r.d[pj];
+            let left = a_exp * rp;
+            let right = b_exp * (1.0 - rp) + beta * rp;
+            let mut acc = 0.0f32;
+            for i in 0..n {
+                let mut v = left * lc[i] + right * ls[i];
+                if l_cap.is_finite() {
+                    // `numpy.clip(v, -L, L)` returns `L` for every element when L < 0
+                    // (min > max), which is what happens with n = 2 and cap = 0.25;
+                    // `f32::clamp` panics there, so mirror numpy's behaviour.
+                    v = if l_cap < 0.0 { l_cap } else { v.clamp(-l_cap, l_cap) };
+                }
+                acc += v.exp();
+            }
+            m[p] = (acc / n as f32).max(1e-30);
+        }
+    });
+    let mut out: Vec<Img> = (0..n).map(|_| Img::new(w, h)).collect();
+    out.par_iter_mut().enumerate().for_each(|(i, o)| {
         for p in 0..npx {
             let rp = r.d[p];
             let mut v = a_exp * rp * lc[i] + (b_exp * (1.0 - rp) + beta * rp) * ls[i];
             if l_cap.is_finite() {
-                // `numpy.clip(v, -L, L)` returns `L` for every element when L < 0
-                // (min > max), which is what happens with n = 2 and cap = 0.25;
-                // `f32::clamp` panics there, so mirror numpy's behaviour.
                 v = if l_cap < 0.0 { l_cap } else { v.clamp(-l_cap, l_cap) };
             }
-            row[p] = v;
+            o.d[p] = v.exp() / mean[p];
         }
     });
-    let mut mean = vec![0.0f32; npx];
-    for i in 0..n {
-        for p in 0..npx {
-            mean[p] += lw[i * npx + p].exp();
-        }
-    }
-    for v in &mut mean {
-        *v = (*v / n as f32).max(1e-30);
-    }
-    let mut out: Vec<Img> = (0..n).map(|_| Img::new(w, h)).collect();
-    for i in 0..n {
-        let row = &lw[i * npx..(i + 1) * npx];
-        for p in 0..npx {
-            out[i].d[p] = row[p].exp() / mean[p];
-        }
-    }
     out
 }
 

@@ -8,10 +8,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rayon::prelude::*;
+
 use dwt_rs::bggrad;
 use dwt_rs::detect::{build_star_table, measure_fwhm_search, noise_sigma};
 use dwt_rs::cfa;
-use dwt_rs::drizzle::{drizzle_add, drizzle_add_cfa, Acc, Plan};
+use dwt_rs::drizzle::{drizzle_add_many, Acc, FramePlace, Plan};
 use dwt_rs::register::Sim;
 use dwt_rs::image::{downsample, median, median_of, percentile, stack_median, Img};
 use dwt_rs::rfield::build_r_field;
@@ -814,35 +816,39 @@ fn run_pipeline(
     let t_all = Instant::now();
     // ---- read full frames (needed to locate the crop centre) --------------
     let t = Instant::now();
-    let mut full: Vec<Img> = Vec::with_capacity(files.len());
-    let mut expts: Vec<f64> = Vec::with_capacity(files.len());
-    for f in &files {
-        let (meta, img) = read_xisf(f)?;
-        let kw = |k: &str| -> Option<String> {
-            // XISF writers pad string keyword values (e.g. "Light   "), so trim
-            // quotes *and* whitespace before matching on them.
-            meta.keywords
-                .iter()
-                .find(|(n, _)| n == k)
-                .map(|(_, v)| v.trim_matches('\'').trim().to_string())
-        };
-        let expt = kw("EXPTIME")
-            .or_else(|| kw("EXPOSURE"))
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let typ = kw("IMAGETYP").unwrap_or_default();
-        let filt = kw("FILTER").or_else(|| kw("FILTERID")).unwrap_or_default();
-        if !typ.is_empty() && !matches!(typ.as_str(), "LIGHT" | "Light" | "LightFrame" | "OBJECT") {
-            return Err(format!("{}: not a light frame ({typ})", f.display()));
-        }
-        if let Some(p) = &a.pick {
-            if !filt.is_empty() && !filt.eq_ignore_ascii_case(p) {
-                return Err(format!("{}: FILTER={filt} but --pick {p}", f.display()));
+    // Frames are independent: read (and inflate) them in parallel.  `collect`
+    // into `Result<Vec<_>>` keeps them in `files` order.
+    let loaded: Result<Vec<(f64, Img)>, String> = files
+        .par_iter()
+        .map(|f| {
+            let (meta, img) = read_xisf(f)?;
+            let kw = |k: &str| -> Option<String> {
+                // XISF writers pad string keyword values (e.g. "Light   "), so trim
+                // quotes *and* whitespace before matching on them.
+                meta.keywords
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| v.trim_matches('\'').trim().to_string())
+            };
+            let expt = kw("EXPTIME")
+                .or_else(|| kw("EXPOSURE"))
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let typ = kw("IMAGETYP").unwrap_or_default();
+            let filt = kw("FILTER").or_else(|| kw("FILTERID")).unwrap_or_default();
+            if !typ.is_empty() && !matches!(typ.as_str(), "LIGHT" | "Light" | "LightFrame" | "OBJECT") {
+                return Err(format!("{}: not a light frame ({typ})", f.display()));
             }
-        }
-        expts.push(expt);
-        full.push(img);
-    }
+            if let Some(p) = &a.pick {
+                if !filt.is_empty() && !filt.eq_ignore_ascii_case(p) {
+                    return Err(format!("{}: FILTER={filt} but --pick {p}", f.display()));
+                }
+            }
+            Ok((expt, img))
+        })
+        .collect();
+    let loaded = loaded?;
+    let (expts, full): (Vec<f64>, Vec<Img>) = loaded.into_iter().unzip();
     let t_read = t.elapsed().as_secs_f32();
     let t_med = median_of(&expts.iter().map(|v| *v as f32).collect::<Vec<_>>()) as f64;
     println!("[帧] 读 {:.2}s  曝光中位 {t_med}s  内部归一 {EXPTIME_REF}s", t_read);
@@ -868,26 +874,36 @@ fn run_pipeline(
             println!("[CFA] 通道 {c}：{pat} 相位拆分（真样本保留，其余按同色 3x3 归一均值填充）");
         }
     }
-    for (i, src) in full.iter().enumerate() {
-        let mut d = src.crop(x0, y0, w, h);
-        let k = (EXPTIME_REF / expts[i]) as f32;
-        if (k - 1.0).abs() > 1e-9 {
-            for v in &mut d.d {
-                *v *= k;
+    let built: Result<Vec<(Img, f32, f32, Option<Img>)>, String> = full
+        .par_iter()
+        .enumerate()
+        .map(|(i, src)| {
+            let mut d = src.crop(x0, y0, w, h);
+            let k = (EXPTIME_REF / expts[i]) as f32;
+            if (k - 1.0).abs() > 1e-9 {
+                for v in &mut d.d {
+                    *v *= k;
+                }
             }
-        }
-        // Python measures the sky/sigma on the stored mosaic, before demosaic.
-        skies.push(median_strided(&d, 4));
-        sigmas.push(noise_sigma(&d));
-        if let (Some(pat), Some(c)) = (pattern, ch) {
-            let plane = cfa::plane(&d, pat, c, y0, x0)
-                .map_err(|e| format!("CFA plane {}: {e}", files[i].display()))?;
-            if raw {
-                mosaics.push(d);
+            // Python measures the sky/sigma on the stored mosaic, before demosaic.
+            let sky = median_strided(&d, 4);
+            let sig = noise_sigma(&d);
+            if let (Some(pat), Some(c)) = (pattern, ch) {
+                let plane = cfa::plane(&d, pat, c, y0, x0)
+                    .map_err(|e| format!("CFA plane {}: {e}", files[i].display()))?;
+                let mosaic = if raw { Some(d) } else { None };
+                Ok((plane, sky, sig, mosaic))
+            } else {
+                Ok((d, sky, sig, None))
             }
-            frames.push(plane);
-        } else {
-            frames.push(d);
+        })
+        .collect();
+    for (img, sky, sig, mosaic) in built? {
+        frames.push(img);
+        skies.push(sky);
+        sigmas.push(sig);
+        if let Some(m) = mosaic {
+            mosaics.push(m);
         }
     }
     drop(full);
@@ -943,36 +959,76 @@ fn run_pipeline(
 
     // ---- per-frame quality ------------------------------------------------
     let t = Instant::now();
+    // Star tables of every frame, built once.  A 120-star table is exactly the
+    // prefix of the 400-star one (the detector sorts candidates by peak and then
+    // greedily isolates them), so a single 400-star table per frame serves the
+    // quality probe search, the per-frame PSF measure and the canvas
+    // registration.  Building it serially three times was the single largest
+    // cost in the pipeline.
+    let mut fstars: Vec<Vec<(usize, usize)>> = Vec::new();
     let (mut probe, stars, mut fwhms): (usize, Vec<(usize, usize)>, Vec<f32>) =
         if let Some(sh) = share {
             (sh.probe, sh.stars.clone(), sh.fwhms.clone())
         } else {
             // the star table must come from a single frame: these frames are dithered by
             // several px, so a median stack blurs the PSF cores into the noise.
+            let want400 = a.geom.is_none() && a.canvas_from.is_some();
+            if want400 {
+                fstars = frames.par_iter().map(|f| build_star_table(f, 400, 26, 25.0)).collect();
+            }
             let probe = match a.ref_frame.or(a.seed_frame) {
                 Some(i) => i.min(frames.len() - 1),
                 None => {
                     let mut best = (0usize, 0usize);
-                    for (i, f) in frames.iter().enumerate() {
-                        let k = build_star_table(f, 120, 26, 25.0).len();
-                        if k > best.1 {
-                            best = (i, k);
+                    if fstars.is_empty() {
+                        for (i, f) in frames.iter().enumerate() {
+                            let k = build_star_table(f, 120, 26, 25.0).len();
+                            if k > best.1 {
+                                best = (i, k);
+                            }
+                        }
+                    } else {
+                        for (i, t) in fstars.iter().enumerate() {
+                            let k = t.len().min(120);
+                            if k > best.1 {
+                                best = (i, k);
+                            }
                         }
                     }
                     best.0
                 }
             };
-            let stars = build_star_table(&frames[probe], 120, 26, 25.0);
+            let mut stars = if fstars.is_empty() {
+                build_star_table(&frames[probe], 120, 26, 25.0)
+            } else {
+                fstars[probe].clone()
+            };
+            stars.truncate(120);
             println!("[星表] 探针帧 #{probe} 上检出 {} 颗", stars.len());
-            let mut fwhms = Vec::with_capacity(frames.len());
-            for f in &frames {
-                if a.per_frame_stars {
-                    let own = build_star_table(f, 120, 26, 25.0);
-                    fwhms.push(measure_fwhm_search(f, &own, 16, a.fwhm_search));
+            let fwhms: Vec<f32> = if a.per_frame_stars {
+                let own: Vec<Vec<(usize, usize)>> = if fstars.is_empty() {
+                    frames.par_iter().map(|f| build_star_table(f, 120, 26, 25.0)).collect()
                 } else {
-                    fwhms.push(measure_fwhm_search(f, &stars, 16, a.fwhm_search));
-                }
-            }
+                    fstars
+                        .iter()
+                        .map(|t| {
+                            let mut v = t.clone();
+                            v.truncate(120);
+                            v
+                        })
+                        .collect()
+                };
+                frames
+                    .par_iter()
+                    .zip(own.par_iter())
+                    .map(|(f, o)| measure_fwhm_search(f, o, 16, a.fwhm_search))
+                    .collect()
+            } else {
+                frames
+                    .par_iter()
+                    .map(|f| measure_fwhm_search(f, &stars, 16, a.fwhm_search))
+                    .collect()
+            };
             (probe, stars, fwhms)
         };
     // ---- frame-to-frame registration --------------------------------------
@@ -1071,46 +1127,64 @@ fn run_pipeline(
                     println!("[配准] 参考画布是帧的 {ratio:.3}× 网格，相似变换按此换算");
                 }
                 let mut placed: Vec<dwt_rs::register::Sim> = Vec::new();
-                let mut centres: Vec<Vec<(f32, f32, f32)>> = Vec::with_capacity(frames.len());
-                for f in frames.iter() {
-                    let own = build_star_table(f, 400, 26, 25.0);
-                    centres.push(dwt_rs::register::centroids(f, &own, 8));
-                }
+                // Reuse the tables built for the quality pass; only fall back to
+                // building them here when that pass did not run the 400-star path.
+                let own_tables: Vec<Vec<(usize, usize)>> = if fstars.len() == frames.len() {
+                    Vec::new()
+                } else {
+                    frames.par_iter().map(|f| build_star_table(f, 400, 26, 25.0)).collect()
+                };
+                let centres: Vec<Vec<(f32, f32, f32)>> = (0..frames.len())
+                    .into_par_iter()
+                    .map(|i| {
+                        let own: &[(usize, usize)] =
+                            if own_tables.is_empty() { &fstars[i] } else { &own_tables[i] };
+                        dwt_rs::register::centroids(&frames[i], own, 8)
+                    })
+                    .collect();
+                // The vote grid is integer pixels, so a faint frame occasionally
+                // returns no inlier set at the nominal search radius; widen it
+                // before giving up on the frame.
+                // Nights of the same target can be offset by hundreds of pixels
+                // (the reference product may be a mosaic from another night), so
+                // the vote radius covers most of a frame; the vote is sparse, so a
+                // wide radius costs no more than a narrow one.
+                //
+                // The direct fit is a pure function of (refc, centres[i]), so all
+                // frames are solved up front in parallel.  The chain fallback below
+                // still runs in frame order: it reads the neighbours' placements.
+                let wide = 0.75 * frames[0].w.max(frames[0].h) as f32;
+                let directs: Vec<Option<dwt_rs::register::Sim>> = centres
+                    .par_iter()
+                    .map(|c| {
+                        let mut got = None;
+                        for ms in [wide, 0.5 * wide] {
+                            if let Some(s) = dwt_rs::register::estimate(&refc, c, ms) {
+                                got = Some(s);
+                                break;
+                            }
+                        }
+                        // A similarity supported by only a handful of star pairs is a
+                        // false peak.  Refusing it is what keeps junk placements out of
+                        // the stack: the reference matcher needs a comparable inlier set,
+                        // and a frame that cannot earn one has no honest place here.
+                        // A direct fit is only trusted when a real inlier set supports
+                        // it; the triangle matcher routinely returns 200+ matches at
+                        // rms<1 px for these frames, so `n>=40, rms<=1.0` costs nothing
+                        // and keeps the rare 15-pair junk solution out of the stack.
+                        got.filter(|s| s.rms <= 1.0 && s.n >= 40).map(|s| dwt_rs::register::Sim {
+                            ux: s.ux * ratio,
+                            uy: s.uy * ratio,
+                            theta: s.theta,
+                            k: s.k * ratio,
+                            rms: s.rms * ratio,
+                            n: s.n,
+                        })
+                    })
+                    .collect();
                 for i in 0..frames.len() {
                     let c = centres[i].clone();
-                    let f = &frames[i];
-                    // The vote grid is integer pixels, so a faint frame occasionally
-                    // returns no inlier set at the nominal search radius; widen it
-                    // before giving up on the frame.
-                    // Nights of the same target can be offset by hundreds of pixels
-                    // (the reference product may be a mosaic from another night), so
-                    // the vote radius covers most of a frame; the vote is sparse, so a
-                    // wide radius costs no more than a narrow one.
-                    let wide = 0.75 * frames[0].w.max(frames[0].h) as f32;
-                    let mut got = None;
-                    for ms in [wide, 0.5 * wide] {
-                        if let Some(s) = dwt_rs::register::estimate(&refc, &c, ms) {
-                            got = Some(s);
-                            break;
-                        }
-                    }
-                    // A similarity supported by only a handful of star pairs is a
-                    // false peak.  Refusing it is what keeps junk placements out of
-                    // the stack: the reference matcher needs a comparable inlier set,
-                    // and a frame that cannot earn one has no honest place here.
-                    // A direct fit is only trusted when a real inlier set supports
-                    // it; the triangle matcher routinely returns 200+ matches at
-                    // rms<1 px for these frames, so `n>=40, rms<=1.0` costs nothing
-                    // and keeps the rare 15-pair junk solution out of the stack.
-                    let got = got.filter(|s| s.rms <= 1.0 && s.n >= 40);
-                    let direct = got.map(|s| dwt_rs::register::Sim {
-                        ux: s.ux * ratio,
-                        uy: s.uy * ratio,
-                        theta: s.theta,
-                        k: s.k * ratio,
-                        rms: s.rms * ratio,
-                        n: s.n,
-                    });
+                    let direct = directs[i];
                     // Chain fallback (Python's `[位移] 三角配准兜底救回`): a frame
                     // that cannot be matched against the reference product is first
                     // matched against its nearest already-placed neighbour and the
@@ -1440,6 +1514,7 @@ fn run_pipeline(
     // ---- weights + rejection + combine ------------------------------------
     let t = Instant::now();
     let wts = strip_weights(&c, &s, &rfield, a.a_exp, a.b_exp, a.beta, a.max_share);
+    let t_prof_sw = t.elapsed().as_secs_f32();
     if let Some(dir) = &a.dump_w {
         let _ = std::fs::create_dir_all(dir);
         for (i, m) in wts.iter().enumerate() {
@@ -1548,6 +1623,7 @@ fn run_pipeline(
     } else if drz {
         // Python's drizzle path rejects with plain sigma-clip + detail allowance
         // (core/drizzle.py:1938-1982): no sky branch, no one-sided exemption.
+        let t_prof_rj = Instant::now();
         let rate = dwt_rs::stack::reject(
             &frames,
             &mut wts,
@@ -1558,6 +1634,7 @@ fn run_pipeline(
             Some(&sigmas),
             true,
         );
+        let d_prof_rj = t_prof_rj.elapsed().as_secs_f32();
         let dx = vec![0.0f32; frames.len()];
         let dy = vec![0.0f32; frames.len()];
         if std::env::var("DWT_RS_DEBUG").is_ok() {
@@ -1602,6 +1679,7 @@ fn run_pipeline(
         lsp_plan = Some(plan);
         out_plan = Some(plan);
         let mut acc = Acc::new(plan);
+        let t_prof_dz = Instant::now();
         // core/drizzle.py:1867 -- the rotating branch passes
         // `Pi = pixfrac * s * kk * _pm` with `_pm` defaulting to 2.0 (a 2x drop
         // side, so that the phase holes left by a thin dither still fill in).
@@ -1633,13 +1711,34 @@ fn run_pipeline(
         } else {
             a.dpix * dmul
         };
-        for i in 0..frames.len() {
-            let s = sims[i];
-            if let Some(mask) = cfa_mask {
-                drizzle_add_cfa(&mut acc, &mosaics[i], s.ux, s.uy, s.theta, s.k, pf, &wts[i].d, &mask, y0 % 2, x0 % 2);
-            } else {
-                drizzle_add(&mut acc, &frames[i], s.ux, s.uy, s.theta, s.k, pf, &wts[i].d);
-            }
+        // Band-parallel drizzle: every output pixel still receives each frame's
+        // contribution in frame order, so the result is bit-identical to the
+        // per-frame serial loop this replaces.
+        let places: Vec<FramePlace<'_>> = frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let s = sims[i];
+                let img = if cfa_mask.is_some() { &mosaics[i] } else { f };
+                FramePlace {
+                    img,
+                    ux: s.ux,
+                    uy: s.uy,
+                    theta: s.theta,
+                    k: s.k,
+                    w: &wts[i].d,
+                    cfa: cfa_mask.as_ref().map(|m| (m, y0 % 2, x0 % 2)),
+                }
+            })
+            .collect();
+        drizzle_add_many(&mut acc, &places, pf);
+        if std::env::var("DWT_RS_PROF").is_ok() {
+            println!(
+                "[PROF] strip {:.2}s reject {:.2}s drizzle {:.2}s",
+                t_prof_sw,
+                d_prof_rj,
+                t_prof_dz.elapsed().as_secs_f32()
+            );
         }
         let img = acc.finish();
         cov_acc = std::mem::take(&mut acc.cov);

@@ -13,3 +13,11 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Single codegen unit + fat LTO: this is a numeric kernel bound by inner-loop
+# throughput, so cross-crate inlining of the image/stack/drizzle helpers matters
+# more than build time.  ~2x faster release builds of the hot loops at the cost
+# of a slower link.
+[profile.release]
+lto = "fat"
+codegen-units = 1

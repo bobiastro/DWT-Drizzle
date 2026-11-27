@@ -1,6 +1,8 @@
 //! Minimal dense f32 image buffer plus the numeric primitives the PWS core needs
 //! (`numpy`/`scipy.ndimage` equivalents, implemented without external deps).
 
+use rayon::prelude::*;
+
 /// Row-major single-channel float image.
 #[derive(Clone, Debug, Default)]
 pub struct Img {
@@ -127,9 +129,8 @@ pub fn max_filter(src: &Img, win: usize) -> Img {
     }
     let w = src.w;
     let h = src.h;
-    // horizontal pass
     let mut tmp = Img::new(w, h);
-    for y in 0..h {
+    tmp.d.par_chunks_mut(w).enumerate().for_each(|(y, orow)| {
         let row = &src.d[y * w..y * w + w];
         for x in 0..w {
             let mut m = f32::NEG_INFINITY;
@@ -140,12 +141,12 @@ pub fn max_filter(src: &Img, win: usize) -> Img {
                     m = v;
                 }
             }
-            tmp.d[y * w + x] = m;
+            orow[x] = m;
         }
-    }
+    });
     // vertical pass
     let mut out = Img::new(w, h);
-    for y in 0..h {
+    out.d.par_chunks_mut(w).enumerate().for_each(|(y, orow)| {
         for x in 0..w {
             let mut m = f32::NEG_INFINITY;
             for k in -r..=r {
@@ -155,9 +156,9 @@ pub fn max_filter(src: &Img, win: usize) -> Img {
                     m = v;
                 }
             }
-            out.d[y * w + x] = m;
+            orow[x] = m;
         }
-    }
+    });
     out
 }
 
@@ -171,27 +172,27 @@ pub fn box_filter(src: &Img, win: usize) -> Img {
     let w = src.w;
     let h = src.h;
     let mut tmp = Img::new(w, h);
-    for y in 0..h {
+    tmp.d.par_chunks_mut(w).enumerate().for_each(|(y, orow)| {
         for x in 0..w {
             let mut acc = 0.0f64;
             for k in -r..=r {
                 let xx = (x as isize + k).clamp(0, w as isize - 1) as usize;
                 acc += src.d[y * w + xx] as f64;
             }
-            tmp.d[y * w + x] = (acc / win as f64) as f32;
+            orow[x] = (acc / win as f64) as f32;
         }
-    }
+    });
     let mut out = Img::new(w, h);
-    for y in 0..h {
+    out.d.par_chunks_mut(w).enumerate().for_each(|(y, orow)| {
         for x in 0..w {
             let mut acc = 0.0f64;
             for k in -r..=r {
                 let yy = (y as isize + k).clamp(0, h as isize - 1) as usize;
                 acc += tmp.d[yy * w + x] as f64;
             }
-            out.d[y * w + x] = (acc / win as f64) as f32;
+            orow[x] = (acc / win as f64) as f32;
         }
-    }
+    });
     out
 }
 
@@ -216,27 +217,27 @@ pub fn gaussian_filter(src: &Img, sigma: f32) -> Img {
     let w = src.w;
     let h = src.h;
     let mut tmp = Img::new(w, h);
-    for y in 0..h {
+    tmp.d.par_chunks_mut(w).enumerate().for_each(|(y, orow)| {
         for x in 0..w {
             let mut acc = 0.0f64;
             for (i, kv) in k.iter().enumerate() {
                 let xx = (x as isize + i as isize - r).clamp(0, w as isize - 1) as usize;
                 acc += *kv as f64 * src.d[y * w + xx] as f64;
             }
-            tmp.d[y * w + x] = acc as f32;
+            orow[x] = acc as f32;
         }
-    }
+    });
     let mut out = Img::new(w, h);
-    for y in 0..h {
+    out.d.par_chunks_mut(w).enumerate().for_each(|(y, orow)| {
         for x in 0..w {
             let mut acc = 0.0f64;
             for (i, kv) in k.iter().enumerate() {
                 let yy = (y as isize + i as isize - r).clamp(0, h as isize - 1) as usize;
                 acc += *kv as f64 * tmp.d[yy * w + x] as f64;
             }
-            out.d[y * w + x] = acc as f32;
+            orow[x] = acc as f32;
         }
-    }
+    });
     out
 }
 
