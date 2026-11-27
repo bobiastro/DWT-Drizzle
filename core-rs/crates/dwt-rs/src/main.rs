@@ -16,8 +16,10 @@ use dwt_rs::cfa;
 use dwt_rs::drizzle::{drizzle_add_many, Acc, FramePlace, Plan};
 use dwt_rs::register::Sim;
 use dwt_rs::image::{coverage_count, median, median_of, percentile, sky_sigma, stack_median, Img};
-use dwt_rs::rfield::build_r_field;
-use dwt_rs::stack::{stack_strip, strip_weights};
+use dwt_rs::rfield::{build_r_field_ext, RMode};
+use dwt_rs::stack::{
+    reject_ext, stack_strip, stack_strip_mode, strip_weights_ext, RejMode, WeightOpts,
+};
 use dwt_rs::xisf::{
     aggregate_fits_keywords, aggregate_properties, pws_properties, py_g6, read_xisf,
     read_xisf_luma, write_npy_f32, write_xisf, write_xisf_rgb, OutMeta, PwsDiag, XisfMeta,
@@ -83,8 +85,14 @@ struct Args {
     lsp_only: Option<String>,
     rej_k: f32,
     snr_clip: f32,
+    rej_z: bool,
+    sharp_w: f32,
+    rej_mode: RejMode,
     star_grow: f32,
     r_floor: f32,
+    r_mode: RMode,
+    r_win: f32,
+    r_k: f32,
     drop_mul: f32,
     bgdeg: usize,
     star_grow_fixed: f32,
@@ -141,8 +149,14 @@ impl Default for Args {
             lsp_only: None,
             rej_k: REJ_K,
             snr_clip: SNR_CLIP,
+            rej_z: true,
+            sharp_w: 0.0, // Python: drizzle 合成里的 `sharp_w`（core/drizzle.py:1990-2010），默认 0 即无效
+            rej_mode: RejMode::Winsor, // Python: `rej_mode` 默认 winsor
             star_grow: 100.0,
             r_floor: 0.0,
+            r_mode: RMode::Max,
+            r_win: 0.0,
+            r_k: 3.0,
             drop_mul: 0.0,
             bgdeg: 1,
             star_grow_fixed: -1.0,
@@ -157,15 +171,15 @@ impl Default for Args {
             geom: None,
             fixed_probe: false,
             per_frame_stars: false,
-            fwhm_search: 8,
+            fwhm_search: 0, // Python: `fwhm_search` 默认 0（不做搜索）
             report: false,
-            gpu: "off".into(),
+            gpu: "auto".into(), // Python: `gpu` 默认 auto
             jobs: 0,
             cfa: "off".into(),
             cfa_debayer: "bilinear".into(),
             cfa_weights: "auto".into(),
             cfa_align: "auto".into(),
-            cfa_raw: "off".into(),
+            cfa_raw: "auto".into(), // Python: `cfa_raw` 默认 auto
             cfa_ref: None,
             cfa_grid: Some("shared".into()),
             cfa_drizzle: false,
@@ -279,6 +293,36 @@ fn parse_args() -> Result<Args, String> {
             }
             "--rej-k" => {
                 a.rej_k = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--rej-z" => {
+                // `--rej-z 0` / `--rej-z 1`；裸写 `--rej-z` 视为打开
+                if has_val() {
+                    a.rej_z = num(val()?, flag)? != 0.0;
+                    i += 2;
+                } else {
+                    a.rej_z = true;
+                    i += 1;
+                }
+            }
+            "--sharp-w" => {
+                a.sharp_w = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--rej-mode" => {
+                a.rej_mode = RejMode::parse(val()?);
+                i += 2;
+            }
+            "--r-mode" => {
+                a.r_mode = RMode::parse(val()?);
+                i += 2;
+            }
+            "--r-win" => {
+                a.r_win = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--r-k" => {
+                a.r_k = num(val()?, flag)? as f32;
                 i += 2;
             }
             "--snr-clip" => {
@@ -1498,7 +1542,20 @@ fn run_pipeline(
             sigma_ref,
             sigma_psf
         );
-        let (rfield, rinfo) = build_r_field(&sref, sigma_ref, a.r_floor, 2.0, 16.0, 1.0, star_grow, R_DEC, a.dump_r.as_ref().map(std::path::Path::new));
+        let (rfield, rinfo) = build_r_field_ext(
+            &sref,
+            sigma_ref,
+            a.r_floor,
+            2.0,
+            16.0,
+            1.0,
+            star_grow,
+            R_DEC,
+            a.dump_r.as_ref().map(std::path::Path::new),
+            a.r_mode,
+            a.r_win,
+            a.r_k,
+        );
         if let Some(dir) = &a.dump_r {
             let _ = std::fs::create_dir_all(dir);
             let _ = dwt_rs::xisf::write_npy_f32(&std::path::Path::new(dir).join("r.npy"), &rfield.d, rfield.h, rfield.w);
@@ -1519,7 +1576,13 @@ fn run_pipeline(
 
     // ---- weights + rejection + combine ------------------------------------
     let t = Instant::now();
-    let wts = strip_weights(&c, &s, &rfield, a.a_exp, a.b_exp, a.beta, a.max_share);
+    let wopts = WeightOpts {
+        sharp_w: a.sharp_w,
+        flux_pow: 0.0,
+    };
+    let wts = strip_weights_ext(
+        &c, &s, &rfield, a.a_exp, a.b_exp, a.beta, a.max_share, wopts, None, None,
+    );
     let t_prof_sw = t.elapsed().as_secs_f32();
     if let Some(dir) = &a.dump_w {
         let _ = std::fs::create_dir_all(dir);
@@ -1630,15 +1693,18 @@ fn run_pipeline(
         // Python's drizzle path rejects with plain sigma-clip + detail allowance
         // (core/drizzle.py:1938-1982): no sky branch, no one-sided exemption.
         let t_prof_rj = Instant::now();
-        let rate = dwt_rs::stack::reject(
+        // Python 的 drizzle 排异不带逐帧 σ（frame_sig 只存在于非 drizzle 的
+        // stack_strip，见 core/pws.py:1855/4834/4867），`rej_z` 因此只影响叠加路径。
+        let rate = reject_ext(
             &frames,
             &mut wts,
             Some(&rfield),
             sky0,
             a.rej_k,
             REJ_GATE,
-            Some(&sigmas),
+            None,
             true,
+            a.rej_mode,
         );
         let d_prof_rj = t_prof_rj.elapsed().as_secs_f32();
         let dx = vec![0.0f32; frames.len()];
@@ -1751,8 +1817,15 @@ fn run_pipeline(
         println!("[drizzle] 输出 {}x{}  scale={} pixfrac={} (x{}) drop_mul={}  ox={} oy={}", img.w, img.h, a.dscale, a.dpix, pf, dmul, plan.ox, plan.oy);
         (img, Vec::new(), rate)
     } else {
-        let res = stack_strip(
-            &frames, &mut wts, Some(&rfield), sky0, a.rej_k, REJ_GATE, Some(&sigmas),
+        let res = stack_strip_mode(
+            &frames,
+            &mut wts,
+            Some(&rfield),
+            sky0,
+            a.rej_k,
+            REJ_GATE,
+            if a.rej_z { Some(&sigmas) } else { None },
+            a.rej_mode,
         );
         if let Some(dir) = &a.dump_w {
             for (i, m) in wts.iter().enumerate() {
