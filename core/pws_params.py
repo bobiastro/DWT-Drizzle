@@ -62,6 +62,7 @@ class PwsParams:
     center: str = ''
     B: float = 2.0
     flux_pow: float = 0.0
+    fwhm_search: int = 0
     gpu: str = 'auto'
     frame: str = ''
     crop_cover: float = 0.9
@@ -235,6 +236,12 @@ PARAMS: Tuple[Param, ...] = (
           '叠出来的成品直接就是它的宽高与朝向，和它逐像素对齐，不需要事后裁切或重采样。'
           '原理：先解出参考帧与 master 的相似变换，再把它复合到每一帧的变换上，'
           '画布取 master 的宽高、缩放 1、无平移。'),
+    Param('fwhm_search', '逐帧 FWHM 重定心', 'int', '高级',
+          '测量每帧星点 FWHM 时，在 seed 坐标 ±N 像素内重新找星点中心；0=关闭（默认）',
+          '关闭时严格按基准帧星表坐标切窗——这是 2.7.115 及更早的既有行为。'
+          '打开后能消除帧间抖动造成的假差异（实测同一批星 3.85× 离散 → 1.13×），'
+          '但权重会随之改变，可能让 LSPR 对低对比痕的检测变难，故默认关。',
+          lo=0, hi=24, step=1, dec=0),
     Param('flux_pow', '吞吐权重', 'float', '高级',
           '每帧收光量（星点流量）的权重指数，默认 0=关闭',
           'W = T^p · C^(A·R) · S^(2(1-R))；T 是逐帧星点流量（同一批星、同一孔径、'
