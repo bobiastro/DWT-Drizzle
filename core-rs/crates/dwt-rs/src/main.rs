@@ -477,6 +477,10 @@ fn parse_args() -> Result<Args, String> {
                 a.match_scale = if has_val() { num(val()?, flag)? != 0.0 } else { true };
                 i += if has_val() { 2 } else { 1 };
             }
+            "-V" | "--version" => {
+                println!("dwt-rs {} (DWT · Drizzle Rust 后端)", dwt_rs::VERSION);
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -509,7 +513,8 @@ registration (the default; --register 1 is an explicit alias):
   NOTE: --crop N (N > 0) plus registration is REFUSED on purpose, exit code 1
   and no output file: Python's crop builds a shift bounding box plus a centre
   crop, so a plain input-window crop would silently emit a different region.
-  Pass --canvas-from, or use --aligned 1.";
+  Pass --canvas-from, or use --aligned 1.
+  -V, --version   print the release string and exit.";
 
 
 fn normalize_pattern(s: &str) -> Option<&'static str> {

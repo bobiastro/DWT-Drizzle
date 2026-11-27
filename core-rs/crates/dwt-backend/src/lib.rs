@@ -15,6 +15,8 @@ pub mod register;
 pub mod rfield;
 pub mod wbpp;
 
+pub use dwt_rs::VERSION;
+
 pub use backend::{
     AlignedStackRequest, Backend, DrizzleRequest, RustBackend, SimilarityDrizzleRequest,
 };

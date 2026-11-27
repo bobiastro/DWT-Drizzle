@@ -1,4 +1,5 @@
-pub const VERSION: &str = "2.7.119-D";
+/// Re-exported so the GUI and the CLI print the same release string.
+pub use dwt_backend::VERSION;
 
 pub const LICENSE_TEXT: &str = "\
 分区加权叠加（PWS）+ Drizzle 几何重采样
