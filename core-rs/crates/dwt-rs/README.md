@@ -269,3 +269,29 @@ plain cropping, which is bit-identical to Python's crop path.  Setting
   -0.11 % of sky, and 5e-4 % of masked pixels (single-frame hits) are rejected
   differently.  The 1x aligned/crop path (no registration) *is* bit-exact -
   `corr 1.00000000`, `max|d| 1.0e-8` - because both sides skip drizzle there.
+
+## Known limits vs the Python implementation (measured 2026-11-27, commit 64c7f6f)
+
+Both implementations are compared on the same 8-frame HFG1-3 O dataset, same canvas
+(`--canvas-from` a Python product, 2228x2783):
+
+| metric | value | note |
+|---|---|---|
+| corr on finite pixels | 0.999846 | passes the >=0.999 bar |
+| star-core ratio (Rust/Python) | 0.99875 | 1 +/- 0.002 |
+| median abs diff after 4x4 binning | 0.04 x sky noise | per-pixel sampling-phase scatter only |
+| A/B median level ratio | 0.99735 | no global offset or scale bias |
+| pixel rejection rate | 1.16 % vs Python 0.51 % | **not aligned** |
+
+Why the rejection rate still differs: Python computes dev/anchor on the *output grid
+after per-frame drizzle* (frames already aligned and resampled); dwt-rs computes it on
+*native pixels* (frames still ~17 px apart). Closing this gap requires moving rejection
+into the droplet accumulation (per tap), which is a structural change and was
+deliberately not done - the difference is invisible in the product (0.04 x noise after
+4x4 binning), so the risk is not justified.
+
+Coverage footprint: dwr-rs leaves 52218 NaN pixels vs Python 52494; 276 pixels along the
+border have data in Rust but not in Python (Rust covers *more*), 3 the other way.
+
+The quad-table (_QUAD_NBIN=96) sub-pixel LUT of the Python drizzle is still not
+replicated; residual in star cores is <=0.2 % after the drop-size fix.
