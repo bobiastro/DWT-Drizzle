@@ -155,15 +155,15 @@ impl Default for Args {
             geom: None,
             fixed_probe: false,
             per_frame_stars: false,
-            fwhm_search: 8,
+            fwhm_search: 0, // Python: core/pws.py `fwhm_search` 默认 0（不做搜索）
             report: false,
-            gpu: "off".into(),
+            gpu: "auto".into(), // Python: `gpu` 默认 auto（本仓库 GPU 分支仅在 available() 时启用）
             jobs: 0,
             cfa: "off".into(),
             cfa_debayer: "bilinear".into(),
             cfa_weights: "auto".into(),
             cfa_align: "auto".into(),
-            cfa_raw: "off".into(),
+            cfa_raw: "auto".into(), // Python: `cfa_raw` 默认 auto
             cfa_ref: None,
             cfa_grid: Some("shared".into()),
             cfa_drizzle: false,
