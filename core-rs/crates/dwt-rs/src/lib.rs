@@ -13,6 +13,7 @@ pub mod gpu;
 #[path = "gpu_stub.rs"]
 pub mod gpu;
 pub mod image;
+pub mod lsp;
 pub mod register;
 pub mod rfield;
 pub mod stack;

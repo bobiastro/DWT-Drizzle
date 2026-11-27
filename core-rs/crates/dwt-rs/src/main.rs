@@ -209,7 +209,7 @@ fn parse_args() -> Result<Args, String> {
                 a.register = Some(if has_val() { num(val()?, flag)? != 0.0 } else { true });
                 i += if has_val() { 2 } else { 1 };
             }
-            "--canvas-from" => {
+            "--canvas-from" | "--frame" => {
                 a.canvas_from = Some(val()?.to_string());
                 i += 2;
             }
@@ -401,7 +401,12 @@ fn run() -> Result<(), String> {
     for f in &files {
         let (meta, img) = read_xisf(f)?;
         let kw = |k: &str| -> Option<String> {
-            meta.keywords.iter().find(|(n, _)| n == k).map(|(_, v)| v.trim_matches('\'').to_string())
+            // XISF writers pad string keyword values (e.g. "Light   "), so trim
+            // quotes *and* whitespace before matching on them.
+            meta.keywords
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.trim_matches('\'').trim().to_string())
         };
         let expt = kw("EXPTIME")
             .or_else(|| kw("EXPOSURE"))
@@ -533,7 +538,7 @@ fn run() -> Result<(), String> {
     // positions are then reused for every frame with a fixed window, so an
     // un-registered dither shows up as PSF blur -- we reproduce that on purpose
     // so the C weights can be compared like for like.
-    let probe = match a.ref_frame.or(a.seed_frame) {
+    let mut probe = match a.ref_frame.or(a.seed_frame) {
         Some(i) => i.min(frames.len() - 1),
         None => {
             let mut best = (0usize, 0usize);
@@ -616,6 +621,11 @@ fn run() -> Result<(), String> {
         ));
     }
     let mut sims: Vec<dwt_rs::register::Sim> = vec![dwt_rs::register::Sim::identity(); frames.len()];
+    // Which frames were actually anchored to the reference geometry.  A frame
+    // that cannot be solved is *excluded* from the stack rather than parked at a
+    // median offset: parking hundreds of blurred copies of the same field on top
+    // of the good frames washes out the fine structures the stack exists to keep.
+    let mut anchored: Vec<bool> = vec![true; frames.len()];
     let mut canvas_anchored = false;
     if register {
         let t = Instant::now();
@@ -630,17 +640,79 @@ fn run() -> Result<(), String> {
                 if refc.len() < 8 {
                     return Err("参考画布上找不到足够的星，无法把帧锚定到参考网格".to_string());
                 }
+                // The reference product may be a drizzle master whose pixel grid is
+                // finer than the input frames (a 2x `PWS_dwt-*` master, say).  Match
+                // in *frame* units, then scale the similarity up to canvas units —
+                // Python's `matchref.align` k / `_inv` composition in core/pws.py.
+                let ratio = if frames[0].w > 0 {
+                    cim.w as f32 / frames[0].w as f32
+                } else {
+                    1.0
+                };
+                let ratio = if ratio.is_finite() && ratio > 0.0 { ratio } else { 1.0 };
+                let refc: Vec<(f32, f32, f32)> =
+                    refc.iter().map(|&(x, y, a)| (x / ratio, y / ratio, a)).collect();
+                if (ratio - 1.0).abs() > 1e-6 {
+                    println!("[配准] 参考画布是帧的 {ratio:.3}× 网格，相似变换按此换算");
+                }
+                let mut placed: Vec<dwt_rs::register::Sim> = Vec::new();
                 for (i, f) in frames.iter().enumerate() {
                     let own = build_star_table(f, 400, 26, 25.0);
                     let c = dwt_rs::register::centroids(f, &own, 8);
-                    let s = dwt_rs::register::estimate(&refc, &c, 64.0).ok_or_else(|| {
-                        format!("帧{i} 无法与参考画布匹配，拒绝用错位的几何出图")
-                    })?;
+                    // The vote grid is integer pixels, so a faint frame occasionally
+                    // returns no inlier set at the nominal search radius; widen it
+                    // before giving up on the frame.
+                    // Nights of the same target can be offset by hundreds of pixels
+                    // (the reference product may be a mosaic from another night), so
+                    // the vote radius covers most of a frame; the vote is sparse, so a
+                    // wide radius costs no more than a narrow one.
+                    let wide = 0.75 * frames[0].w.max(frames[0].h) as f32;
+                    let mut got = None;
+                    for ms in [wide, 0.5 * wide] {
+                        if let Some(s) = dwt_rs::register::estimate(&refc, &c, ms) {
+                            got = Some(s);
+                            break;
+                        }
+                    }
+                    // A similarity supported by only a handful of star pairs is a
+                    // false peak.  Refusing it is what keeps junk placements out of
+                    // the stack: the reference matcher needs a comparable inlier set,
+                    // and a frame that cannot earn one has no honest place here.
+                    let got = got.filter(|s| s.rms <= 1.5 && s.n >= 12);
+                    let s = match got {
+                        Some(s) => dwt_rs::register::Sim {
+                            ux: s.ux * ratio,
+                            uy: s.uy * ratio,
+                            theta: s.theta,
+                            k: s.k * ratio,
+                            rms: s.rms * ratio,
+                            n: s.n,
+                        },
+                        None => {
+                            if placed.is_empty() {
+                                return Err(format!(
+                                    "帧{i} 无法与参考画布匹配（星点 {}），且此前没有可用的解，拒绝用错位的几何出图",
+                                    c.len()
+                                ));
+                            }
+                            // Leave it out of the stack: a frame whose star field is
+                            // not on the reference grid cannot be placed honestly, and
+                            // Python's bad placements land off-canvas for the same
+                            // reason — they contribute nothing either way.
+                            anchored[i] = false;
+                            println!(
+                                "[配准] 帧{i} 无法与参考画布匹配（星点 {}），排除出叠加",
+                                c.len()
+                            );
+                            dwt_rs::register::Sim::identity()
+                        }
+                    };
                     println!(
                         "[配准] 帧{i} →画布  dx={:+.2} dy={:+.2} rot={:+.3}deg k={:.5} 匹配{} rms={:.2}px",
                         s.ux, s.uy, s.theta, s.k, s.n, s.rms
                     );
                     sims[i] = s;
+                    placed.push(s);
                 }
                 canvas_anchored = true;
                 println!(
@@ -714,6 +786,27 @@ fn run() -> Result<(), String> {
             sims[i] = dwt_rs::register::Sim { ux: -dx, uy: -dy, theta: th, k, rms: 0.0, n: 0 };
         }
         println!("[配准] 使用外部解（--geom {p}）");
+    }
+
+    // Drop the frames that could not be anchored (see `anchored` above) so every
+    // per-frame vector stays index-parallel.
+    let drop_n = anchored.iter().filter(|v| !**v).count();
+    if drop_n > 0 {
+        let keep: Vec<usize> = (0..frames.len()).filter(|&i| anchored[i]).collect();
+        if keep.is_empty() {
+            return Err("没有一帧能锚定到参考画布，拒绝出图".to_string());
+        }
+        let mut src: Vec<Option<Img>> = std::mem::take(&mut frames).into_iter().map(Some).collect();
+        frames = keep.iter().map(|&i| src[i].take().expect("frame taken twice")).collect();
+        sims = keep.iter().map(|&i| sims[i]).collect();
+        fwhms = keep.iter().map(|&i| fwhms[i]).collect();
+        sigmas = keep.iter().map(|&i| sigmas[i]).collect();
+        let _ = &skies;
+        probe = keep.iter().position(|&i| i == probe).unwrap_or(0);
+        println!(
+            "[配准] 排除 {drop_n} 帧无法锚定的帧（不参与叠加），参与叠加 {} 帧",
+            frames.len()
+        );
     }
 
     // Python builds the reference from the k *sharpest* frames only
@@ -910,6 +1003,9 @@ fn run() -> Result<(), String> {
     // For the plain weighted-mean case the canvas is identity (margin 0), so the
     // GPU gather reproduces `stack_strip` pixel for pixel.
     let margin = if drz { 1.0 } else { 0.0 };
+    // LSPR needs the exact canvas→frame placement of every frame; keep the plan
+    // the accumulator used (None = pre-aligned frames on their own grid).
+    let mut lsp_plan: Option<Plan> = None;
     if register && a.gpu != "off" {
         println!("[GPU] 配准路径走 CPU（wgpu kernel 目前只支持平移）");
     }
@@ -918,6 +1014,7 @@ fn run() -> Result<(), String> {
         let dy = vec![0.0f32; frames.len()];
         let scale = if drz { a.dscale } else { 1.0 };
         let plan = Plan::new(w, h, &dx, &dy, scale, margin);
+        lsp_plan = Some(plan);
         let gpu_in = dwt_rs::gpu::GpuInput {
             frames: &frames,
             r: &rfield,
@@ -1016,6 +1113,7 @@ fn run() -> Result<(), String> {
                 println!("[画布] 输出网格 = 参考 {}x{}（原点对齐参考像素）", cw, ch);
             }
         }
+        lsp_plan = Some(plan);
         let mut acc = Acc::new(plan);
         // core/drizzle.py:1867 -- the rotating branch passes
         // `Pi = pixfrac * s * kk * _pm` with `_pm` defaulting to 2.0 (a 2x drop
@@ -1059,6 +1157,40 @@ fn run() -> Result<(), String> {
     // ---- export -----------------------------------------------------------
     let scale_out = (t_med / EXPTIME_REF) as f32;
     let mut image = stk;
+    // LSPR runs on the *material* stack (before the exposure re-multiply), so
+    // the per-frame sigma it compares against has the same units.
+    if std::env::var("DWT_LSPR").map(|v| v.trim() != "0").unwrap_or(true) {
+        let t_l = Instant::now();
+        let sf = median_of(&sigmas) as f64;
+        // The frame-domain gate needs the exact canvas→frame affine of every
+        // frame; only the registered/drizzled path has one (Python likewise
+        // only builds a sampler when `n > 1` frames are placed on a canvas).
+        let maps: Option<Vec<dwt_rs::lsp::Map>> = match (register, lsp_plan) {
+            (true, Some(pl)) if frames.len() > 1 => Some(
+                sims.iter()
+                    .map(|s| {
+                        dwt_rs::lsp::Map::from_sim(pl.s as f64, pl.ox as f64, pl.oy as f64, s)
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        };
+        let (nl, npx) = dwt_rs::lsp::process_auto(
+            &mut image,
+            None,
+            maps.as_ref().map(|_| frames.as_slice()),
+            maps.as_deref(),
+            Some(sf),
+        );
+        let npix = (image.w * image.h) as f64;
+        println!(
+            "[LSPR] 结构排异：检出并扣除 {} 条细长结构，改动 {} 像素（{:.3}%），用时 {:.2}s",
+            nl,
+            npx,
+            if npix > 0.0 { 100.0 * npx as f64 / npix } else { 0.0 },
+            t_l.elapsed().as_secs_f32()
+        );
+    }
     if (scale_out - 1.0).abs() > 1e-9 {
         for v in &mut image.d {
             *v *= scale_out;

@@ -9,7 +9,6 @@
 //! cheaper.
 
 use crate::image::{median_of, Img};
-use std::collections::HashMap;
 
 /// A similarity transform taking frame pixel coordinates to the reference frame:
 /// `q = k*R(theta)*p + u`.
@@ -227,41 +226,164 @@ fn match_pairs(refc: &[(f32, f32, f32)], movc: &[(f32, f32, f32)], sim: &Sim, to
     pairs
 }
 
+/// Vote for the most common shift after rotating `mov` by `theta`, with no
+/// search window: the vote table is a sparse map, so a radius of thousands of
+/// pixels costs the same as a small one.  Python's `matchref.align` is
+/// translation-free (length-spectrum matching); later nights of the same target
+/// are often offset by far more than a dithered frame, and a bounded vote would
+/// silently fall back to a bogus placement.
+fn vote_all(
+    refc: &[(f32, f32, f32)],
+    movc: &[(f32, f32, f32)],
+    theta: f32,
+    k: f32,
+    quant: f32,
+    max_shift: f32,
+) -> (u32, f32, f32) {
+    use std::collections::HashMap;
+    let nr = refc.len().min(40);
+    let nm = movc.len().min(28);
+    let (ct, st) = (theta.to_radians().cos(), theta.to_radians().sin());
+    let mut votes: HashMap<(i32, i32), u32> = HashMap::with_capacity(nr * nm);
+    for mv in movc.iter().take(nm) {
+        let mx = k * (ct * mv.0 - st * mv.1);
+        let my = k * (st * mv.0 + ct * mv.1);
+        for r in refc.iter().take(nr) {
+            let dx = r.0 - mx;
+            let dy = r.1 - my;
+            if dx.abs() > max_shift || dy.abs() > max_shift {
+                continue;
+            }
+            let key = ((dx / quant).round() as i32, (dy / quant).round() as i32);
+            *votes.entry(key).or_insert(0) += 1;
+        }
+    }
+    // Score each bin by the votes in its 3x3 neighbourhood: when the assumed
+    // angle or scale is a fraction of a step off, the true peak smears over the
+    // neighbouring bins, and ranking single bins lets a random spike win.
+    let mut best: Option<(u32, f32, f32)> = None;
+    for (&(ix, iy), _) in votes.iter() {
+        let (mut sum, mut wx, mut wy) = (0u32, 0.0f32, 0.0f32);
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if let Some(m) = votes.get(&(ix + dx, iy + dy)) {
+                    sum += *m;
+                    wx += (ix + dx) as f32 * *m as f32;
+                    wy += (iy + dy) as f32 * *m as f32;
+                }
+            }
+        }
+        if sum == 0 {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((bs, _, _)) => sum > bs,
+        };
+        if better {
+            best = Some((sum, wx / sum as f32 * quant, wy / sum as f32 * quant));
+        }
+    }
+    best.unwrap_or((0, 0.0, 0.0))
+}
+
+
+/// Refine a coarse hypothesis: the vote lands within a few pixels and a percent
+/// or so of scale, so the first match radius is deliberately wide and shrinks
+/// as the fit improves.
+fn refine_sim_wide(refc: &[(f32, f32, f32)], movc: &[(f32, f32, f32)], sim0: Sim) -> Option<Sim> {
+    let mut sim = sim0;
+    let mut fitted = false;
+    for tol in [20.0f32, 12.0, 8.0, 5.0, 3.0, 2.0, 1.5] {
+        let pairs = match_pairs(refc, movc, &sim, tol);
+        if pairs.len() < 6 {
+            continue;
+        }
+        let p: Vec<(f32, f32)> = pairs.iter().map(|&(i, _)| (movc[i].0, movc[i].1)).collect();
+        let q: Vec<(f32, f32)> = pairs.iter().map(|&(_, j)| (refc[j].0, refc[j].1)).collect();
+        if let Some(s) = fit_sim(&p, &q) {
+            sim = s;
+            fitted = true;
+        }
+    }
+    if fitted && sim.n >= 6 { Some(sim) } else { None }
+}
+
+/// Sweep rotation (and the given pixel scales) with a sparse translation vote,
+/// then refine the strongest hypotheses into a similarity.
+fn grid_search(
+    refc: &[(f32, f32, f32)],
+    movc: &[(f32, f32, f32)],
+    scales: &[f32],
+    tstep: f32,
+    tmax: f32,
+    max_shift: f32,
+) -> Option<Sim> {
+    let mut coarse: Vec<(u32, f32, f32, f32, f32)> = Vec::new();
+    for &k0 in scales {
+        let mut t = -tmax;
+        while t <= tmax + 0.001 {
+            let (v, dx, dy) = vote_all(refc, movc, t, k0, 4.0, max_shift);
+            coarse.push((v, t, k0, dx, dy));
+            t += tstep;
+        }
+    }
+    coarse.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
+    let mut best: Option<Sim> = None;
+    for &(v, theta, k0, sx, sy) in coarse.iter().take(40) {
+        if v < 2 {
+            break;
+        }
+        let sim0 = Sim { ux: sx, uy: sy, theta, k: k0, rms: 0.0, n: 0 };
+        let Some(sim) = refine_sim_wide(refc, movc, sim0) else { continue };
+        let better = match best {
+            None => true,
+            Some(b) => sim.n > b.n || (sim.n == b.n && sim.rms < b.rms),
+        };
+        if better {
+            best = Some(sim);
+        }
+    }
+    best
+}
+
 /// Estimate the transform of `mov` relative to `ref` (both are centroid lists).
-/// `max_shift` bounds the translation search; `tol` is the match radius.
+///
+/// `max_shift` bounds the translation search.  A single translation vote only
+/// survives a *sub-0.1 deg* rotation, so the vote is repeated over a rotation
+/// grid before a similarity fit refines `theta`, `k` and the shift.  Frames
+/// from another night can also differ in pixel scale by a percent or two
+/// (focus, reducer, binning), and a scale-blind vote finds *nothing at all*
+/// there — Python's triangle matcher searches scale for the same reason, so a
+/// second grid over k in 0.96..1.04 is tried whenever the k=1 grid is weak.
 pub fn estimate(refc: &[(f32, f32, f32)], movc: &[(f32, f32, f32)], max_shift: f32) -> Option<Sim> {
     if refc.len() < 8 || movc.len() < 8 {
         return None;
     }
-    let nr = refc.len().min(80);
-    let nm = movc.len().min(60);
-    let mut votes: HashMap<(i32, i32), u32> = HashMap::new();
-    for m in movc.iter().take(nm) {
-        for r in refc.iter().take(nr) {
-            let dx = r.0 - m.0;
-            let dy = r.1 - m.1;
-            if dx.abs() > max_shift || dy.abs() > max_shift {
-                continue;
-            }
-            *votes.entry((dx.round() as i32, dy.round() as i32)).or_insert(0) += 1;
+    // Fast path: frames from the same night share the pixel scale exactly, and
+    // the field rotation of one run is a fraction of a degree.
+    let same = grid_search(refc, movc, &[1.0], 1.0, 12.0, max_shift);
+    if let Some(s) = same {
+        if s.rms <= 1.2 && s.n >= 40 {
+            return Some(s);
         }
     }
-    let (&(bx, by), &bv) = votes.iter().max_by_key(|(_, v)| **v)?;
-    if bv < 3 {
-        return None;
-    }
-    let mut sim = Sim { ux: bx as f32, uy: by as f32, theta: 0.0, k: 1.0, rms: 0.0, n: 0 };
-    // two rounds: match -> fit -> rematch with the refined model
-    for _ in 0..2 {
-        let pairs = match_pairs(refc, movc, &sim, 2.5);
-        if pairs.len() < 6 {
-            return None;
+    // Another night can change the pixel scale (a re-focused or re-binned run,
+    // a drizzle master on a finer grid) and the field rotation, so the fallback
+    // sweeps the scale family and keeps every hypothesis worth refining.
+    let scales: Vec<f32> = (0..7).map(|i| 0.98 + 0.01 * i as f32).collect();
+    let wide = grid_search(refc, movc, &scales, 2.0, 12.0, max_shift);
+    let mut best = same;
+    if let Some(b) = wide {
+        let better = match best {
+            None => true,
+            Some(a) => b.n > a.n || (b.n == a.n && b.rms < a.rms),
+        };
+        if better {
+            best = Some(b);
         }
-        let p: Vec<(f32, f32)> = pairs.iter().map(|&(i, _)| (movc[i].0, movc[i].1)).collect();
-        let q: Vec<(f32, f32)> = pairs.iter().map(|&(_, j)| (refc[j].0, refc[j].1)).collect();
-        sim = fit_sim(&p, &q)?;
     }
-    Some(sim)
+    best
 }
 
 #[cfg(test)]
@@ -290,6 +412,65 @@ mod tests {
         assert!((s.k - k).abs() < 1e-4);
         assert!((s.theta - 0.12).abs() < 5e-3, "theta {}", s.theta);
         assert!(s.rms < 0.01);
+    }
+
+    /// A mosaic from another night can be rotated by several degrees; the
+    /// single-translation vote alone cannot find that, the rotation sweep must.
+    #[test]
+    fn recovers_seven_degree_rotation() {
+        let mut mov = Vec::new();
+        let mut rf = Vec::new();
+        let (k, th) = (1.0f32, 7.1f32.to_radians());
+        let (ux, uy) = (-41.0f32, 31.0f32);
+        for i in 0..60 {
+            let x = 200.0 + (i as f32 * 131.0) % 2200.0;
+            let y = 150.0 + (i as f32 * 197.0) % 1700.0;
+            mov.push((x, y, 1.0));
+            rf.push((
+                k * (th.cos() * x - th.sin() * y) + ux,
+                k * (th.sin() * x + th.cos() * y) + uy,
+                1.0,
+            ));
+        }
+        let s = estimate(&rf, &mov, 64.0).expect("fit");
+        assert!((s.theta - 7.1).abs() < 0.05, "theta {}", s.theta);
+        assert!((s.ux - ux).abs() < 0.05, "ux {}", s.ux);
+        assert!((s.uy - uy).abs() < 0.05, "uy {}", s.uy);
+        assert!((s.k - 1.0).abs() < 1e-3, "k {}", s.k);
+        assert!(s.rms < 0.05, "rms {}", s.rms);
+    }
+
+    /// A frame from another night can sit hundreds of pixels away from the
+    /// reference pointing; a bounded translation vote returns a spurious peak
+    /// there, so the coarse vote must be sparse/unbounded.
+    #[test]
+    fn recovers_large_offset_and_rotation() {
+        let mut mov = Vec::new();
+        let mut rf = Vec::new();
+        let (k, th) = (1.0003f32, 2.4f32.to_radians());
+        let (ux, uy) = (520.0f32, -340.0f32);
+        // A lattice would alias onto itself under a one-star shift, so draw the
+        // synthetic field from an LCG — real star fields are not periodic.
+        let mut seed = 12345u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 8) as f32) / 16777216.0
+        };
+        for _ in 0..60 {
+            let x = 100.0 + rnd() * 2500.0;
+            let y = 80.0 + rnd() * 2000.0;
+            mov.push((x, y, 1.0));
+            rf.push((
+                k * (th.cos() * x - th.sin() * y) + ux,
+                k * (th.sin() * x + th.cos() * y) + uy,
+                1.0,
+            ));
+        }
+        let s = estimate(&rf, &mov, 1650.0).expect("fit");
+        assert!((s.theta - 2.4).abs() < 0.05, "theta {}", s.theta);
+        assert!((s.ux - ux).abs() < 0.2, "ux {} vs {}", s.ux, ux);
+        assert!((s.uy - uy).abs() < 0.2, "uy {} vs {}", s.uy, uy);
+        assert!((s.k - k).abs() < 2e-3, "k {}", s.k);
     }
 }
 
