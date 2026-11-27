@@ -722,9 +722,31 @@ fn run() -> Result<(), String> {
     let kref = 8.min(frames.len());
     let mut order: Vec<usize> = (0..frames.len()).collect();
     order.sort_by(|&i, &j| fwhms[i].partial_cmp(&fwhms[j]).unwrap_or(std::cmp::Ordering::Equal));
-    let refs: Vec<&Img> = order[..kref].iter().map(|&i| &frames[i]).collect();
-    let sref = stack_median(&refs);
-    println!("[R] 参考像 = 最锐 {kref} 帧等权中位");
+    let ref_idx: Vec<usize> = order[..kref].to_vec();
+    // Python builds this reference on the *output* grid from frames placed at
+    // their own offsets (`drizzle.py:_sharp_ref_shift`): roll each sharpest frame
+    // by its integer shift, median, then one bilinear resample onto the canvas.
+    // A plain median of the raw frames smears the dithered PSF cores, and the R
+    // envelope then measures sharpness on a blur that is not in the data.
+    let plan_r = if let (Some((cw, ch)), None) = (canvas, a.geom.as_ref()) {
+        Plan { s: 1.0, ox: 0.0, oy: 0.0, w: cw, h: ch }
+    } else if register || a.geom.is_some() {
+        Plan::new_sim(w, h, &sims, a.dscale, 1.0, canvas)
+    } else {
+        Plan { s: 1.0, ox: 0.0, oy: 0.0, w, h }
+    };
+    let tmax = sims.iter().map(|s| s.theta.abs()).fold(0.0f32, f32::max);
+    let kmax = sims.iter().map(|s| (s.k - 1.0).abs()).fold(0.0f32, f32::max);
+    let (sref, sigma_meas) = if tmax < 0.5 && kmax < 0.005 {
+        sharp_ref(&frames, &ref_idx, &sims, &plan_r, &stars, probe)
+    } else {
+        let refs: Vec<&Img> = ref_idx.iter().map(|&i| &frames[i]).collect();
+        (stack_median(&refs), None)
+    };
+    println!(
+        "[R] 参考像 = 最锐 {kref} 帧等权中位（{}）",
+        if sigma_meas.is_none() { "原帧中位" } else { "按位移回卷 + 画布重采样" }
+    );
 
     let finite: Vec<f32> = fwhms.iter().copied().filter(|v| v.is_finite() && *v > 0.5 && *v < 40.0).collect();
     let mut fmed = if finite.is_empty() { 1.0 } else { median_of(&finite) };
@@ -810,7 +832,21 @@ fn run() -> Result<(), String> {
 
     // ---- R support field --------------------------------------------------
     let t = Instant::now();
-    let (rfield, rinfo) = build_r_field(&sref, sigma_psf, a.r_floor, 2.0, 16.0, 1.0, star_grow, R_DEC, a.dump_r.as_ref().map(std::path::Path::new));
+    // Python measures the reference's own PSF on the output grid and gives *that*
+    // width to the R field (`core/pws.py`: 参考像自量 → σ_psf); a drizzled k-frame
+    // median is wider than a single frame, so the per-frame median under-estimates
+    // the support halo.  Fall back to the frame median when the fit fails.
+    let sigma_ref = match sigma_meas {
+        Some(v) if v.is_finite() && v > 0.05 => v,
+        _ => sigma_psf,
+    };
+    println!(
+        "[R] 参考像自量 FWHM {:.2}px（输出网格）→ R 场 σ_psf {:.2}px（中位帧折算 {:.2}px）",
+        sigma_ref * 2.3548,
+        sigma_ref,
+        sigma_psf
+    );
+    let (rfield, rinfo) = build_r_field(&sref, sigma_ref, a.r_floor, 2.0, 16.0, 1.0, star_grow, R_DEC, a.dump_r.as_ref().map(std::path::Path::new));
     if let Some(dir) = &a.dump_r {
         let _ = std::fs::create_dir_all(dir);
         let _ = dwt_rs::xisf::write_npy_f32(&std::path::Path::new(dir).join("r.npy"), &rfield.d, rfield.h, rfield.w);
@@ -929,8 +965,17 @@ fn run() -> Result<(), String> {
     let (stk, neff, rej_rate) = if let Some((img, nf)) = gpu_out {
         (img, nf, f32::NAN)
     } else if drz {
+        // Python's drizzle path rejects with plain sigma-clip + detail allowance
+        // (core/drizzle.py:1938-1982): no sky branch, no one-sided exemption.
         let rate = dwt_rs::stack::reject(
-            &frames, &mut wts, Some(&rfield), sky0, a.rej_k, REJ_GATE, Some(&sigmas),
+            &frames,
+            &mut wts,
+            Some(&rfield),
+            sky0,
+            a.rej_k,
+            REJ_GATE,
+            Some(&sigmas),
+            true,
         );
         let dx = vec![0.0f32; frames.len()];
         let dy = vec![0.0f32; frames.len()];
@@ -1079,6 +1124,89 @@ fn out_stem(tag: &str, fname: Option<&str>) -> String {
         }
     }
     parts.join("_")
+}
+
+/// Python's R reference (`drizzle.py:_sharp_ref_shift`): the k sharpest frames
+/// are rolled by their integer shift, median-combined, and resampled once onto
+/// the output canvas.  Building it from the raw frames instead (no roll, no
+/// resample) smears the dithered PSF cores, so the envelope measured a blur that
+/// is not in the data.
+///
+/// Python then measures that reference's own FWHM on the output grid and hands
+/// the width to the R field (`core/pws.py: 参考像自量`).  The measurement lives
+/// here because the projected star positions are already available.
+///
+/// Returns the reference on the canvas plus its measured width (σ in canvas
+/// pixels), or `None` when the PSF fit fails.
+fn sharp_ref(
+    frames: &[Img],
+    idx: &[usize],
+    sims: &[dwt_rs::register::Sim],
+    plan: &Plan,
+    stars: &[(usize, usize)],
+    probe: usize,
+) -> (Img, Option<f32>) {
+    let (h, w) = (frames[0].h, frames[0].w);
+    let n = idx.len().max(1);
+    let sx: Vec<i64> = idx.iter().map(|&i| sims[i].ux.round() as i64).collect();
+    let sy: Vec<i64> = idx.iter().map(|&i| sims[i].uy.round() as i64).collect();
+    let mut med = Img::new(w, h);
+    let mut rowbuf = vec![0.0f32; n * w];
+    let mut col = vec![0.0f32; n];
+    for y in 0..h {
+        for (q, &i) in idx.iter().enumerate() {
+            let yy = (y as i64 - sy[q]).rem_euclid(h as i64) as usize;
+            let src = &frames[i].d[yy * w..yy * w + w];
+            let dst = &mut rowbuf[q * w..(q + 1) * w];
+            for (x, d) in dst.iter_mut().enumerate() {
+                *d = src[(x as i64 - sx[q]).rem_euclid(w as i64) as usize];
+            }
+        }
+        for x in 0..w {
+            for (q, c) in col.iter_mut().enumerate() {
+                *c = rowbuf[q * w + x];
+            }
+            med.d[y * w + x] = median_of(&col);
+        }
+    }
+    let sample = |coord: f32, n: usize| -> (usize, usize, f32) {
+        let c = coord.max(0.0).min((n - 1) as f32);
+        let i0 = c.floor() as usize;
+        (i0, (i0 + 1).min(n - 1), c - i0 as f32)
+    };
+    let mut out = Img::new(plan.w, plan.h);
+    for y in 0..plan.h {
+        let yy = (y as f32 + 0.5 - plan.oy) / plan.s - 0.5;
+        let (y0, y1, ty) = sample(yy, h);
+        for x in 0..plan.w {
+            let xx = (x as f32 + 0.5 - plan.ox) / plan.s - 0.5;
+            let (x0, x1, tx) = sample(xx, w);
+            let a = med.at(y0, x0) * (1.0 - tx) + med.at(y0, x1) * tx;
+            let b = med.at(y1, x0) * (1.0 - tx) + med.at(y1, x1) * tx;
+            out.set(y, x, a * (1.0 - ty) + b * ty);
+        }
+    }
+    // Python measures the reference's own FWHM (`core/pws.py: 参考像自量`) and
+    // hands *that* width to the R field: the median of the k sharpest frames is
+    // sharper than the frame median, and the frame median would widen the
+    // envelope by ~1.6x.  The projected star positions are only integer-accurate
+    // here, so recentre by up to +-2 px inside the fixed-centre fit -- a
+    // mis-centred fit inflates sigma (3 px reads as 7 px).
+    let s = sims[probe];
+    let th = s.theta.to_radians();
+    let (ct, st) = (th.cos(), th.sin());
+    let pts: Vec<(usize, usize)> = stars
+        .iter()
+        .map(|&(x, y)| {
+            let (xf, yf) = (x as f32 + 0.5, y as f32 + 0.5);
+            let cx = plan.s * (s.k * (ct * xf - st * yf) + s.ux) + plan.ox;
+            let cy = plan.s * (s.k * (st * xf + ct * yf) + s.uy) + plan.oy;
+            (cx.floor().max(0.0) as usize, cy.floor().max(0.0) as usize)
+        })
+        .collect();
+    let fw = dwt_rs::detect::measure_fwhm_search(&out, &pts, 16, 2);
+    let sigma = if fw.is_finite() && fw > 0.5 { Some(fw / 2.3548) } else { None };
+    (out, sigma)
 }
 
 fn median_strided(img: &Img, step: usize) -> f32 {

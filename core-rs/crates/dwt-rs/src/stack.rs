@@ -66,6 +66,13 @@ pub struct StackResult {
 }
 
 /// Zero out rejected weights in place. Returns the fraction of dropped samples.
+///
+/// `drizzle_style` selects the rule the Python drizzle path uses
+/// (`core/drizzle.py:1938-1982`): plain sigma-clip + detail allowance, with no
+/// sky-region one-sided test and no one-sided exemption (those belong to the
+/// `stack_strip` path that Python's non-drizzle branch runs).  The drizzle path
+/// also rescues pixels whose every sample was flagged by keeping the sample that
+/// deviates least from the anchor, instead of dropping all of them.
 pub fn reject(
     d: &[Img],
     wts: &mut [Img],
@@ -74,6 +81,7 @@ pub fn reject(
     rej_k: f32,
     rej_max_frac: f32,
     frame_sig: Option<&[f32]>,
+    drizzle_style: bool,
 ) -> f32 {
     let n = d.len();
     let h = d[0].h;
@@ -130,9 +138,13 @@ pub fn reject(
         let limit = (rej_max_frac * n as f32).max(1.0);
 
         // sky-region one-sided rejection (R < 0.1), computed per pixel over frames
-        let sky_mask: Vec<bool> = match r {
-            Some(rr) => (0..npx).map(|p| rr.d[p] < 0.1).collect(),
-            None => vec![false; npx],
+        let sky_mask: Vec<bool> = if drizzle_style {
+            vec![false; npx]
+        } else {
+            match r {
+                Some(rr) => (0..npx).map(|p| rr.d[p] < 0.1).collect(),
+                None => vec![false; npx],
+            }
         };
         let any_sky = sky_mask.iter().any(|v| *v);
         let mut sky_bad = vec![false; n * npx];
@@ -195,18 +207,39 @@ pub fn reject(
             let mut nbad = 0usize;
             let mut nhi = 0usize;
             for i in 0..n {
+                // python counts the upper-side outliers over *all* samples
+                // (`_hi = (dev > thr) & (D > anchor)`, pws.py:1903), not only the
+                // ones the mask already flags: in sky pixels the mask is
+                // overwritten by the one-sided sky test, so restricting the count
+                // to `bad` under-states `_nhi` there.
+                if dev[i * npx + p] > thr[i] && d[i].d[p] > anchor[p] {
+                    nhi += 1;
+                }
                 if bad[i] {
                     nbad += 1;
-                    if dev[i * npx + p] > thr[i] && d[i].d[p] > anchor[p] {
-                        nhi += 1;
-                    }
                 }
             }
             let nbadf = nbad as f32;
             let nhif = nhi as f32;
             let ok = nbadf - expected <= limit;
-            let one = (nbadf - nhif) <= 0.05 * n as f32 && (nhif - expected) <= 0.7 * n as f32;
+            // The one-sided exemption is a `stack_strip` rule; the drizzle path
+            // never applies it (core/drizzle.py:1972 only gates on the count).
+            let one = !drizzle_style
+                && (nbadf - nhif) <= 0.05 * n as f32
+                && (nhif - expected) <= 0.7 * n as f32;
             let keep = ok || one;
+            if keep && drizzle_style && nbad == n {
+                // Rescue: every frame flagged here, so keep the sample that
+                // deviates least from the anchor (core/drizzle.py:1976).
+                let mut best = 0usize;
+                for i in 1..n {
+                    if dev[i * npx + p] < dev[best * npx + p] {
+                        best = i;
+                    }
+                }
+                bad[best] = false;
+                nbad -= 1;
+            }
             nbad_total += if keep { nbad } else { 0 };
             for i in 0..n {
                 if bad[i] && keep {
@@ -229,7 +262,7 @@ pub fn stack_strip(
     rej_max_frac: f32,
     frame_sig: Option<&[f32]>,
 ) -> StackResult {
-    let rej_rate = reject(d, wts, r, sky, rej_k, rej_max_frac, frame_sig);
+    let rej_rate = reject(d, wts, r, sky, rej_k, rej_max_frac, frame_sig, false);
     let n = d.len();
     let h = d[0].h;
     let w = d[0].w;

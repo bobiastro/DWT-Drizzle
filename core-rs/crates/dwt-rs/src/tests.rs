@@ -89,7 +89,7 @@ fn reject_disabled() {
     let mut d: Vec<Img> = (0..n).map(|_| img(2, 2, 2.0)).collect();
     d[0].d[0] = 50.0;
     let mut w: Vec<Img> = (0..n).map(|_| img(2, 2, 1.0)).collect();
-    let rate = reject(&d, &mut w, None, 0.0, 0.0, 1.0 / 3.0, None);
+    let rate = reject(&d, &mut w, None, 0.0, 0.0, 1.0 / 3.0, None, false);
     assert_eq!(rate, 0.0);
     assert!(w.iter().all(|x| x.d[0] == 1.0));
 }
