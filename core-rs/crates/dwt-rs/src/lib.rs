@@ -5,6 +5,7 @@
 //! `--aligned 1` (already-registered frames) case.
 
 pub mod bggrad;
+pub mod cfa;
 pub mod detect;
 pub mod drizzle;
 #[cfg(feature = "gpu")]

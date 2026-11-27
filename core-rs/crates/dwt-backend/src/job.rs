@@ -7,11 +7,14 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use dwt_rs::bggrad;
+use dwt_rs::cfa;
 use dwt_rs::detect;
 use dwt_rs::drizzle::{self, Acc, Plan};
 use dwt_rs::image::{self, Img};
@@ -218,6 +221,15 @@ pub fn run_job_with_progress(
 ) -> Result<JobResult, String> {
     validate(cfg)?;
     let t0 = Instant::now();
+    // Colour / OSC runs share the exact numeric chain with the CLI.  Keeping a
+    // second copy of the whole registration+drizzle+CFA pipeline in this crate
+    // would be the classic place for the two front ends to drift apart, so the
+    // GUI hands the fully-populated JobConfig to `dwt-rs` and streams its log.
+    // The binary is built from the same workspace (`cargo build -p dwt-gui`
+    // places dwt-rs.exe beside dwt-gui.exe).
+    if needs_colour_pipeline(cfg)? {
+        return run_colour_job(cfg, log, progress, cancel, t0);
+    }
     let photos = PathBuf::from(&cfg.photos);
     let out_dir = PathBuf::from(&cfg.out);
     fs::create_dir_all(&out_dir).map_err(|e| format!("创建输出目录失败: {e}"))?;
@@ -681,6 +693,163 @@ pub fn run_job_with_progress(
         width: out_img.w,
         height: out_img.h,
         reject_rate: rej_rate,
+        elapsed_secs: t0.elapsed().as_secs_f32(),
+    })
+}
+
+/// True when the run needs the colour pipeline: either a Bayer/colour mode was
+/// selected, or the tree is already split into `__R` / `__G` / `__B` folders.
+fn needs_colour_pipeline(cfg: &JobConfig) -> Result<bool, String> {
+    let mode = cfg.cfa.trim().to_ascii_lowercase();
+    if !matches!(mode.as_str(), "" | "off" | "0" | "false") {
+        return Ok(true);
+    }
+    fn walk(dir: &Path, hit: &mut bool) -> std::io::Result<()> {
+        for e in fs::read_dir(dir)? {
+            let p = e?.path();
+            if p.is_dir() {
+                walk(&p, hit)?;
+            } else if *hit == false
+                && p.extension().and_then(|s| s.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("xisf"))
+                && cfa::channel_from_path(&p).is_some()
+            {
+                *hit = true;
+            }
+            if *hit {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+    let mut hit = false;
+    walk(Path::new(&cfg.photos), &mut hit).map_err(|e| format!("扫描素材失败: {e}"))?;
+    Ok(hit)
+}
+
+fn find_dwt_rs() -> Result<PathBuf, String> {
+    if let Ok(p) = std::env::var("DWT_RS_BIN") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    let mut cands = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            cands.push(dir.join("dwt-rs.exe"));
+            cands.push(dir.join("dwt-rs"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        for rel in ["target/release/dwt-rs.exe", "target/debug/dwt-rs.exe",
+                    "../target/release/dwt-rs.exe", "../target/debug/dwt-rs.exe"] {
+            cands.push(cwd.join(rel));
+        }
+    }
+    for p in cands {
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    Err("找不到 dwt-rs 可执行文件；请先 cargo build -p dwt-rs，或设置 DWT_RS_BIN".into())
+}
+
+fn run_colour_job(
+    cfg: &JobConfig,
+    log: impl Fn(&str),
+    progress: impl Fn(JobProgress),
+    cancel: &AtomicBool,
+    t0: Instant,
+) -> Result<JobResult, String> {
+    check_cancel(cancel)?;
+    let out_dir = PathBuf::from(&cfg.out);
+    fs::create_dir_all(&out_dir).map_err(|e| format!("创建输出目录失败: {e}"))?;
+    let exe = find_dwt_rs()?;
+    let tag = if cfg.tag.trim().is_empty() { "PWS" } else { cfg.tag.trim() };
+    let mut args: Vec<String> = vec![
+        "--photos".into(), cfg.photos.clone(),
+        "--out".into(), cfg.out.clone(),
+        "--tag".into(), tag.to_string(),
+        "--A".into(), cfg.a.to_string(),
+        "--B".into(), cfg.b.to_string(),
+        "--rej-k".into(), cfg.rej_k.to_string(),
+        "--bgdeg".into(), cfg.bgdeg.to_string(),
+        "--aligned".into(), if cfg.aligned { "1".into() } else { "0".into() },
+        "--cfa".into(), if cfg.cfa.trim().is_empty() { "off".into() } else { cfg.cfa.clone() },
+        "--cfa-debayer".into(), cfg.cfa_debayer.clone(),
+        "--cfa-weights".into(), cfg.cfa_weights.clone(),
+        "--cfa-align".into(), cfg.cfa_align.clone(),
+        "--cfa-raw".into(), cfg.cfa_raw.clone(),
+        "--rgb-balance".into(), cfg.rgb_balance.clone(),
+    ];
+    if cfg.limit > 0 { args.push("--limit".into()); args.push(cfg.limit.to_string()); }
+    if cfg.crop > 0 { args.push("--crop".into()); args.push(cfg.crop.to_string()); }
+    if !cfg.center.trim().is_empty() { args.push("--center".into()); args.push(cfg.center.clone()); }
+    if !cfg.pick.trim().is_empty() { args.push("--pick".into()); args.push(cfg.pick.clone()); }
+    if cfg.drizzle { args.push("--drizzle".into()); }
+    args.push("--drizzle-scale".into()); args.push(cfg.drizzle_scale.to_string());
+    args.push("--drizzle-pix".into()); args.push(cfg.drizzle_pix.to_string());
+    if !cfg.cfa_ref.trim().is_empty() { args.push("--cfa-ref".into()); args.push(cfg.cfa_ref.clone()); }
+    if !cfg.cfa_grid.trim().is_empty() { args.push("--cfa-grid".into()); args.push(cfg.cfa_grid.clone()); }
+    if cfg.cfa_drizzle { args.push("--cfa-drizzle".into()); }
+    args.push("--cfa-drizzle-scale".into()); args.push(cfg.cfa_drizzle_scale.to_string());
+    if cfg.match_scale { args.push("--match-scale".into()); }
+    if !cfg.frame.trim().is_empty() { args.push("--frame".into()); args.push(cfg.frame.clone()); }
+    if cfg.jobs > 0 { args.push("--jobs".into()); args.push(cfg.jobs.to_string()); }
+    if !cfg.gpu.trim().is_empty() && cfg.gpu.trim().to_ascii_lowercase() != "auto" {
+        args.push("--gpu".into()); args.push(cfg.gpu.clone());
+    }
+    let _ = cfg.ref_k;
+    let _ = cfg.c_star;
+
+    log(&format!("[GUI] 彩机/分通道流程，调用 {}", exe.display()));
+    log(&format!("[GUI] 参数：{}", args.join(" ")));
+    progress(JobProgress { stage: "彩机通道叠加".into(), current: 1, total: 2 });
+    let mut child = Command::new(&exe)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("启动 dwt-rs 失败: {e}"))?;
+    if let Some(stdout) = child.stdout.take() {
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => log(&line),
+                Err(_) => break,
+            }
+            if cancel.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                return Err("已取消".into());
+            }
+        }
+    }
+    let status = child.wait().map_err(|e| format!("等待 dwt-rs 失败: {e}"))?;
+    if !status.success() {
+        return Err(format!("dwt-rs 失败（{status}）"));
+    }
+    progress(JobProgress { stage: "彩机通道叠加".into(), current: 2, total: 2 });
+
+    let mono = out_dir.join(format!("PWS_{tag}.xisf"));
+    let rgb = out_dir.join(format!("PWS_{tag}_RGB.xisf"));
+    let image_path = if rgb.is_file() { rgb } else { mono };
+    let (w, h, frames) = if image_path.is_file() {
+        match dwt_rs::xisf::read_xisf_planes(&image_path) {
+            Ok((m, _)) => (m.width, m.height, 0),
+            Err(_) => (0, 0, 0),
+        }
+    } else {
+        (0, 0, 0)
+    };
+    log(&format!("[GUI] 完成：{}  {}×{}", image_path.display(), w, h));
+    Ok(JobResult {
+        image_path: image_path.to_string_lossy().into_owned(),
+        r_path: None,
+        neff_path: None,
+        weights_path: None,
+        frames,
+        width: w,
+        height: h,
+        reject_rate: f32::NAN,
         elapsed_secs: t0.elapsed().as_secs_f32(),
     })
 }

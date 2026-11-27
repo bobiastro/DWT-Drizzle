@@ -80,8 +80,8 @@ impl Plan {
         if std::env::var("DWT_RS_DEBUG").is_ok() {
             eprintln!("[dbg] bbox x[{xmin},{xmax}] y[{ymin},{ymax}]");
         }
-        let mut ox = (margin - xmin) * scale;
-        let mut oy = (margin - ymin) * scale;
+        let ox = (margin - xmin) * scale;
+        let oy = (margin - ymin) * scale;
         let ow = (((xmax - xmin + 2.0 * margin) * scale).ceil() as i64).max(1) as usize;
         let oh = (((ymax - ymin + 2.0 * margin) * scale).ceil() as i64).max(1) as usize;
         // NOTE: `canvas` is deliberately *not* used to resize the plan.  The
@@ -110,12 +110,25 @@ fn extrema(v: &[f32]) -> (f32, f32) {
 pub struct Acc {
     pub num: Vec<f32>, // sum w*d
     pub den: Vec<f32>, // sum w
+    /// Number of input frames whose drop touched each output pixel (Python's
+    /// `_ncov`; the CFA merge needs it to build the common coverage mask).
+    pub cov: Vec<f32>,
+    seen: Vec<u32>,
+    epoch: u32,
     pub plan: Plan,
 }
 
 impl Acc {
     pub fn new(plan: Plan) -> Self {
-        Self { num: vec![0.0; plan.w * plan.h], den: vec![0.0; plan.w * plan.h], plan }
+        let n = plan.w * plan.h;
+        Self {
+            num: vec![0.0; n],
+            den: vec![0.0; n],
+            cov: vec![0.0; n],
+            seen: vec![0; n],
+            epoch: 0,
+            plan,
+        }
     }
 
     /// Average accumulated flux; pixels with no coverage become NaN (like Python).
@@ -144,6 +157,43 @@ pub fn drizzle_add(
     pixfrac: f32,
     wmap: &[f32],
 ) {
+    scatter(acc, frame, ux, uy, theta_deg, k, pixfrac, wmap, None);
+}
+
+/// True-CFA drizzle: scatter only the mosaic samples that really belong to
+/// `ch` (no interpolation).  `mask[(y+oy)%2][(x+ox)%2]` selects them; `oy/ox`
+/// are the parity of the crop origin inside the original frame, so the phase
+/// survives `--crop`.
+pub fn drizzle_add_cfa(
+    acc: &mut Acc,
+    mosaic: &Img,
+    ux: f32,
+    uy: f32,
+    theta_deg: f32,
+    k: f32,
+    pixfrac: f32,
+    wmap: &[f32],
+    mask: &[[bool; 2]; 2],
+    oy: usize,
+    ox: usize,
+) {
+    scatter(acc, mosaic, ux, uy, theta_deg, k, pixfrac, wmap, Some((mask, oy, ox)));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scatter(
+    acc: &mut Acc,
+    frame: &Img,
+    ux: f32,
+    uy: f32,
+    theta_deg: f32,
+    k: f32,
+    pixfrac: f32,
+    wmap: &[f32],
+    cfa: Option<(&[[bool; 2]; 2], usize, usize)>,
+) {
+    acc.epoch = acc.epoch.wrapping_add(1);
+    let epoch = acc.epoch;
     let s = acc.plan.s;
     let fp = 0.5 * s * pixfrac; // half-side of the drop, in output pixels
     let th = theta_deg.to_radians();
@@ -157,6 +207,11 @@ pub fn drizzle_add(
             continue;
         }
         for x in 0..frame.w {
+            if let Some((mask, oy, ox)) = cfa {
+                if !mask[(y + oy) % 2][(x + ox) % 2] {
+                    continue;
+                }
+            }
             let xc = x as f32 + 0.5;
             let cx = s * (k * (ct * xc - st * yc) + ux) + acc.plan.ox;
             let cy = s * (k * (st * xc + ct * yc) + uy) + acc.plan.oy;
@@ -172,20 +227,24 @@ pub fn drizzle_add(
                 continue;
             }
             let v = frame.d[y * frame.w + x] * wt;
-            for oy in y0.max(0)..y1.min(oh) {
-                let wy = overlap(fp, oy as f32 + 0.5 - cy);
+            for oy_i in y0.max(0)..y1.min(oh) {
+                let wy = overlap(fp, oy_i as f32 + 0.5 - cy);
                 if wy <= 0.0 {
                     continue;
                 }
-                for ox in x0.max(0)..x1.min(ow) {
-                    let wx = overlap(fp, ox as f32 + 0.5 - cx);
+                for ox_i in x0.max(0)..x1.min(ow) {
+                    let wx = overlap(fp, ox_i as f32 + 0.5 - cx);
                     if wx <= 0.0 {
                         continue;
                     }
                     let a = wx * wy;
-                    let q = (oy * ow + ox) as usize;
+                    let q = (oy_i * ow + ox_i) as usize;
                     acc.num[q] += v * a;
                     acc.den[q] += a * wt;
+                    if acc.seen[q] != epoch {
+                        acc.seen[q] = epoch;
+                        acc.cov[q] += 1.0;
+                    }
                 }
             }
         }

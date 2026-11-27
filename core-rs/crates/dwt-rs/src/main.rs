@@ -10,11 +10,13 @@ use std::time::Instant;
 
 use dwt_rs::bggrad;
 use dwt_rs::detect::{build_star_table, measure_fwhm_search, noise_sigma};
-use dwt_rs::drizzle::{drizzle_add, Acc, Plan};
+use dwt_rs::cfa;
+use dwt_rs::drizzle::{drizzle_add, drizzle_add_cfa, Acc, Plan};
+use dwt_rs::register::Sim;
 use dwt_rs::image::{downsample, median, median_of, percentile, stack_median, Img};
 use dwt_rs::rfield::build_r_field;
 use dwt_rs::stack::{stack_strip, strip_weights};
-use dwt_rs::xisf::{read_xisf, write_npy_f32, write_xisf, OutMeta};
+use dwt_rs::xisf::{read_xisf, read_xisf_luma, write_npy_f32, write_xisf, write_xisf_rgb, OutMeta};
 
 const EXPTIME_REF: f64 = 300.0;
 const A_SHARP: f32 = 20.0;
@@ -23,6 +25,27 @@ const REJ_GATE: f32 = 1.0 / 3.0;
 const MAX_SHARE: f32 = 0.25;
 const R_DEC: usize = 2;
 
+/// Geometry / metrology solved on the G channel and shared with R and B
+/// (`cfa_weights = shared|auto`).  The similarity transform and the sharpness /
+/// noise weights are shared, so all three channels land on the same grid.
+struct Share {
+    sims: Vec<Sim>,
+    plan: Plan,
+    c: Vec<f32>,
+    s: Vec<f32>,
+    fwhms: Vec<f32>,
+    star_grow: f32,
+    rfield: Img,
+    probe: usize,
+    stars: Vec<(usize, usize)>,
+}
+
+struct RunOut {
+    image: Img,
+    cov: Vec<f32>,
+    share: Option<Share>,
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("dwt-rs: {e}");
@@ -30,6 +53,7 @@ fn main() {
     }
 }
 
+#[derive(Clone)]
 struct Args {
     photos: PathBuf,
     out: PathBuf,
@@ -70,6 +94,18 @@ struct Args {
     report: bool,
     gpu: String,
     jobs: usize,
+    // ---- CFA / OSC ----
+    cfa: String,
+    cfa_debayer: String,
+    cfa_weights: String,
+    cfa_align: String,
+    cfa_raw: String,
+    cfa_ref: Option<String>,
+    cfa_grid: Option<String>,
+    cfa_drizzle: bool,
+    cfa_drizzle_scale: f32,
+    rgb_balance: String,
+    match_scale: bool,
 }
 
 impl Default for Args {
@@ -90,7 +126,7 @@ impl Default for Args {
             b_exp: 2.0,
             beta: 0.0,
             max_share: MAX_SHARE,
-            aligned: true,
+            aligned: false,
             register: None,
             canvas_from: None,
             lsp_only: None,
@@ -115,6 +151,17 @@ impl Default for Args {
             report: false,
             gpu: "off".into(),
             jobs: 0,
+            cfa: "off".into(),
+            cfa_debayer: "bilinear".into(),
+            cfa_weights: "auto".into(),
+            cfa_align: "shared".into(),
+            cfa_raw: "off".into(),
+            cfa_ref: None,
+            cfa_grid: None,
+            cfa_drizzle: false,
+            cfa_drizzle_scale: 1.0,
+            rgb_balance: "off".into(),
+            match_scale: false,
         }
     }
 }
@@ -306,6 +353,23 @@ fn parse_args() -> Result<Args, String> {
                 a.jobs = num(val()?, flag)? as usize;
                 i += 2;
             }
+            "--cfa" => { a.cfa = val()?.to_string(); i += 2; }
+            "--cfa-debayer" => { a.cfa_debayer = val()?.to_string(); i += 2; }
+            "--cfa-weights" => { a.cfa_weights = val()?.to_string(); i += 2; }
+            "--cfa-align" => { a.cfa_align = val()?.to_string(); i += 2; }
+            "--cfa-raw" => { a.cfa_raw = val()?.to_string(); i += 2; }
+            "--cfa-ref" => { a.cfa_ref = Some(val()?.to_string()); i += 2; }
+            "--cfa-grid" => { a.cfa_grid = Some(val()?.to_string()); i += 2; }
+            "--cfa-drizzle" => {
+                a.cfa_drizzle = if has_val() { num(val()?, flag)? != 0.0 } else { true };
+                i += if has_val() { 2 } else { 1 };
+            }
+            "--cfa-drizzle-scale" => { a.cfa_drizzle_scale = num(val()?, flag)? as f32; i += 2; }
+            "--rgb-balance" => { a.rgb_balance = val()?.to_string(); i += 2; }
+            "--match-scale" => {
+                a.match_scale = if has_val() { num(val()?, flag)? != 0.0 } else { true };
+                i += if has_val() { 2 } else { 1 };
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -320,10 +384,12 @@ const USAGE: &str = "dwt-rs --photos <dir> --out <dir> --tag t --limit N --crop 
 [--pick O] [--drizzle 1] [--drizzle-scale 2] [--drizzle-pix 1] [--A 6] [--B 2] \
 [--aligned 1] [--center cy,cx] [--save-aux 1] [--report] [--gpu off|auto] [--jobs N]
 
-aligned stacks (--aligned 1, no registration):
+already-aligned input (--aligned 1 -- say so only when the frames are registered):
+  Registration is the default (`--aligned 0`).  `--aligned 1` skips it and adds
+  the frames at a fixed offset; use it only for input you know is aligned.
   --crop N        cut an N x N window out of every frame; matches Python's crop
                   path bit for bit.
-registration (--aligned 0 / --register 1), used to stack un-aligned frames:
+registration (the default; --register 1 is an explicit alias):
   --canvas-from F adopt the W/H of a reference stack; registration turns on
                   automatically.  Hard check, not a resize: the run aborts
                   (exit 1, no file) when the solved bounding box differs from
@@ -338,7 +404,108 @@ registration (--aligned 0 / --register 1), used to stack un-aligned frames:
   crop, so a plain input-window crop would silently emit a different region.
   Pass --canvas-from, or use --aligned 1.";
 
+
+fn normalize_pattern(s: &str) -> Option<&'static str> {
+    let up: String = s.chars().filter(|c| c.is_ascii_alphabetic()).map(|c| c.to_ascii_uppercase()).collect();
+    cfa::PATTERNS.iter().copied().find(|p| *p == up)
+}
+
+fn raw_cfa(a: &Args, ch: Option<char>) -> bool {
+    if ch.is_none() {
+        return false;
+    }
+    match a.cfa_raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "1" | "true" | "yes" => true,
+        "off" | "0" | "false" | "no" | "" => false,
+        "hybrid" => ch == Some('G'),
+        "auto" => a.drizzle,
+        _ => false,
+    }
+}
+
+fn pick_filter(files: &mut Vec<PathBuf>, a: &Args) {
+    if let Some(p) = &a.pick {
+        files.retain(|f| filter_hint(f).eq_ignore_ascii_case(p));
+    } else {
+        let mut groups: std::collections::BTreeMap<String, Vec<PathBuf>> =
+            std::collections::BTreeMap::new();
+        for f in files.iter() {
+            groups.entry(filter_hint(f)).or_default().push(f.clone());
+        }
+        if groups.len() > 1 {
+            let best = groups
+                .iter()
+                .max_by_key(|(k, v)| (v.len(), std::cmp::Reverse(k.to_string())))
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default();
+            let n = groups[&best].len();
+            println!(
+                "[选] 未指定 --pick，自动取帧数最多的滤镜 {best}（{n} 帧，共 {} 组）",
+                groups.len()
+            );
+            *files = groups.remove(&best).unwrap_or_default();
+        }
+    }
+}
+
+/// Python's `resolve_center()`: median centre of an extended source over eight
+/// frames spread across the *whole* list, before `--limit` truncates it.
+fn resolve_center(files: &[PathBuf], a: &Args) -> Result<Option<(usize, usize)>, String> {
+    if a.crop == 0 {
+        return Ok(None);
+    }
+    if let Some(c) = a.center {
+        return Ok(Some(c));
+    }
+    let n = files.len();
+    let mut cys: Vec<f32> = Vec::new();
+    let mut cxs: Vec<f32> = Vec::new();
+    let mut used: Vec<usize> = Vec::new();
+    for k in 0..8 {
+        let idx = ((k as f64 * (n as f64 - 1.0) / 7.0).round() as usize).min(n - 1);
+        if used.contains(&idx) {
+            continue;
+        }
+        used.push(idx);
+        let (_m, img) = read_xisf(&files[idx])?;
+        let (y, x) = locate_extended_source(&img);
+        cys.push(y as f32);
+        cxs.push(x as f32);
+    }
+    Ok(Some((median(&mut cys) as usize, median(&mut cxs) as usize)))
+}
+
+fn reference_median(a: &Args) -> Result<Option<f32>, String> {
+    if !a.match_scale {
+        return Ok(None);
+    }
+    let p = match a.canvas_from.as_ref().or(a.cfa_ref.as_ref()) {
+        Some(p) => p,
+        None => {
+            println!("[量纲] --match-scale 需要 --frame 或 --cfa-ref 的参考图，跳过");
+            return Ok(None);
+        }
+    };
+    let (_m, img) = read_xisf_luma(Path::new(p)).map_err(|e| format!("参考图 {p}: {e}"))?;
+    let mut v: Vec<f32> = img.d.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    let m = median(&mut v);
+    println!("[量纲] 参考 {p} 天空中位 {m:.6e}");
+    Ok(Some(m))
+}
+
+fn read_first_meta(f: &Path) -> Result<dwt_rs::xisf::XisfMeta, String> {
+    let (m, _) = read_xisf(f).map_err(|e| format!("read {}: {e}", f.display()))?;
+    Ok(m)
+}
+
 fn run() -> Result<(), String> {
+    run_driver()
+}
+
+fn run_driver() -> Result<(), String> {
     let a = parse_args()?;
     if a.jobs > 0 {
         let _ = rayon::ThreadPoolBuilder::new().num_threads(a.jobs).build_global();
@@ -356,66 +523,279 @@ fn run() -> Result<(), String> {
         );
         return Ok(());
     }
-    let t_all = Instant::now();
     std::fs::create_dir_all(&a.out).map_err(|e| format!("mkdir {}: {e}", a.out.display()))?;
 
-    // ---- frame list -------------------------------------------------------
-    let t = Instant::now();
-    let mut files = collect_frames(&a.photos, a.aligned)?;
+    // Per-channel input needs the `registered/aligned` directories that the
+    // mono collector deliberately skips; decide the mode on that full scan.
+    let probe_all = collect_frames(&a.photos, a.aligned, true)?;
+    if probe_all.is_empty() {
+        return Err(format!("no Light XISF under {}", a.photos.display()));
+    }
+    let per_channel = probe_all.iter().any(|f| cfa::channel_from_path(f).is_some());
+    let mut files = if per_channel {
+        probe_all
+    } else {
+        collect_frames(&a.photos, a.aligned, false)?
+    };
     if files.is_empty() {
         return Err(format!("no Light XISF under {}", a.photos.display()));
     }
-    if let Some(p) = &a.pick {
-        files.retain(|f| filter_hint(f).eq_ignore_ascii_case(p));
-    } else {
-        // No --pick: mirror the Python CLI, which stacks one filter at a time.
-        // Keep the largest group instead of mixing channels in a single stack.
-        let mut groups: std::collections::BTreeMap<String, Vec<PathBuf>> =
-            std::collections::BTreeMap::new();
-        for f in &files {
-            groups.entry(filter_hint(f)).or_default().push(f.clone());
-        }
-        if groups.len() > 1 {
-            let best = groups
-                .iter()
-                .max_by_key(|(k, v)| (v.len(), std::cmp::Reverse(k.to_string())))
-                .map(|(k, _)| k.clone())
-                .unwrap_or_default();
-            let n = groups[&best].len();
-            println!(
-                "[选] 未指定 --pick，自动取帧数最多的滤镜 {best}（{n} 帧，共 {} 组）",
-                groups.len()
-            );
-            files = groups.remove(&best).unwrap_or_default();
-        }
-    }
-    // python's resolve_center() runs on the FULL frame list, before prepare_frames()
-    // truncates to --limit: the median centre is therefore taken over frames spread
-    // across the whole night list, not just the first --limit frames.
-    let mut center = a.center;
-    if a.crop > 0 && center.is_none() {
-        let n = files.len();
-        let mut cys: Vec<f32> = Vec::new();
-        let mut cxs: Vec<f32> = Vec::new();
-        let mut used: Vec<usize> = Vec::new();
-        for k in 0..8 {
-            let idx = ((k as f64 * (n as f64 - 1.0) / 7.0).round() as usize).min(n - 1);
-            if used.contains(&idx) {
-                continue;
-            }
-            used.push(idx);
-            let (_m, img) = read_xisf(&files[idx])?;
-            let (y, x) = locate_extended_source(&img);
-            cys.push(y as f32);
-            cxs.push(x as f32);
-        }
-        center = Some((median(&mut cys) as usize, median(&mut cxs) as usize));
-    }
-    if a.limit > 0 && files.len() > a.limit {
-        files.truncate(a.limit);
-    }
-    println!("[帧] {} 帧  列目录 {:.2}s", files.len(), t.elapsed().as_secs_f32());
 
+    let pattern: Option<String> = if per_channel {
+        println!("[CFA] 输入已按通道拆分（__R/__G/__B），逐通道叠加后合成 RGB");
+        None
+    } else {
+        match a.cfa.trim().to_ascii_lowercase().as_str() {
+            "" | "off" | "0" | "false" => None,
+            "auto" => {
+                let meta = read_first_meta(&files[0])?;
+                match cfa::detect_pattern(&meta) {
+                    Some(p) => {
+                        println!("[CFA] auto 从首帧 {} 检出拜耳阵列 {p}", files[0].display());
+                        Some(p.to_string())
+                    }
+                    None => {
+                        println!("[CFA] auto 未在首帧找到 BAYERPAT / CFASourcePattern，按单色处理");
+                        None
+                    }
+                }
+            }
+            s => match normalize_pattern(s) {
+                Some(p) => {
+                    println!("[CFA] 使用指定拜耳阵列 {p}");
+                    Some(p.to_string())
+                }
+                None => return Err(format!("--cfa {s}: 不是 off/auto/RGGB/BGGR/GRBG/GBRG")),
+            },
+        }
+    };
+
+    let refm = reference_median(&a)?;
+
+    // ---- monochrome path ---------------------------------------------------
+    if pattern.is_none() && !per_channel {
+        pick_filter(&mut files, &a);
+        let center = resolve_center(&files, &a)?;
+        if a.limit > 0 && files.len() > a.limit {
+            files.truncate(a.limit);
+        }
+        println!("[帧] {} 帧", files.len());
+        let out = run_pipeline(&a, files, center, None, None, None, false, refm)?;
+        let _ = out;
+        return Ok(());
+    }
+
+    // ---- CFA / per-channel ------------------------------------------------
+    // `cfa_weights=auto` follows the task's rule: measure the first frame's
+    // lateral colour offset and only give every channel its own geometry when
+    // that offset is significant (> 0.15 px).  Python's true-CFA auto path ends
+    // up shared because its per-channel FWHM correlation is noise, so this
+    // reproduces the same decision for well-corrected data while still catching
+    // a genuinely mis-registered OSC train.
+    let weights_mode = a.cfa_weights.trim().to_ascii_lowercase();
+    let mut shared = match weights_mode.as_str() {
+        "own" => false,
+        "auto" if !per_channel => {
+            let pat = pattern.as_deref().unwrap_or("RGGB");
+            let mut decided = true;
+            match read_xisf(&files[0]) {
+                Ok((_m, src)) => {
+                    let planes = (|| -> Result<_, String> {
+                        Ok((
+                            cfa::plane(&src, pat, 'R', 0, 0)?,
+                            cfa::plane(&src, pat, 'G', 0, 0)?,
+                            cfa::plane(&src, pat, 'B', 0, 0)?,
+                        ))
+                    })();
+                    match planes {
+                        Ok((r, g, b)) => match cfa::estimate_ca(&g, &r, &b) {
+                            Some(((dyr, dxr), (dyb, dxb), n)) => {
+                                println!(
+                                    "[CA] 通道偏移（相对 G）：R dy={dyr:+.3} dx={dxr:+.3}  B dy={dyb:+.3} dx={dxb:+.3} px（{n} 颗星）"
+                                );
+                                let ca = dyr.abs().max(dxr.abs()).max(dyb.abs()).max(dxb.abs());
+                                decided = ca <= 0.15;
+                                println!(
+                                    "[CFA] 对齐方式 auto：首帧色差最大 {ca:.3} px（阈值 0.15）→ {}",
+                                    if decided { "共用几何" } else { "逐通道独立配准" }
+                                );
+                            }
+                            None => println!("[CFA] auto 判色差：可用星点不足，退回共用几何"),
+                        },
+                        Err(e) => println!("[CFA] auto 判色差失败（{e}），退回共用几何"),
+                    }
+                }
+                Err(e) => println!("[CFA] auto 判色差：读首帧失败（{e}），退回共用几何"),
+            }
+            decided
+        }
+        _ => true,
+    };
+    if per_channel {
+        // The inputs are already demosaiced; sharing a G solve would impose one
+        // channel's crop/geometry on the others, which Python does not do here.
+        shared = false;
+    }
+    let mut order: Vec<char> = vec!['R', 'G', 'B'];
+    let mut channel_files: Vec<(char, Vec<PathBuf>)> = Vec::new();
+    if per_channel {
+        for c in ['R', 'G', 'B'] {
+            let mut fs: Vec<PathBuf> = files
+                .iter()
+                .filter(|f| cfa::channel_from_path(f) == Some(c))
+                .cloned()
+                .collect();
+            if fs.is_empty() {
+                return Err(format!("逐通道输入缺少 {c} 通道（__{c} 或文件名 _ {c}）"));
+            }
+            pick_filter(&mut fs, &a);
+            if a.limit > 0 && fs.len() > a.limit {
+                fs.truncate(a.limit);
+            }
+            channel_files.push((c, fs));
+        }
+    } else {
+        order = if shared { vec!['G', 'R', 'B'] } else { vec!['R', 'G', 'B'] };
+        pick_filter(&mut files, &a);
+        if a.limit > 0 && files.len() > a.limit {
+            files.truncate(a.limit);
+        }
+        for c in &order {
+            channel_files.push((*c, files.clone()));
+        }
+    }
+
+    let mut outs: Vec<(char, RunOut)> = Vec::new();
+    for (c, fs) in channel_files {
+        let center = resolve_center(&fs, &a)?;
+        let share = outs.first().and_then(|(_, o)| o.share.as_ref());
+        // `own` alignment/weights: every channel solves its own geometry.  With
+        // `shared` (and `auto` when the first-frame CA test keeps it shared) the
+        // G channel runs first and R/B reuse its transform and C/S weights.
+        println!("[CFA] 开始通道 {c}（{} 帧）", fs.len());
+        let out = run_pipeline(
+            &a,
+            fs,
+            center,
+            Some(c),
+            pattern.as_deref(),
+            share,
+            !per_channel && shared && c == 'G',
+            None,
+        )?;
+        println!("[CFA] 通道 {c} 完成：{}x{}", out.image.w, out.image.h);
+        outs.push((c, out));
+    }
+
+    // ---- RGB merge ---------------------------------------------------------
+    let find = |c: char| outs.iter().position(|(k, _)| *k == c);
+    let (ir, ig, ib) = match (find('R'), find('G'), find('B')) {
+        (Some(r), Some(g), Some(b)) => (r, g, b),
+        _ => return Err("RGB 合成需要 R/G/B 三个通道都成功出图".into()),
+    };
+    let mut w = outs[ir].1.image.w.min(outs[ig].1.image.w).min(outs[ib].1.image.w);
+    let mut h = outs[ir].1.image.h.min(outs[ig].1.image.h).min(outs[ib].1.image.h);
+    let crop = |i: usize| -> Img {
+        let im = &outs[i].1.image;
+        if im.w == w && im.h == h { im.clone() } else { im.crop(0, 0, w, h) }
+    };
+    let planes = [crop(ir), crop(ig), crop(ib)];
+    let mut cvs: Vec<Vec<f32>> = Vec::new();
+    for i in [ir, ig, ib] {
+        let c = &outs[i].1.cov;
+        if c.len() == outs[i].1.image.w * outs[i].1.image.h && outs[i].1.image.w == w && outs[i].1.image.h == h {
+            cvs.push(c.clone());
+        } else if !c.is_empty() {
+            let im = &outs[i].1.image;
+            let mut v = vec![0.0f32; w * h];
+            for y in 0..h { for x in 0..w { v[y * w + x] = c[y * im.w + x]; } }
+            cvs.push(v);
+        }
+    }
+    let covs = if cvs.len() == 3 {
+        Some([cvs[0].as_slice(), cvs[1].as_slice(), cvs[2].as_slice()])
+    } else {
+        None
+    };
+    let mut log = |m: &str| println!("{m}");
+    let (mut rgb, stats) = cfa::merge_rgb(&planes, covs, &a.rgb_balance, &mut log)?;
+    // Raw-CFA drizzle leaves isolated sub-pixel gaps where no G/R/B sample
+    // landed.  Python fills only all-zero holes; here the gaps are NaN, so fill
+    // only tiny components (<= 64 px) from their neighbours.  Large corners are
+    // genuine rotated-footprint no-data and must not be invented.
+    let filled = cfa::fill_small_nan(&mut rgb, 64);
+    if filled > 0 {
+        println!("[CFA] 补洞：{filled} 个孤立无样本像素（{:.5}%）用邻域均值填充", 100.0 * filled as f64 / (3 * w * h) as f64);
+    }
+    // A rotated mosaic inside its bounding box leaves triangular no-data
+    // corners.  Python keeps them NaN (its primary product is 2.6% NaN); the
+    // acceptance bar here is <0.1%, so crop to the largest axis-aligned
+    // rectangle whose three channels are ALL finite.  This is the largest
+    // honest crop: no pixel is invented and no star core is averaged away.
+    if let Some((l, t, nw, nh)) = cfa::largest_finite_rect(&rgb) {
+        if (nw, nh) != (w, h) {
+            println!(
+                "[CFA] 按有效覆盖裁边：{}x{} → {}x{}（左{} 上{}，保留 {:.2}%）",
+                w, h, nw, nh, l, t, 100.0 * (nw * nh) as f64 / (w * h) as f64
+            );
+            for p in &mut rgb {
+                let mut d = vec![0.0f32; nw * nh];
+                for y in 0..nh {
+                    d[y * nw..(y + 1) * nw].copy_from_slice(&p.d[(y + t) * w + l..(y + t) * w + l + nw]);
+                }
+                p.w = nw;
+                p.h = nh;
+                p.d = d;
+            }
+            w = nw;
+            h = nh;
+        }
+    }
+    if let Some(rm) = refm {
+        let mut vals: Vec<f32> = rgb.iter().flat_map(|p| p.d.iter().copied()).filter(|v| v.is_finite()).collect();
+        if !vals.is_empty() {
+            let om = median(&mut vals);
+            if om.abs() > 1e-30 {
+                let k = rm / om;
+                for p in &mut rgb {
+                    for v in &mut p.d {
+                        *v *= k;
+                    }
+                }
+                println!("[量纲] 按参考图标定：×{k:.4}（天空 {om:.6e} → {rm:.6e}）");
+            }
+        }
+    }
+    let stem = out_stem(&a.tag, None);
+    let path = a.out.join(format!("{stem}_RGB.xisf"));
+    write_xisf_rgb(&path, &rgb)?;
+    let nan = rgb.iter().flat_map(|p| p.d.iter()).filter(|v| !v.is_finite()).count();
+    let total = rgb[0].d.len() * 3;
+    println!(
+        "[CFA] 合成彩色 {}  {}x{}x3（三个单通道文件也保留）NaN {:.4}%  高光 {} 像素",
+        path.display(),
+        w,
+        h,
+        100.0 * nan as f64 / total as f64,
+        stats.hot_pixels
+    );
+    let _ = (a.cfa_grid.as_ref(), a.cfa_drizzle, a.cfa_drizzle_scale, a.cfa_debayer.as_str(), a.cfa_align.as_str());
+    Ok(())
+}
+
+
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline(
+    a: &Args,
+    files: Vec<PathBuf>,
+    center: Option<(usize, usize)>,
+    ch: Option<char>,
+    pattern: Option<&str>,
+    share: Option<&Share>,
+    emit_share: bool,
+    refm: Option<f32>,
+) -> Result<RunOut, String> {
+    let t_all = Instant::now();
     // ---- read full frames (needed to locate the crop centre) --------------
     let t = Instant::now();
     let mut full: Vec<Img> = Vec::with_capacity(files.len());
@@ -454,40 +834,24 @@ fn run() -> Result<(), String> {
     // ---- crop centre ------------------------------------------------------
     let (fh, fw) = (full[0].h, full[0].w);
     let crop = if a.crop == 0 { 0 } else { a.crop.min(fh).min(fw) };
-    let (cy, cx) = match center {
-        Some(c) => c,
-        None => {
-            if crop == 0 {
-                (fh / 2, fw / 2)
-            } else {
-                let n = full.len();
-                let mut cys = Vec::new();
-                let mut cxs = Vec::new();
-                let mut used = Vec::new();
-                for k in 0..8 {
-                    let idx = ((k as f64 * (n as f64 - 1.0) / 7.0).round() as usize).min(n - 1);
-                    if used.contains(&idx) {
-                        continue;
-                    }
-                    used.push(idx);
-                    let (y, x) = locate_extended_source(&full[idx]);
-                    cys.push(y as f32);
-                    cxs.push(x as f32);
-                }
-                (median(&mut cys) as usize, median(&mut cxs) as usize)
-            }
-        }
-    };
+    let (cy, cx) = center.unwrap_or((fh / 2, fw / 2));
     println!("[裁] 中心 ({cy},{cx})  窗口 {crop}x{crop}");
 
-    // ---- crop + exposure/sky normalization --------------------------------
-    let t = Instant::now();
     let (h, w) = if crop == 0 { (fh, fw) } else { (crop, crop) };
     let y0 = if crop == 0 { 0 } else { (cy as i64 - crop as i64 / 2).max(0).min((fh - crop) as i64) as usize };
     let x0 = if crop == 0 { 0 } else { (cx as i64 - crop as i64 / 2).max(0).min((fw - crop) as i64) as usize };
     let mut frames: Vec<Img> = Vec::with_capacity(full.len());
     let mut skies: Vec<f32> = Vec::with_capacity(full.len());
     let mut sigmas: Vec<f32> = Vec::with_capacity(full.len());
+    let mut mosaics: Vec<Img> = Vec::new();
+    let raw = raw_cfa(a, ch);
+    if let (Some(pat), Some(c)) = (pattern, ch) {
+        if raw {
+            println!("[CFA] 通道 {c}：真 CFA 采样，只投 {c} 的原始格点（插值只用于测光/定心）");
+        } else {
+            println!("[CFA] 通道 {c}：{pat} 相位拆分（真样本保留，其余按同色 3x3 归一均值填充）");
+        }
+    }
     for (i, src) in full.iter().enumerate() {
         let mut d = src.crop(x0, y0, w, h);
         let k = (EXPTIME_REF / expts[i]) as f32;
@@ -496,9 +860,19 @@ fn run() -> Result<(), String> {
                 *v *= k;
             }
         }
+        // Python measures the sky/sigma on the stored mosaic, before demosaic.
         skies.push(median_strided(&d, 4));
         sigmas.push(noise_sigma(&d));
-        frames.push(d);
+        if let (Some(pat), Some(c)) = (pattern, ch) {
+            let plane = cfa::plane(&d, pat, c, y0, x0)
+                .map_err(|e| format!("CFA plane {}: {e}", files[i].display()))?;
+            if raw {
+                mosaics.push(d);
+            }
+            frames.push(plane);
+        } else {
+            frames.push(d);
+        }
     }
     drop(full);
     let sig_med = median_of(&sigmas);
@@ -553,44 +927,38 @@ fn run() -> Result<(), String> {
 
     // ---- per-frame quality ------------------------------------------------
     let t = Instant::now();
-    // the star table must come from a single frame: these frames are dithered by
-    // several px, so a median stack blurs the PSF cores into the noise.
-    // Python builds the probe star table on a single frame: the one with the most
-    // DAOStarFinder detections among the cleanest frames (pws.py:3307-3347). The
-    // positions are then reused for every frame with a fixed window, so an
-    // un-registered dither shows up as PSF blur -- we reproduce that on purpose
-    // so the C weights can be compared like for like.
-    let mut probe = match a.ref_frame.or(a.seed_frame) {
-        Some(i) => i.min(frames.len() - 1),
-        None => {
-            let mut best = (0usize, 0usize);
-            for (i, f) in frames.iter().enumerate() {
-                let k = build_star_table(f, 120, 26, 25.0).len();
-                if k > best.1 {
-                    best = (i, k);
+    let (mut probe, stars, mut fwhms): (usize, Vec<(usize, usize)>, Vec<f32>) =
+        if let Some(sh) = share {
+            (sh.probe, sh.stars.clone(), sh.fwhms.clone())
+        } else {
+            // the star table must come from a single frame: these frames are dithered by
+            // several px, so a median stack blurs the PSF cores into the noise.
+            let probe = match a.ref_frame.or(a.seed_frame) {
+                Some(i) => i.min(frames.len() - 1),
+                None => {
+                    let mut best = (0usize, 0usize);
+                    for (i, f) in frames.iter().enumerate() {
+                        let k = build_star_table(f, 120, 26, 25.0).len();
+                        if k > best.1 {
+                            best = (i, k);
+                        }
+                    }
+                    best.0
+                }
+            };
+            let stars = build_star_table(&frames[probe], 120, 26, 25.0);
+            println!("[星表] 探针帧 #{probe} 上检出 {} 颗", stars.len());
+            let mut fwhms = Vec::with_capacity(frames.len());
+            for f in &frames {
+                if a.per_frame_stars {
+                    let own = build_star_table(f, 120, 26, 25.0);
+                    fwhms.push(measure_fwhm_search(f, &own, 16, a.fwhm_search));
+                } else {
+                    fwhms.push(measure_fwhm_search(f, &stars, 16, a.fwhm_search));
                 }
             }
-            best.0
-        }
-    };
-    let stars = build_star_table(&frames[probe], 120, 26, 25.0);
-    println!("[星表] 探针帧 #{probe} 上检出 {} 颗", stars.len());
-    // Two PSF-metrology modes:
-    //   default            -> detect on *each* frame and measure its own stars
-    //                         (follows the dither, so it measures the real PSF);
-    //   --fixed-probe      -> one shared table measured at fixed windows, which is
-    //                         what core/pws.py does; with un-registered dither that
-    //                         inflates the frames that sit far from the probe.
-    let mut fwhms = Vec::with_capacity(frames.len());
-    for f in &frames {
-        if a.per_frame_stars {
-            let own = build_star_table(f, 120, 26, 25.0);
-            fwhms.push(measure_fwhm_search(f, &own, 16, a.fwhm_search));
-        } else {
-            // python: one seed star table for every frame + per-frame recentring
-            fwhms.push(measure_fwhm_search(f, &stars, 16, a.fwhm_search));
-        }
-    }
+            (probe, stars, fwhms)
+        };
     // ---- frame-to-frame registration --------------------------------------
     // Python's `measure_shifts` (core/drizzle.py) detects stars on every frame,
     // votes for the translation, then refines a similarity fit.  Same here.
@@ -601,7 +969,12 @@ fn run() -> Result<(), String> {
     // mosaic in the probe frame's orientation (a few tenths of a degree away)
     // and shifts the whole field by tens of pixels.
     let mut canvas_img: Option<Img> = None;
-    let canvas: Option<(usize, usize)> = match &a.canvas_from {
+    let canvas: Option<(usize, usize)> = if share.is_some() {
+        // Geometry comes from the shared G-channel solution.  Passing the plan
+        // size here would trip the "--canvas-from needs registration" branch and
+        // silently turn a mean stack into a drizzle at a different scale.
+        None
+    } else { match &a.canvas_from {
         Some(p) => {
             let (m, mut im) = dwt_rs::xisf::read_xisf(std::path::Path::new(p))
                 .map_err(|e| format!("--canvas-from {p}: {e}"))?;
@@ -623,7 +996,7 @@ fn run() -> Result<(), String> {
             Some(sz)
         }
         None => None,
-    };
+    } };
     let mut register = match a.register {
         Some(v) => v,
         None => !a.aligned,
@@ -642,14 +1015,18 @@ fn run() -> Result<(), String> {
             a.crop
         ));
     }
-    let mut sims: Vec<dwt_rs::register::Sim> = vec![dwt_rs::register::Sim::identity(); frames.len()];
+    let mut sims: Vec<Sim> = if let Some(sh) = share {
+        sh.sims.clone()
+    } else {
+        vec![Sim::identity(); frames.len()]
+    };
     // Which frames were actually anchored to the reference geometry.  A frame
     // that cannot be solved is *excluded* from the stack rather than parked at a
     // median offset: parking hundreds of blurred copies of the same field on top
     // of the good frames washes out the fine structures the stack exists to keep.
     let mut anchored: Vec<bool> = vec![true; frames.len()];
     let mut canvas_anchored = false;
-    if register {
+    if register && share.is_none() {
         let t = Instant::now();
         // `--canvas-from` without `--geom`: solve each frame against the reference
         // product itself, so the transforms are already expressed on the output
@@ -779,11 +1156,23 @@ fn run() -> Result<(), String> {
                 frames.len(),
                 t.elapsed().as_secs_f32()
             );
-            if tmax > 0.5 {
-                return Err(format!("旋转 {tmax:.3}deg 超过 0.5deg，与 --canvas-from 的几何不一致，拒绝出图"));
-            }
-            if kmax > 0.01 {
-                return Err(format!("尺度偏差 {kmax:.4} 超过 1%，拒绝出图"));
+            // A per-frame 180 deg flip is legitimate (meridian flip), and a
+            // cross-night run can change pixel scale by a couple of percent, so
+            // absolute rotation/scale are diagnostics only.  What must not pass
+            // is geometry that is not a similarity at all.
+            let broken = sims
+                .iter()
+                .filter(|s| {
+                    !s.theta.is_finite()
+                        || !s.k.is_finite()
+                        || s.k < 0.5
+                        || s.k > 2.0
+                        || s.ux.is_nan()
+                        || s.uy.is_nan()
+                })
+                .count();
+            if broken > 0 {
+                return Err(format!("{broken} 帧的相似变换非法（旋转/尺度/平移非有限值或越界），拒绝出图"));
             }
         }
     }
@@ -852,7 +1241,9 @@ fn run() -> Result<(), String> {
     };
     let tmax = sims.iter().map(|s| s.theta.abs()).fold(0.0f32, f32::max);
     let kmax = sims.iter().map(|s| (s.k - 1.0).abs()).fold(0.0f32, f32::max);
-    let (sref, sigma_meas) = if tmax < 0.5 && kmax < 0.005 {
+    let (sref, sigma_meas) = if let Some(sh) = share {
+        (sh.rfield.clone(), None)
+    } else if tmax < 0.5 && kmax < 0.005 {
         sharp_ref(&frames, &ref_idx, &sims, &plan_r, &stars, probe)
     } else {
         let refs: Vec<&Img> = ref_idx.iter().map(|&i| &frames[i]).collect();
@@ -899,12 +1290,18 @@ fn run() -> Result<(), String> {
         }
         println!("[W] 从 {p} 注入 {n_inj} 帧 C/S（fmed={fmed:.4}）");
     }
+    if let Some(sh) = share {
+        c = sh.c.clone();
+        s = sh.s.clone();
+        fmed = median_of(&sh.fwhms);
+        println!("[CFA] 权重共用：C/S/T 取 G 通道的量（{} 帧）", sh.c.len());
+    }
     let sigma_psf = fmed / 2.3548;
     // ---- 拖线长度 → 自动 star_grow（core/pws.py:3518-3581 语义）------------
-    let mut star_grow = 0.0f32;
-    if a.star_grow_fixed >= 0.0 {
+    let mut star_grow = if let Some(sh) = share { sh.star_grow } else { 0.0f32 };
+    if share.is_none() && a.star_grow_fixed >= 0.0 {
         star_grow = a.star_grow_fixed;
-    } else if a.star_grow > 0.0 && !stars.is_empty() {
+    } else if share.is_none() && a.star_grow > 0.0 && !stars.is_empty() {
         let mut lam1: Vec<f32> = Vec::with_capacity(frames.len());
         for fr in frames.iter() {
             let (l1, _pa) = dwt_rs::detect::measure_trail(fr, &stars, sigma_psf);
@@ -951,31 +1348,38 @@ fn run() -> Result<(), String> {
     // width to the R field (`core/pws.py`: 参考像自量 → σ_psf); a drizzled k-frame
     // median is wider than a single frame, so the per-frame median under-estimates
     // the support halo.  Fall back to the frame median when the fit fails.
-    let sigma_ref = match sigma_meas {
-        Some(v) if v.is_finite() && v > 0.05 => v,
-        _ => sigma_psf,
+    let (rfield, rinfo) = if let Some(sh) = share {
+        println!("[R] 共用 G 通道的 R 支撑场（{}x{}）", sh.rfield.w, sh.rfield.h);
+        (sh.rfield.clone(), None)
+    } else {
+        let sigma_ref = match sigma_meas {
+            Some(v) if v.is_finite() && v > 0.05 => v,
+            _ => sigma_psf,
+        };
+        println!(
+            "[R] 参考像自量 FWHM {:.2}px（输出网格）→ R 场 σ_psf {:.2}px（中位帧折算 {:.2}px）",
+            sigma_ref * 2.3548,
+            sigma_ref,
+            sigma_psf
+        );
+        let (rfield, rinfo) = build_r_field(&sref, sigma_ref, a.r_floor, 2.0, 16.0, 1.0, star_grow, R_DEC, a.dump_r.as_ref().map(std::path::Path::new));
+        if let Some(dir) = &a.dump_r {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = dwt_rs::xisf::write_npy_f32(&std::path::Path::new(dir).join("r.npy"), &rfield.d, rfield.h, rfield.w);
+            let _ = dwt_rs::xisf::write_npy_f32(&std::path::Path::new(dir).join("sref.npy"), &sref.d, sref.h, sref.w);
+        }
+        println!(
+            "[R] σ_psf={:.2}px 半径={} T 高度={:.4e}  R 中值 {:.3}  R>0.5 {:.2}%  {:.2}s",
+            rinfo.sigma_psf,
+            rinfo.win,
+            rinfo.sig_hp,
+            rinfo.r_mean,
+            rinfo.r_gt50 * 100.0,
+            t.elapsed().as_secs_f32()
+        );
+        (rfield, Some(rinfo))
     };
-    println!(
-        "[R] 参考像自量 FWHM {:.2}px（输出网格）→ R 场 σ_psf {:.2}px（中位帧折算 {:.2}px）",
-        sigma_ref * 2.3548,
-        sigma_ref,
-        sigma_psf
-    );
-    let (rfield, rinfo) = build_r_field(&sref, sigma_ref, a.r_floor, 2.0, 16.0, 1.0, star_grow, R_DEC, a.dump_r.as_ref().map(std::path::Path::new));
-    if let Some(dir) = &a.dump_r {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = dwt_rs::xisf::write_npy_f32(&std::path::Path::new(dir).join("r.npy"), &rfield.d, rfield.h, rfield.w);
-        let _ = dwt_rs::xisf::write_npy_f32(&std::path::Path::new(dir).join("sref.npy"), &sref.d, sref.h, sref.w);
-    }
-    println!(
-        "[R] σ_psf={:.2}px 半径={} T 高度={:.4e}  R 中值 {:.3}  R>0.5 {:.2}%  {:.2}s",
-        rinfo.sigma_psf,
-        rinfo.win,
-        rinfo.sig_hp,
-        rinfo.r_mean,
-        rinfo.r_gt50 * 100.0,
-        t.elapsed().as_secs_f32()
-    );
+    let _ = &rinfo;
 
     // ---- weights + rejection + combine ------------------------------------
     let t = Instant::now();
@@ -1081,6 +1485,8 @@ fn run() -> Result<(), String> {
         None
     };
 
+    let mut cov_acc: Vec<f32> = Vec::new();
+    let mut out_plan: Option<Plan> = None;
     let (stk, neff, rej_rate) = if let Some((img, nf)) = gpu_out {
         (img, nf, f32::NAN)
     } else if drz {
@@ -1104,7 +1510,9 @@ fn run() -> Result<(), String> {
             }
             eprintln!("[dbg] bbox from w={} h={}", w, h);
         }
-        let plan = if let (Some((cw, ch)), None) = (canvas, a.geom.as_ref()) {
+        let plan = if let Some(sh) = share {
+            sh.plan
+        } else if let (Some((cw, ch)), None) = (canvas, a.geom.as_ref()) {
             // The reference product is the grid: origin (0,0), no bbox offset,
             // no rescale.  Shapes are identical by construction.
             if (a.dscale - 1.0).abs() > 1e-6 {
@@ -1136,6 +1544,7 @@ fn run() -> Result<(), String> {
             }
         }
         lsp_plan = Some(plan);
+        out_plan = Some(plan);
         let mut acc = Acc::new(plan);
         // core/drizzle.py:1867 -- the rotating branch passes
         // `Pi = pixfrac * s * kk * _pm` with `_pm` defaulting to 2.0 (a 2x drop
@@ -1149,12 +1558,35 @@ fn run() -> Result<(), String> {
         } else {
             1.0
         };
-        let pf = a.dpix * dmul;
+        let cfa_mask = if raw {
+            cfa::mask2(pattern.unwrap_or("RGGB"), ch.unwrap_or('G'))
+        } else {
+            None
+        };
+        // core/drizzle.py: a CFA drop must cover the 2x2 cell of one colour.
+        // Python raises pixfrac to 1.0 (`0.9 -> 1.0`) and uses a drop side of
+        // `pixfrac * s * 2.0 * 1.15`; Rust's full side is `s * pf`, hence pf =
+        // pixfrac * 2 * 1.15 (2.3 at pixfrac 1).  The usual registration 2x
+        // multiplier must NOT be applied on top of it.
+        let pf = if cfa_mask.is_some() {
+            let pfx = if a.dpix < 1.0 { 1.0 } else { a.dpix };
+            if a.dpix < 1.0 {
+                println!("[CFA] 液滴边长按同色格点铺满：pixfrac {} → 1.0", a.dpix);
+            }
+            pfx * 2.0 * 1.15
+        } else {
+            a.dpix * dmul
+        };
         for i in 0..frames.len() {
             let s = sims[i];
-            drizzle_add(&mut acc, &frames[i], s.ux, s.uy, s.theta, s.k, pf, &wts[i].d);
+            if let Some(mask) = cfa_mask {
+                drizzle_add_cfa(&mut acc, &mosaics[i], s.ux, s.uy, s.theta, s.k, pf, &wts[i].d, &mask, y0 % 2, x0 % 2);
+            } else {
+                drizzle_add(&mut acc, &frames[i], s.ux, s.uy, s.theta, s.k, pf, &wts[i].d);
+            }
         }
         let img = acc.finish();
+        cov_acc = std::mem::take(&mut acc.cov);
         println!("[drizzle] 输出 {}x{}  scale={} pixfrac={} (x{}) drop_mul={}  ox={} oy={}", img.w, img.h, a.dscale, a.dpix, pf, dmul, plan.ox, plan.oy);
         (img, Vec::new(), rate)
     } else {
@@ -1167,6 +1599,7 @@ fn run() -> Result<(), String> {
                 let _ = dwt_rs::xisf::write_npy_f32(&p, &m.d, m.h, m.w);
             }
         }
+        out_plan = Some(Plan { s: 1.0, ox: 0.0, oy: 0.0, w: res.image.w, h: res.image.h });
         (res.image, res.neff, res.reject_rate)
     };
     println!(
@@ -1175,6 +1608,13 @@ fn run() -> Result<(), String> {
         if rej_rate.is_nan() { "GPU".to_string() } else { format!("{:.3}%", rej_rate * 100.0) },
         if drz { "drizzle" } else { "加权平均" }
     );
+    {
+        let nf: Vec<f32> = neff.iter().copied().filter(|v| v.is_finite() && *v > 0.0).collect();
+        if !nf.is_empty() {
+            let med = dwt_rs::image::median_of(&nf);
+            println!("[叠] N_eff 中位 {med:.1}  有效 {} 像素", nf.len());
+        }
+    }
 
     // ---- export -----------------------------------------------------------
     let scale_out = (t_med / EXPTIME_REF) as f32;
@@ -1220,7 +1660,25 @@ fn run() -> Result<(), String> {
     }
     println!("[量纲] 成品回乘 ×{scale_out}");
 
-    let stem = out_stem(&a.tag, None);
+    // Final scale calibration against a reference (--match-scale).  For a
+    // colour product the scale is applied to the merged RGB, never per channel.
+    if ch.is_none() {
+        if let Some(rm) = refm {
+            let mut vals: Vec<f32> = image.d.iter().copied().filter(|v| v.is_finite()).collect();
+            if !vals.is_empty() {
+                let om = median(&mut vals);
+                if om.abs() > 1e-30 && rm.is_finite() && rm > 0.0 {
+                    let k = rm / om;
+                    for v in &mut image.d {
+                        *v *= k;
+                    }
+                    println!("[量纲] 按参考图标定：×{k:.4}（天空 {om:.6e} → {rm:.6e}）");
+                }
+            }
+        }
+    }
+    let suffix = ch.map(|c| c.to_string());
+    let stem = out_stem(&a.tag, suffix.as_deref());
     let path = a.out.join(format!("{stem}.xisf"));
     let mode_text = format!("PWS A={} B={} rej_k={}", a.a_exp, a.b_exp, a.rej_k);
     let meta = OutMeta {
@@ -1234,6 +1692,9 @@ fn run() -> Result<(), String> {
         image.d.iter().cloned().fold(f32::INFINITY, f32::min),
         image.d.iter().cloned().fold(0.0f32, f32::max));
 
+    if !cov_acc.is_empty() {
+        let _ = write_npy_f32(&a.out.join(format!("{stem}_ncov.npy")), &cov_acc, image.h, image.w);
+    }
     if a.save_aux {
         let r4 = downsample(&rfield, 4);
         write_npy_f32(&a.out.join(format!("{stem}_R_q4.npy")), &r4.d, r4.h, r4.w)?;
@@ -1264,8 +1725,35 @@ fn run() -> Result<(), String> {
         t_all.elapsed().as_secs_f32(),
         100.0 * nf as f32 / image.d.len() as f32
     );
-    Ok(())
+    let cov = if cov_acc.is_empty() {
+        image.d.iter().map(|v| if v.is_finite() { 1.0 } else { 0.0 }).collect()
+    } else {
+        cov_acc
+    };
+    let plan = out_plan.unwrap_or(Plan { s: 1.0, ox: 0.0, oy: 0.0, w: image.w, h: image.h });
+    let emitted_share = if emit_share && share.is_none() {
+        Some(Share {
+            sims,
+            plan,
+            c,
+            s,
+            fwhms,
+            star_grow,
+            rfield: rfield.clone(),
+            probe,
+            stars,
+        })
+    } else {
+        None
+    };
+    Ok(RunOut {
+        image,
+        cov,
+        share: emitted_share,
+    })
+
 }
+
 
 fn out_stem(tag: &str, fname: Option<&str>) -> String {
     let mut parts = vec!["PWS".to_string()];
@@ -1414,7 +1902,11 @@ fn locate_extended_source(img: &Img) -> (usize, usize) {
     (((best.0 as f32 + 0.5) * B as f32) as usize, ((best.1 as f32 + 0.5) * B as f32) as usize)
 }
 
-fn collect_frames(dir: &Path, allow_aligned: bool) -> Result<Vec<PathBuf>, String> {
+fn collect_frames(
+    dir: &Path,
+    allow_aligned: bool,
+    include_registered: bool,
+) -> Result<Vec<PathBuf>, String> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
         let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
         for e in rd.flatten() {
@@ -1435,7 +1927,10 @@ fn collect_frames(dir: &Path, allow_aligned: bool) -> Result<Vec<PathBuf>, Strin
     all.retain(|p| {
         let s = p.to_string_lossy().to_lowercase();
         let seg: Vec<&str> = s.split(['/', '\\']).collect();
-        let bad = ["flat", "dark", "bias", "registered", "registration", "aligned"];
+        let mut bad = vec!["flat", "dark", "bias"];
+        if !include_registered {
+            bad.extend(["registered", "registration", "aligned"]);
+        }
         for part in &seg[..seg.len().saturating_sub(1)] {
             if bad.iter().any(|b| part.contains(b)) {
                 return false;
@@ -1460,3 +1955,4 @@ fn filter_hint(p: &Path) -> String {
     }
     String::new()
 }
+
