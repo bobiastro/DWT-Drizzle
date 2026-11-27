@@ -1,0 +1,909 @@
+//! GUI-friendly full pipeline: calibrated, un-registered XISF frames in, one
+//! stacked XISF plus the usual R / N_eff / weights companions out.
+//!
+//! This module only orchestrates the public `dwt-rs` primitives.  It does not
+//! re-implement any numeric kernel; the existing command line pipeline remains
+//! the reference implementation.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+use dwt_rs::bggrad;
+use dwt_rs::detect;
+use dwt_rs::drizzle::{self, Acc, Plan};
+use dwt_rs::image::{self, Img};
+use dwt_rs::register::{self, Sim};
+use dwt_rs::rfield;
+use dwt_rs::stack;
+use dwt_rs::xisf::{self, OutMeta};
+
+/// Reference exposure used by the Python pipeline.
+const EXPTIME_REF: f32 = 300.0;
+
+/// Everything the GUI needs to describe a stack run.  Field names are kept in
+/// the same spelling as `core/pws_params.py` so settings can be exchanged with
+/// the Python front end.
+#[derive(Debug, Clone)]
+pub struct JobConfig {
+    pub photos: String,
+    pub out: String,
+    pub tag: String,
+    pub a: f32,
+    pub rej_k: f32,
+    pub snr_clip: f32,
+    pub detail_snr: f32,
+    pub limit: usize,
+    pub pick: String,
+    pub tune: usize,
+    pub tune_a: String,
+    pub tune_jobs: usize,
+    pub frames_dir: String,
+    pub keep_frames: bool,
+    pub crop: usize,
+    pub sharp_tiles: usize,
+    pub center: String,
+    pub b: f32,
+    pub flux_pow: f32,
+    pub fwhm_search: usize,
+    pub gpu: String,
+    pub frame: String,
+    pub crop_cover: f32,
+    pub native_1x: bool,
+    pub bgdeg: i32,
+    pub bg_r: f32,
+    pub env_win_mult: f32,
+    pub env_eps: f32,
+    pub env_p: f32,
+    pub star_grow_pct: f32,
+    pub aligned: bool,
+    pub cfa: String,
+    pub cfa_debayer: String,
+    pub cfa_weights: String,
+    pub cfa_ref: String,
+    pub cfa_raw: String,
+    pub cfa_align: String,
+    pub rgb_balance: String,
+    pub cfa_grid: String,
+    pub ref_k: usize,
+    pub cfa_drizzle: bool,
+    pub cfa_drizzle_scale: f32,
+    pub r_floor: f32,
+    pub n_star: usize,
+    pub c_star: usize,
+    pub jobs: usize,
+    pub rej_mode: String,
+    pub rej_z: bool,
+    pub max_share: f32,
+    pub kernel: String,
+    pub two_pass: bool,
+    pub cache: bool,
+    pub cache_dir: String,
+    pub psf_target: f32,
+    pub rej_gate: f32,
+    pub drizzle: bool,
+    pub drizzle_scale: f32,
+    pub drizzle_pix: f32,
+    pub sharp_w: f32,
+    pub fwhm_max: f32,
+    pub r_blur: f32,
+    pub r_mode: String,
+    pub r_win: f32,
+    pub r_k: f32,
+    pub ln: bool,
+    pub xdrz: String,
+    pub match_path: String,
+    pub match_scale: bool,
+}
+
+impl Default for JobConfig {
+    fn default() -> Self {
+        Self {
+            photos: String::new(),
+            out: String::new(),
+            tag: String::new(),
+            a: 20.0,
+            rej_k: 3.5,
+            snr_clip: 3.0,
+            detail_snr: 0.0,
+            limit: 0,
+            pick: String::new(),
+            tune: 0,
+            tune_a: "10,14,20".into(),
+            tune_jobs: 2,
+            frames_dir: String::new(),
+            keep_frames: false,
+            crop: 0,
+            sharp_tiles: 0,
+            center: String::new(),
+            b: 2.0,
+            flux_pow: 0.0,
+            fwhm_search: 0,
+            gpu: "auto".into(),
+            frame: String::new(),
+            crop_cover: 0.9,
+            native_1x: false,
+            bgdeg: 1,
+            bg_r: 0.0,
+            env_win_mult: 2.0,
+            env_eps: 16.0,
+            env_p: 1.0,
+            star_grow_pct: 100.0,
+            aligned: false,
+            cfa: "off".into(),
+            cfa_debayer: "bilinear".into(),
+            cfa_weights: "auto".into(),
+            cfa_ref: String::new(),
+            cfa_raw: "auto".into(),
+            cfa_align: "auto".into(),
+            rgb_balance: "off".into(),
+            cfa_grid: "shared".into(),
+            ref_k: 0,
+            cfa_drizzle: false,
+            cfa_drizzle_scale: 2.0,
+            r_floor: 0.0,
+            n_star: 120,
+            c_star: 64,
+            jobs: 0,
+            rej_mode: "winsor".into(),
+            rej_z: true,
+            max_share: 0.25,
+            kernel: "box".into(),
+            two_pass: false,
+            cache: true,
+            cache_dir: String::new(),
+            psf_target: 50.0,
+            rej_gate: 1.0 / 3.0,
+            drizzle: false,
+            drizzle_scale: 2.0,
+            drizzle_pix: 1.0,
+            sharp_w: 0.0,
+            fwhm_max: 0.0,
+            r_blur: 0.0,
+            r_mode: "max".into(),
+            r_win: 0.0,
+            r_k: 3.0,
+            ln: false,
+            xdrz: String::new(),
+            match_path: String::new(),
+            match_scale: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JobProgress {
+    pub stage: String,
+    pub current: usize,
+    pub total: usize,
+}
+
+impl JobProgress {
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.current as f32 / self.total as f32).clamp(0.0, 1.0)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JobResult {
+    pub image_path: String,
+    pub r_path: Option<String>,
+    pub neff_path: Option<String>,
+    pub weights_path: Option<String>,
+    pub frames: usize,
+    pub width: usize,
+    pub height: usize,
+    pub reject_rate: f32,
+    pub elapsed_secs: f32,
+}
+
+/// Run a complete stack with a per-line log callback.  The caller is expected
+/// to run this on a worker thread; all callbacks are invoked on that thread.
+pub fn run_job(cfg: &JobConfig, log: impl Fn(&str)) -> Result<JobResult, String> {
+    run_job_with_progress(cfg, log, |_| {}, &AtomicBool::new(false))
+}
+
+/// Run a complete stack with progress and cooperative cancellation.
+pub fn run_job_with_progress(
+    cfg: &JobConfig,
+    log: impl Fn(&str),
+    progress: impl Fn(JobProgress),
+    cancel: &AtomicBool,
+) -> Result<JobResult, String> {
+    validate(cfg)?;
+    let t0 = Instant::now();
+    let photos = PathBuf::from(&cfg.photos);
+    let out_dir = PathBuf::from(&cfg.out);
+    fs::create_dir_all(&out_dir).map_err(|e| format!("创建输出目录失败: {e}"))?;
+
+    log(&format!("[分组] 扫描素材：{}", photos.display()));
+    let mut files = Vec::new();
+    collect_xisf(&photos, &mut files).map_err(|e| format!("扫描素材失败: {e}"))?;
+    if files.is_empty() {
+        return Err("素材目录里没有找到可叠的 XISF（Flat/Dark/Bias 已跳过）".into());
+    }
+
+    let mut groups: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for p in files {
+        groups.entry(filter_hint(&p).unwrap_or_else(|| "UNKNOWN".into())).or_default().push(p);
+    }
+    let mut channels: Vec<(String, usize)> =
+        groups.iter().map(|(k, v)| (k.clone(), v.len())).collect();
+    channels.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    log(&format!(
+        "[分组] 发现 {} 帧，{} 个通道：{}",
+        groups.values().map(Vec::len).sum::<usize>(),
+        channels.len(),
+        channels.iter().map(|(k, n)| format!("{k}({n})")).collect::<Vec<_>>().join(" ")
+    ));
+
+    let pick = if cfg.pick.trim().is_empty() {
+        channels.first().map(|(k, _)| k.clone()).unwrap_or_else(|| "UNKNOWN".into())
+    } else {
+        cfg.pick.trim().to_string()
+    };
+    let mut selected = groups.get(&pick).cloned().unwrap_or_default();
+    if selected.is_empty() {
+        return Err(format!("没有找到通道 {pick} 的素材"));
+    }
+    selected.sort();
+    if cfg.limit > 0 && selected.len() > cfg.limit {
+        selected.truncate(cfg.limit);
+    }
+    if selected.is_empty() {
+        return Err("选中的通道没有帧".into());
+    }
+    log(&format!("[分组] 使用通道 {pick}，{} 帧", selected.len()));
+
+    check_cancel(cancel)?;
+    let total = selected.len() + 12;
+    progress(JobProgress { stage: "读取素材".into(), current: 0, total });
+
+    // First pass: dimensions and exposure time.  Cropping happens below.
+    let mut dims: Option<(usize, usize)> = None;
+    let mut exps = Vec::with_capacity(selected.len());
+    for (i, p) in selected.iter().enumerate() {
+        check_cancel(cancel)?;
+        let (meta, img) = xisf::read_xisf(p).map_err(|e| format!("读取 {}: {e}", p.display()))?;
+        let typ = meta.keyword_str("IMAGETYP").unwrap_or_default().to_ascii_lowercase();
+        if typ.contains("flat") || typ.contains("dark") || typ.contains("bias") {
+            return Err(format!("{} 不是 Light 帧", p.display()));
+        }
+        let exp = meta
+            .keyword_f64("EXPTIME")
+            .or_else(|| meta.keyword_f64("EXPOSURE"))
+            .unwrap_or(0.0);
+        if let Some((w, h)) = dims {
+            if (w, h) != (img.w, img.h) {
+                return Err(format!(
+                    "{} 尺寸 {}x{} 与首帧 {}x{} 不一致",
+                    p.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                    img.w,
+                    img.h,
+                    w,
+                    h
+                ));
+            }
+        } else {
+            dims = Some((img.w, img.h));
+        }
+        exps.push(exp);
+        progress(JobProgress {
+            stage: "读取素材".into(),
+            current: i + 1,
+            total: total + selected.len(),
+        });
+    }
+    let (w0, h0) = dims.ok_or("没有可用帧")?;
+    log(&format!("[读数] {} 帧，{}×{}，曝光中位 {:.1}s", selected.len(), w0, h0, median_f64(&exps)));
+
+    // Crop centre is measured on a sparse subset of the original frames.
+    let (cw, ch, cx, cy) = if cfg.crop > 0 {
+        let side = cfg.crop.min(w0).min(h0);
+        let (ccx, ccy) = if let Some((cx, cy)) = parse_center(&cfg.center) {
+            (cx, cy)
+        } else {
+            locate_center(&selected, w0, h0).unwrap_or((w0 as f32 * 0.5, h0 as f32 * 0.5))
+        };
+        let x0 = (ccx - side as f32 * 0.5).round().clamp(0.0, (w0 - side) as f32) as usize;
+        let y0 = (ccy - side as f32 * 0.5).round().clamp(0.0, (h0 - side) as f32) as usize;
+        log(&format!("[读数] 裁剪 {side}×{side}，起点 ({x0},{y0})"));
+        (side, side, x0, y0)
+    } else {
+        (w0, h0, 0, 0)
+    };
+
+    let mut frames: Vec<Img> = Vec::with_capacity(selected.len());
+    let mut frame_sigmas: Vec<f32> = Vec::with_capacity(selected.len());
+    for (i, p) in selected.iter().enumerate() {
+        check_cancel(cancel)?;
+        let (_, src) = xisf::read_xisf(p).map_err(|e| format!("读取 {}: {e}", p.display()))?;
+        let mut img = if cfg.crop > 0 { src.crop(cx, cy, cw, ch) } else { src };
+        let exp = exps[i];
+        if exp.is_finite() && exp > 1.0 {
+            let f = EXPTIME_REF / exp as f32;
+            for v in &mut img.d {
+                *v *= f;
+            }
+        }
+        let sky = image::median_of(&sample_stride(&img, 4));
+        let sig = detect::noise_sigma(&img);
+        let _ = bggrad::flatten(&mut img, cfg.bgdeg.max(0) as usize);
+        log(&format!(
+            "[归一] 帧{i} sky={sky:.4} σ={sig:.4} 曝光={exp:.1}s fwhm_search={}",
+            cfg.fwhm_search
+        ));
+        frame_sigmas.push(sig.max(1e-6));
+        frames.push(img);
+        progress(JobProgress {
+            stage: "归一化".into(),
+            current: selected.len() + i + 1,
+            total: total + selected.len(),
+        });
+    }
+
+    // Pick the frame with the most detected stars, then measure all frames on
+    // that common star table (matching the CLI pipeline).
+    let mut best = (0usize, 0usize);
+    for (i, f) in frames.iter().enumerate() {
+        let n = detect::build_star_table(f, cfg.n_star, 26, 25.0).len();
+        if n > best.1 {
+            best = (i, n);
+        }
+        progress(JobProgress {
+            stage: "星表".into(),
+            current: selected.len() * 2 + i + 1,
+            total: total + selected.len(),
+        });
+    }
+    let probe = best.0;
+    let stars = detect::build_star_table(&frames[probe], cfg.n_star, 26, 25.0);
+    if stars.len() < 3 {
+        return Err("检测到的星点太少，无法测 FWHM/配准".into());
+    }
+    log(&format!("[星表] 参考帧 {probe}，{} 颗星（表 {}）", stars.len(), best.1));
+
+    let mut fwhms = Vec::with_capacity(frames.len());
+    for (i, f) in frames.iter().enumerate() {
+        check_cancel(cancel)?;
+        let v = detect::measure_fwhm_search(f, &stars, 16, cfg.fwhm_search);
+        fwhms.push(v);
+        let msg = if v.is_finite() {
+            format!("[C] 帧{i} FWHM={v:.2}px")
+        } else {
+            format!("[C] 帧{i} FWHM 测量失败")
+        };
+        log(&msg);
+        progress(JobProgress {
+            stage: "清晰度".into(),
+            current: selected.len() * 3 + i + 1,
+            total: total + selected.len(),
+        });
+    }
+    let mut fw: Vec<f32> = fwhms.iter().copied().filter(|v| v.is_finite() && *v > 0.0).collect();
+    let fmed = if fw.is_empty() { 3.0 } else { image::median_of(&mut fw) };
+    let mut sig = frame_sigmas.clone();
+    let sig_med = image::median_of(&mut sig);
+    let c: Vec<f32> = fwhms.iter().map(|v| if v.is_finite() && *v > 0.0 { fmed / *v } else { 1.0 }).collect();
+    let gate = if cfg.rej_gate.is_finite() && cfg.rej_gate > 1.0 { cfg.rej_gate } else { 3.0 };
+    let s: Vec<f32> = frame_sigmas.iter().map(|v| (sig_med / v.max(1e-6)).clamp(1.0 / gate, gate)).collect();
+
+    // Registration (skipped when the caller says the input is already aligned).
+    let mut sims = vec![Sim::identity(); frames.len()];
+    if !cfg.aligned {
+        let refc = register::centroids(&frames[probe], &stars, 8);
+        let mut solved = 0usize;
+        for i in 0..frames.len() {
+            if i == probe {
+                continue;
+            }
+            check_cancel(cancel)?;
+            let own = detect::build_star_table(&frames[i], cfg.n_star, 26, 25.0);
+            let cc = register::centroids(&frames[i], &own, 8);
+            match register::estimate(&refc, &cc, 64.0) {
+                Some(sim) => {
+                    log(&format!(
+                        "[配准] 帧{i} dx={:+.2} dy={:+.2} rot={:+.3} k={:.5} n={} rms={:.2}",
+                        sim.ux, sim.uy, sim.theta, sim.k, sim.n, sim.rms
+                    ));
+                    sims[i] = sim;
+                    solved += 1;
+                }
+                None => log(&format!("[配准] 帧{i} 匹配失败，退回恒等变换")),
+            }
+        }
+        if let Some(ps) = sims.get(probe).filter(|s| !s.is_identity()) {
+            let inv = ps.inverse();
+            for s in sims.iter_mut() {
+                *s = s.compose(&inv);
+            }
+        }
+        log(&format!("[配准] {} 帧，成功 {solved}，最大旋转 {:.3}°/尺度偏差 {:.3}", frames.len(),
+            sims.iter().map(|s| s.theta.abs()).fold(0.0f32, f32::max),
+            sims.iter().map(|s| (s.k - 1.0).abs()).fold(0.0f32, f32::max)));
+    } else {
+        log("[配准] --aligned：输入已对齐，跳过");
+    }
+
+    // Reference = median of the sharpest frames (8 like the CLI, unless fewer).
+    let k = frames.len().min(8).max(1);
+    let mut order: Vec<usize> = (0..frames.len()).collect();
+    order.sort_by(|&a, &b| fwhms[a].partial_cmp(&fwhms[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let ref_idx: Vec<usize> = order.into_iter().take(k).collect();
+    let refs: Vec<&Img> = ref_idx.iter().map(|&i| &frames[i]).collect();
+    let sref = image::stack_median(&refs);
+    log(&format!("[R 场] 参考帧 {:?}，FWHM 中位 {fmed:.3}px", ref_idx));
+
+    let sigma_ref = (fmed / 2.3548).max(0.2);
+    // Trailing-star growth, matching the CLI's `star_grow` semantics: measure
+    // the trailing length on every frame, take the 90th percentile, express it
+    // in PSF sigmas, then scale by the user's percentage.
+    let mut star_grow = 0.0f32;
+    if cfg.star_grow_pct > 0.0 {
+        let mut lam1: Vec<f32> = Vec::with_capacity(frames.len());
+        for fr in &frames {
+            let (l1, _pa) = detect::measure_trail(fr, &stars, sigma_ref);
+            lam1.push(l1);
+        }
+        let fin: Vec<f32> = lam1.iter().copied().filter(|v| v.is_finite()).collect();
+        if !fin.is_empty() {
+            let ref1 = image::median_of(&fin);
+            let mut ls: Vec<f32> = lam1
+                .iter()
+                .map(|v| if v.is_finite() { (12.0 * (*v - ref1).max(0.0)).sqrt() } else { f32::NAN })
+                .collect();
+            ls.retain(|v| v.is_finite());
+            if !ls.is_empty() {
+                let grow_auto = image::percentile(&mut ls, 90.0);
+                star_grow = grow_auto / sigma_ref.max(0.5) * cfg.star_grow_pct / 100.0;
+                log(&format!(
+                    "[拖线] 自动外扩 {grow_auto:.1}px ÷ σ_psf {:.2}px；按 {}% 取 {star_grow:.2}σ_psf",
+                    sigma_ref, cfg.star_grow_pct
+                ));
+            }
+        }
+    }
+    let (mut rfield_img, rinfo) = rfield::build_r_field(
+        &sref,
+        sigma_ref,
+        cfg.r_floor,
+        cfg.env_win_mult,
+        cfg.env_eps,
+        cfg.env_p,
+        star_grow,
+        2,
+        None,
+    );
+    if cfg.r_blur > 0.0 {
+        rfield_img = image::gaussian_filter(&rfield_img, cfg.r_blur);
+    }
+    progress(JobProgress {
+        stage: "R 场".into(),
+        current: selected.len() * 4 + 1,
+        total: total + selected.len(),
+    });
+    log(&format!(
+        "[R 场] σ_psf={:.3} win={} grow={:.2} t50={:.2} t90={:.2} mean={:.3} >50%={:.1}%",
+        rinfo.sigma_psf, rinfo.win, rinfo.grow_px, rinfo.t_p50, rinfo.t_p90, rinfo.r_mean,
+        rinfo.r_gt50 * 100.0
+    ));
+
+    let mut wts = stack::strip_weights(
+        &c,
+        &s,
+        &rfield_img,
+        cfg.a,
+        cfg.b,
+        if cfg.detail_snr > 0.5 { 1.0 } else { 0.0 },
+        cfg.max_share,
+    );
+    let sky_level = image::median_of(&sample_stride(&frames[probe], 4));
+    log(&format!("[S] C 权重 A={} B={} κ={} 单帧上限={}", cfg.a, cfg.b, cfg.rej_k, cfg.max_share));
+    progress(JobProgress {
+        stage: "权重".into(),
+        current: selected.len() * 4 + 2,
+        total: total + selected.len(),
+    });
+
+    let out_scale = if cfg.drizzle { cfg.drizzle_scale.max(1.0) } else { 1.0 };
+    // Identity 1× stacks use a plain canvas; a similarity plan would add a
+    // one-pixel margin and break the `stack_strip` fast path below.
+    let plan = if cfg.drizzle || !cfg.aligned {
+        Plan::new_sim(cw, ch, &sims, out_scale, 1.0, None)
+    } else {
+        Plan::new(cw, ch, &[0.0], &[0.0], 1.0, 0.0)
+    };
+    log(&format!(
+        "[drizzle] 输出 {}×{} 倍率 {out_scale} pixfrac {}",
+        plan.w, plan.h, cfg.drizzle_pix
+    ));
+    check_cancel(cancel)?;
+
+    let mut acc = Acc::new(plan);
+    let mut sq_acc = Acc::new(acc.plan);
+    let pixfrac = if cfg.drizzle { cfg.drizzle_pix.clamp(0.3, 1.0) } else { 1.0 };
+    let drop_mul = if cfg.aligned { 1.0 } else { 2.0 };
+    let rej_rate: f32;
+    if cfg.drizzle || !cfg.aligned {
+        rej_rate = stack::reject(
+            &frames,
+            &mut wts,
+            Some(&rfield_img),
+            sky_level,
+            cfg.rej_k,
+            1.0 / 3.0,
+            Some(&frame_sigmas),
+            true,
+        );
+        for (i, f) in frames.iter().enumerate() {
+            check_cancel(cancel)?;
+            drizzle::drizzle_add(
+                &mut acc,
+                f,
+                sims[i].ux,
+                sims[i].uy,
+                sims[i].theta,
+                sims[i].k,
+                (pixfrac * drop_mul).max(0.3),
+                &wts[i].d,
+            );
+            let wimg = Img::from_vec(cw, ch, wts[i].d.clone());
+            drizzle::drizzle_add(
+                &mut sq_acc,
+                &wimg,
+                sims[i].ux,
+                sims[i].uy,
+                sims[i].theta,
+                sims[i].k,
+                (pixfrac * drop_mul).max(0.3),
+                &wts[i].d,
+            );
+            progress(JobProgress {
+                stage: "叠加".into(),
+                current: selected.len() * 5 + i + 1,
+                total: total + selected.len() * 2,
+            });
+        }
+    } else {
+        let stacked = stack::stack_strip(
+            &frames,
+            &mut wts,
+            Some(&rfield_img),
+            sky_level,
+            cfg.rej_k,
+            1.0 / 3.0,
+            Some(&frame_sigmas),
+        );
+        acc.num = stacked.image.d.clone();
+        acc.den = vec![1.0f32; stacked.image.d.len()];
+        rej_rate = stacked.reject_rate;
+        log(&format!("[叠加] 1× 网格，排异率 {:.2}%", rej_rate * 100.0));
+    }
+
+    let mut out_img = if cfg.drizzle || !cfg.aligned { acc.finish() } else { acc.finish() };
+    let exp_factor = median_f64(&exps).max(1.0) as f32 / EXPTIME_REF;
+    for v in &mut out_img.d {
+        if v.is_finite() {
+            *v *= exp_factor;
+        }
+    }
+
+    // Effective sample count.  For the drizzle path den=Σw and the auxiliary
+    // accumulator num=Σw², so N_eff = den² / Σw².
+    let mut neff = vec![0.0f32; out_img.d.len()];
+    if cfg.drizzle || !cfg.aligned {
+        for p in 0..neff.len() {
+            let w = acc.den[p];
+            let w2 = sq_acc.num[p];
+            neff[p] = if w2 > 1e-12 { w * w / w2 } else { 0.0 };
+        }
+    } else {
+        // stack_strip path is not currently used (all non-identity plans go
+        // through drizzle_acc), kept for the 1×/aligned fast path.
+        neff.fill(frames.len() as f32);
+    }
+
+    let (x0, y0, cw2, ch2) = if cfg.crop_cover > 0.0 && cfg.crop_cover < 1.0 {
+        let (bx, by, bw, bh) = autocrop_bounds(&acc.den, acc.plan.w, acc.plan.h, cfg.crop_cover);
+        if bw > 8 && bh > 8 {
+            out_img = out_img.crop(bx, by, bw, bh);
+            let mut n2 = vec![0.0f32; bw * bh];
+            for y in 0..bh {
+                for x in 0..bw {
+                    n2[y * bw + x] = neff[(by + y) * acc.plan.w + bx + x];
+                }
+            }
+            neff = n2;
+            log(&format!("[输出] 自动裁边 {}×{} -> {}×{}", acc.plan.w, acc.plan.h, bw, bh));
+            (bx, by, bw, bh)
+        } else {
+            (0, 0, acc.plan.w, acc.plan.h)
+        }
+    } else {
+        (0, 0, acc.plan.w, acc.plan.h)
+    };
+    let _ = (x0, y0);
+
+    let stem = output_stem(&cfg.tag, &pick);
+    let image_path = out_dir.join(format!("{stem}.xisf"));
+    let r_q4 = image::downsample(&rfield_img, 4);
+    let neff_img = Img::from_vec(cw2, ch2, neff);
+    let neff_q4 = image::downsample(&neff_img, 4);
+    let r_path = out_dir.join(format!("{stem}_R_q4.npy"));
+    let neff_path = out_dir.join(format!("{stem}_neff_q4.npy"));
+    let weights_path = out_dir.join(format!("{stem}_weights.txt"));
+    xisf::write_npy_f32(&r_path, &r_q4.d, r_q4.h, r_q4.w)
+        .map_err(|e| format!("写 R 场失败: {e}"))?;
+    xisf::write_npy_f32(&neff_path, &neff_q4.d, neff_q4.h, neff_q4.w)
+        .map_err(|e| format!("写 N_eff 失败: {e}"))?;
+    let mut table = String::from("# idx  fwhm_px  C_sharp  sigma  S_snr\n");
+    for i in 0..frames.len() {
+        table.push_str(&format!(
+            "{i:>4}  {:>8.3}  {:>7.4}  {:>7.4}  {:>7.4}\n",
+            fwhms[i], c[i], frame_sigmas[i], s[i]
+        ));
+    }
+    fs::write(&weights_path, table).map_err(|e| format!("写权重表失败: {e}"))?;
+
+    let meta = OutMeta {
+        total_exp: exps.iter().sum::<f64>(),
+        ncombine: frames.len() as u32,
+        stack_mode: if cfg.drizzle { "PWS-drizzle".into() } else { "PWS".into() },
+        passthrough: vec![
+            ("FILTER".into(), format!("'{pick}'")),
+            ("PWS_A".into(), format!("{:.3}", cfg.a)),
+            ("PWS_REJK".into(), format!("{:.3}", cfg.rej_k)),
+            ("PWS_SCALE".into(), format!("{out_scale:.3}")),
+        ],
+    };
+    xisf::write_xisf(&image_path, &out_img, &meta).map_err(|e| format!("写 XISF 失败: {e}"))?;
+    log(&format!(
+        "[输出] {}  {}×{}  σ_psf={:.2} 排异率={:.2}% 用时 {:.1}s",
+        image_path.display(), out_img.w, out_img.h, rinfo.sigma_psf, rej_rate * 100.0,
+        t0.elapsed().as_secs_f32()
+    ));
+    log(&format!("[输出] {}", r_path.display()));
+    log(&format!("[输出] {}", neff_path.display()));
+    log(&format!("[输出] {}", weights_path.display()));
+
+    Ok(JobResult {
+        image_path: image_path.to_string_lossy().into_owned(),
+        r_path: Some(r_path.to_string_lossy().into_owned()),
+        neff_path: Some(neff_path.to_string_lossy().into_owned()),
+        weights_path: Some(weights_path.to_string_lossy().into_owned()),
+        frames: frames.len(),
+        width: out_img.w,
+        height: out_img.h,
+        reject_rate: rej_rate,
+        elapsed_secs: t0.elapsed().as_secs_f32(),
+    })
+}
+
+fn validate(cfg: &JobConfig) -> Result<(), String> {
+    if cfg.photos.trim().is_empty() {
+        return Err("请选择素材目录".into());
+    }
+    if !Path::new(&cfg.photos).is_dir() {
+        return Err(format!("素材目录不存在：{}", cfg.photos));
+    }
+    if cfg.out.trim().is_empty() {
+        return Err("请选择输出目录".into());
+    }
+    if !cfg.a.is_finite() || cfg.a <= 0.0 {
+        return Err("清晰度 A 必须大于 0".into());
+    }
+    Ok(())
+}
+
+fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) { Err("已取消".into()) } else { Ok(()) }
+}
+
+fn collect_xisf(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        let lower = p.to_string_lossy().to_ascii_lowercase();
+        let skip = ["flat", "dark", "bias", "registered", "registration", "aligned"]
+            .iter()
+            .any(|s| lower.split(['/', '\\']).any(|seg| seg.contains(s)));
+        if p.is_dir() {
+            if !skip {
+                collect_xisf(&p, out)?;
+            }
+        } else if !skip && p.extension().and_then(|s| s.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("xisf")) {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+fn filter_hint(path: &Path) -> Option<String> {
+    let s = path.to_string_lossy();
+    let up = s.to_ascii_uppercase();
+    if let Some(i) = up.find("FILTER-") {
+        let rest = &s[i + 7..];
+        let end = rest.find(['_', '\\', '/', '.']).unwrap_or(rest.len());
+        let v = rest[..end].trim_matches(['\'', '"', ' ']);
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    let stem = path.file_stem()?.to_string_lossy();
+    // PixInsight's usual name is Light_<filter>_...; the CLI's legacy
+    // fallback only looked at field 2.  Accept either position so scans of
+    // both `Light_H_...` and `Light_BIN-1_...` trees work.
+    for field in 1..=2 {
+        if let Some(v) = stem.split('_').nth(field) {
+            if v.len() == 1 && v.chars().all(|c| c.is_ascii_alphabetic()) {
+                return Some(v.to_ascii_uppercase());
+            }
+        }
+    }
+    None
+}
+
+fn sample_stride(img: &Img, step: usize) -> Vec<f32> {
+    let mut v = Vec::with_capacity((img.w / step + 1) * (img.h / step + 1));
+    let mut y = 0;
+    while y < img.h {
+        let mut x = 0;
+        while x < img.w {
+            let p = img.at(y, x);
+            if p.is_finite() {
+                v.push(p);
+            }
+            x += step;
+        }
+        y += step;
+    }
+    v
+}
+
+fn median_f64(v: &[f64]) -> f64 {
+    let mut x: Vec<f64> = v.iter().copied().filter(|v| v.is_finite()).collect();
+    if x.is_empty() {
+        return 0.0;
+    }
+    x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    x[x.len() / 2]
+}
+
+fn parse_center(s: &str) -> Option<(f32, f32)> {
+    let mut it = s.split([',', 'x', 'X', ' ']).filter(|v| !v.trim().is_empty());
+    let a = it.next()?.trim().parse().ok()?;
+    let b = it.next()?.trim().parse().ok()?;
+    Some((a, b))
+}
+
+/// Coarse source locator: downsample 4×, block-median 8×8, Gaussian blur, then
+/// pick the brightest residual block.  Only used to centre a crop.
+fn locate_center(files: &[PathBuf], w: usize, h: usize) -> Option<(f32, f32)> {
+    let mut vals: Vec<Img> = Vec::new();
+    let n = files.len();
+    let take = n.min(8);
+    for i in 0..take {
+        let idx = i * n / take;
+        if let Ok((_, img)) = xisf::read_xisf(&files[idx]) {
+            if img.w == w && img.h == h {
+                vals.push(image::downsample(&img, 4));
+            }
+        }
+    }
+    if vals.is_empty() {
+        return None;
+    }
+    let (sw, sh) = (vals[0].w, vals[0].h);
+    let mut map = vec![0.0f32; sw * sh];
+    for img in &vals {
+        for y in 0..sh {
+            for x in 0..sw {
+                map[y * sw + x] += img.at(y, x);
+            }
+        }
+    }
+    for v in &mut map {
+        *v /= vals.len() as f32;
+    }
+    let bs = 8usize;
+    let mut blocks = Vec::new();
+    let mut yy = 0;
+    while yy + bs <= sh {
+        let mut xx = 0;
+        while xx + bs <= sw {
+            let mut tmp = Vec::with_capacity(bs * bs);
+            for y in yy..yy + bs {
+                for x in xx..xx + bs {
+                    tmp.push(map[y * sw + x]);
+                }
+            }
+            let m = image::median_of(&tmp);
+            blocks.push((m, xx + bs / 2, yy + bs / 2));
+            xx += bs;
+        }
+        yy += bs;
+    }
+    blocks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    blocks.first().map(|&(_, bx, by)| (bx as f32 * 4.0, by as f32 * 4.0))
+}
+
+/// Keep the largest centred rectangle whose border rows/columns have at least
+/// `cover` of their pixels covered by the stack.
+fn autocrop_bounds(den: &[f32], w: usize, h: usize, cover: f32) -> (usize, usize, usize, usize) {
+    let cov = |x: usize, y: usize| den[y * w + x] > 1e-4;
+    let row_frac = |y: usize| {
+        let n = (0..w).filter(|&x| cov(x, y)).count();
+        n as f32 / w as f32
+    };
+    let mut y0 = 0;
+    while y0 < h && row_frac(y0) < cover {
+        y0 += 1;
+    }
+    let mut y1 = h;
+    while y1 > y0 && row_frac(y1 - 1) < cover {
+        y1 -= 1;
+    }
+    let col_frac = |x: usize| {
+        let n = (y0..y1).filter(|&y| cov(x, y)).count();
+        n as f32 / (y1 - y0).max(1) as f32
+    };
+    let mut x0 = 0;
+    while x0 < w && col_frac(x0) < cover {
+        x0 += 1;
+    }
+    let mut x1 = w;
+    while x1 > x0 && col_frac(x1 - 1) < cover {
+        x1 -= 1;
+    }
+    if x1 <= x0 || y1 <= y0 {
+        (0, 0, w, h)
+    } else {
+        (x0, y0, x1 - x0, y1 - y0)
+    }
+}
+
+fn output_stem(tag: &str, filter: &str) -> String {
+    let mut s = String::from("PWS");
+    let tag = tag.trim();
+    if !tag.is_empty() {
+        s.push('_');
+        s.push_str(tag);
+    }
+    let f = filter.trim();
+    if !f.is_empty() {
+        s.push('_');
+        s.push_str(f);
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stem_matches_cli_convention() {
+        assert_eq!(output_stem("drz", "H"), "PWS_drz_H");
+        assert_eq!(output_stem("", "O"), "PWS_O");
+        assert_eq!(output_stem("a", ""), "PWS_a");
+    }
+
+    #[test]
+    fn filter_from_pixinsight_name() {
+        let p = Path::new("Light_BIN-1_3072x2240_EXPOSURE-1200.00s_FILTER-H_mono_DATE-2026-10-05.xisf");
+        assert_eq!(filter_hint(p).as_deref(), Some("H"));
+        assert_eq!(filter_hint(Path::new("Light_O_0001.xisf")).as_deref(), Some("O"));
+    }
+
+    #[test]
+    fn center_parser_accepts_comma_and_x() {
+        assert_eq!(parse_center("100, 200"), Some((100.0, 200.0)));
+        assert_eq!(parse_center("100x200"), Some((100.0, 200.0)));
+    }
+}

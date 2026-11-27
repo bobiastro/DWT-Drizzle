@@ -26,3 +26,8 @@ pub use geometry::{
     CanvasTransformPlan, SimilarityTransform, invert_affine, plan_transformed_canvas,
 };
 pub use pws::{FrameMetrics, PwsWeights, StackResult, derive_pws_weights, stack_aligned};
+pub mod eval;
+pub mod job;
+
+pub use eval::{EvalReport, NpyMap, StatBlock, eval_product, find_aux, load_npy_f32, map_as_img};
+pub use job::{JobConfig, JobProgress, JobResult, run_job, run_job_with_progress};

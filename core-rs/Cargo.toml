@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/dwt-backend", "crates/dwt-rs"]
+members = ["crates/dwt-backend", "crates/dwt-rs", "crates/dwt-gui"]
 resolver = "3"
 
 [workspace.package]
