@@ -1,4 +1,4 @@
-pub const VERSION: &str = "2.7.118-D";
+pub const VERSION: &str = "2.7.119-D";
 
 pub const LICENSE_TEXT: &str = "\
 分区加权叠加（PWS）+ Drizzle 几何重采样
