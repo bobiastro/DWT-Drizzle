@@ -87,6 +87,7 @@ struct Args {
     snr_clip: f32,
     rej_z: bool,
     sharp_w: f32,
+    flux_pow: f32,
     rej_mode: RejMode,
     star_grow: f32,
     r_floor: f32,
@@ -151,6 +152,7 @@ impl Default for Args {
             snr_clip: SNR_CLIP,
             rej_z: true,
             sharp_w: 0.0, // Python: drizzle 合成里的 `sharp_w`（core/drizzle.py:1990-2010），默认 0 即无效
+            flux_pow: 0.0, // Python: 吞吐权重 `T^fp`，默认 0 即无效
             rej_mode: RejMode::Winsor, // Python: `rej_mode` 默认 winsor
             star_grow: 100.0,
             r_floor: 0.0,
@@ -307,6 +309,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--sharp-w" => {
                 a.sharp_w = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--flux-pow" => {
+                a.flux_pow = num(val()?, flag)? as f32;
                 i += 2;
             }
             "--rej-mode" => {
@@ -1576,12 +1582,32 @@ fn run_pipeline(
 
     // ---- weights + rejection + combine ------------------------------------
     let t = Instant::now();
+    // 吞吐权重 T（配准后按参考星表测流量；Python pws.py:3941-3990）
+    let tflux: Option<Vec<f32>> = if a.flux_pow != 0.0 {
+        let tv = dwt_rs::pws::throughput(&frames, &stars, &sims, &plan_r, probe, 16, 7.0);
+        println!(
+            "[吞吐] T = {}",
+            tv.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(" ")
+        );
+        Some(tv)
+    } else {
+        None
+    };
     let wopts = WeightOpts {
         sharp_w: a.sharp_w,
-        flux_pow: 0.0,
+        flux_pow: a.flux_pow,
     };
     let wts = strip_weights_ext(
-        &c, &s, &rfield, a.a_exp, a.b_exp, a.beta, a.max_share, wopts, None, None,
+        &c,
+        &s,
+        &rfield,
+        a.a_exp,
+        a.b_exp,
+        a.beta,
+        a.max_share,
+        wopts,
+        tflux.as_deref(),
+        None,
     );
     let t_prof_sw = t.elapsed().as_secs_f32();
     if let Some(dir) = &a.dump_w {
