@@ -2488,3 +2488,32 @@ fn filter_hint(p: &Path) -> String {
     String::new()
 }
 
+#[cfg(test)]
+mod args_defaults_tests {
+    use super::*;
+
+    /// CLI 默认值必须与 Python 版一致：`fwhm_search=0`、`cfa_raw=auto`、`gpu=auto`，
+    /// 以及新接线的那些参数各自的「不生效」默认。
+    #[test]
+    fn defaults_match_the_python_reference() {
+        let a = Args::default();
+        assert_eq!(a.fwhm_search, 0);
+        assert_eq!(a.cfa_raw, "auto");
+        assert_eq!(a.gpu, "auto");
+        assert_eq!(a.snr_clip, 3.0);
+        assert!(a.rej_z);
+        assert_eq!(a.rej_mode, RejMode::Winsor);
+        assert_eq!(a.flux_pow, 0.0);
+        assert_eq!(a.sharp_w, 0.0);
+        assert_eq!(a.r_mode, RMode::Max);
+        assert_eq!(a.r_win, 0.0);
+        assert_eq!(a.r_k, 3.0);
+        assert_eq!(a.bg_r, 0.0);
+        assert_eq!(a.kernel, "box");
+        assert_eq!(a.psf_target, 50.0);
+        assert!(!a.two_pass);
+        assert_eq!(a.fwhm_max, 0.0);
+        // 默认参数下 GPU 门控不触发（gpu=auto 仍按老行为走 GPU）
+        assert!(gpu_unhonored(&a).is_none());
+    }
+}
