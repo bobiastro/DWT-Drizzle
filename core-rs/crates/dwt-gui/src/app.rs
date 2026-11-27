@@ -1006,7 +1006,7 @@ impl DrizzleApp {
                     theme::text_row(ui, "包络形状幂", &mut self.params.env_p, "默认 1.0；R 场包络形状幂");
                     theme::text_row(ui, "R 带通窗宽", &mut self.params.r_win, "0 = 关；band 模式下有效");
                     theme::text_row(ui, "对比度阈值", &mut self.params.r_k, "ctn 模式的对比度阈值，默认 3.0");
-                    theme::text_row(ui, "FWHM 搜索", &mut self.params.fwhm_search, "0 = 不搜索；dwt-rs CLI 默认 8");
+                    theme::text_row(ui, "FWHM 搜索", &mut self.params.fwhm_search, "0 = 不搜索（默认，与 Python 一致）");
                     theme::text_row(ui, "星点生长 %", &mut self.params.star_grow_pct, "R 场包络星点生长百分比，默认 100");
                     theme::text_row(ui, "R 场下限", &mut self.params.r_floor, "0..0.95，默认 0");
                     theme::unsupported_text(ui, "C 星点数", &mut self.params.c_star, "清晰度测量星点数，默认 64");

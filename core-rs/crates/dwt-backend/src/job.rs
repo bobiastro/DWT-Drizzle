@@ -350,7 +350,16 @@ pub fn run_job_with_progress(
         }
         let sky = image::median_of(&sample_stride(&img, 4));
         let sig = detect::noise_sigma(&img);
-        let _ = bggrad::flatten(&mut img, cfg.bgdeg.max(0) as usize);
+        // `bg_r > 0` 用「低阶面 + 径向偶次项」模型（Python bggrad.py:86-153），否则原样 flatten。
+        if cfg.bg_r.is_finite() && cfg.bg_r > 0.0 {
+            let _ = dwt_rs::pws::bg_radial_subtract(
+                &mut img,
+                cfg.bgdeg.max(0) as usize,
+                cfg.bg_r as usize,
+            );
+        } else {
+            let _ = bggrad::flatten(&mut img, cfg.bgdeg.max(0) as usize);
+        }
         log(&format!(
             "[归一] 帧{i} sky={sky:.4} σ={sig:.4} 曝光={exp:.1}s fwhm_search={}",
             cfg.fwhm_search
@@ -402,13 +411,46 @@ pub fn run_job_with_progress(
             total: total + selected.len(),
         });
     }
+    // Python `fwhm_max`：超限的帧整帧不参与叠加（pws.py:3833-3841）。
+    if cfg.fwhm_max.is_finite() && cfg.fwhm_max > 0.0 {
+        let cut = dwt_rs::pws::fwhm_max_cut(&fwhms, cfg.fwhm_max);
+        if !cut.is_empty() {
+            if cut.len() == frames.len() {
+                return Err(format!("fwhm_max {} 把所有帧都筛掉了", cfg.fwhm_max));
+            }
+            let keep: Vec<usize> =
+                (0..frames.len()).filter(|i| !cut.contains(i)).collect();
+            let mut src: Vec<Option<Img>> =
+                std::mem::take(&mut frames).into_iter().map(Some).collect();
+            frames = keep.iter().map(|&i| src[i].take().expect("frame taken twice")).collect();
+            fwhms = keep.iter().map(|&i| fwhms[i]).collect();
+            frame_sigmas = keep.iter().map(|&i| frame_sigmas[i]).collect();
+            log(&format!(
+                "[筛选] 剔除 {} 帧 FWHM > {}（剩余 {} 帧）",
+                cut.len(),
+                cfg.fwhm_max,
+                frames.len()
+            ));
+        }
+    }
     let mut fw: Vec<f32> = fwhms.iter().copied().filter(|v| v.is_finite() && *v > 0.0).collect();
     let fmed = if fw.is_empty() { 3.0 } else { image::median_of(&mut fw) };
     let mut sig = frame_sigmas.clone();
     let sig_med = image::median_of(&mut sig);
     let c: Vec<f32> = fwhms.iter().map(|v| if v.is_finite() && *v > 0.0 { fmed / *v } else { 1.0 }).collect();
-    let gate = if cfg.rej_gate.is_finite() && cfg.rej_gate > 1.0 { cfg.rej_gate } else { 3.0 };
-    let s: Vec<f32> = frame_sigmas.iter().map(|v| (sig_med / v.max(1e-6)).clamp(1.0 / gate, gate)).collect();
+    // S 权重限幅用 `snr_clip`（Python pws.py:3305-3320），`rej_gate`
+    // （= Python 的 `rej_max_frac`）只做排异比例上限，两者不再混用。
+    let s: Vec<f32> = frame_sigmas
+        .iter()
+        .map(|v| {
+            let raw = sig_med / v.max(1e-30);
+            if cfg.snr_clip.is_finite() && cfg.snr_clip > 1.0 {
+                raw.clamp(1.0 / cfg.snr_clip, cfg.snr_clip)
+            } else {
+                raw
+            }
+        })
+        .collect();
 
     // Registration (skipped when the caller says the input is already aligned).
     let mut sims = vec![Sim::identity(); frames.len()];
@@ -485,7 +527,7 @@ pub fn run_job_with_progress(
             }
         }
     }
-    let (mut rfield_img, rinfo) = rfield::build_r_field(
+    let (mut rfield_img, rinfo) = rfield::build_r_field_ext(
         &sref,
         sigma_ref,
         cfg.r_floor,
@@ -495,6 +537,9 @@ pub fn run_job_with_progress(
         star_grow,
         2,
         None,
+        rfield::RMode::parse(&cfg.r_mode),
+        cfg.r_win,
+        cfg.r_k,
     );
     if cfg.r_blur > 0.0 {
         rfield_img = image::gaussian_filter(&rfield_img, cfg.r_blur);
@@ -510,23 +555,6 @@ pub fn run_job_with_progress(
         rinfo.r_gt50 * 100.0
     ));
 
-    let mut wts = stack::strip_weights(
-        &c,
-        &s,
-        &rfield_img,
-        cfg.a,
-        cfg.b,
-        if cfg.detail_snr > 0.5 { 1.0 } else { 0.0 },
-        cfg.max_share,
-    );
-    let sky_level = image::median_of(&sample_stride(&frames[probe], 4));
-    log(&format!("[S] C 权重 A={} B={} κ={} 单帧上限={}", cfg.a, cfg.b, cfg.rej_k, cfg.max_share));
-    progress(JobProgress {
-        stage: "权重".into(),
-        current: selected.len() * 4 + 2,
-        total: total + selected.len(),
-    });
-
     let out_scale = if cfg.drizzle { cfg.drizzle_scale.max(1.0) } else { 1.0 };
     // Identity 1× stacks use a plain canvas; a similarity plan would add a
     // one-pixel margin and break the `stack_strip` fast path below.
@@ -541,24 +569,84 @@ pub fn run_job_with_progress(
     ));
     check_cancel(cancel)?;
 
+    // 吞吐权重 T（Python pws.py:3941-3990），仅在 flux_pow != 0 时测量
+    let tflux: Option<Vec<f32>> = if cfg.flux_pow != 0.0 {
+        let t = dwt_rs::pws::throughput(&frames, &stars, &sims, &plan, probe, 16, 7.0);
+        log(&format!(
+            "[吞吐] T = {}",
+            t.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(" ")
+        ));
+        Some(t)
+    } else {
+        None
+    };
+    // 两遍加权：64×64 瓦片清晰度场替代标量 C（Python pws.py:3150-3185 / 4665-4690）
+    let tiles: Option<Vec<Vec<f32>>> = if cfg.two_pass {
+        let t = dwt_rs::pws::local_sharp_maps(&frames, &plan, 64);
+        if let Some(t) = &t {
+            log(&format!("[两遍] 瓦片清晰度场 64px {} 帧", t.len()));
+        }
+        t
+    } else {
+        None
+    };
+    let mut wts = stack::strip_weights_ext(
+        &c,
+        &s,
+        &rfield_img,
+        cfg.a,
+        cfg.b,
+        if cfg.detail_snr > 0.5 { 1.0 } else { 0.0 },
+        cfg.max_share,
+        stack::WeightOpts { sharp_w: cfg.sharp_w, flux_pow: cfg.flux_pow },
+        tflux.as_deref(),
+        tiles.as_deref(),
+    );
+    let sky_level = image::median_of(&sample_stride(&frames[probe], 4));
+    log(&format!("[S] C 权重 A={} B={} κ={} 单帧上限={}", cfg.a, cfg.b, cfg.rej_k, cfg.max_share));
+    progress(JobProgress {
+        stage: "权重".into(),
+        current: selected.len() * 4 + 2,
+        total: total + selected.len(),
+    });
+
+
     let mut acc = Acc::new(plan);
     let mut sq_acc = Acc::new(acc.plan);
     let pixfrac = if cfg.drizzle { cfg.drizzle_pix.clamp(0.3, 1.0) } else { 1.0 };
     let drop_mul = if cfg.aligned { 1.0 } else { 2.0 };
     let rej_rate: f32;
     if cfg.drizzle || !cfg.aligned {
-        rej_rate = stack::reject(
+        // 与 Python 一致：drizzle 路径不传 frame_sig（rej_z 只影响非 drizzle 路径），
+        // 排异比例上限用 rej_gate（= rej_max_frac）。
+        rej_rate = stack::reject_ext(
             &frames,
             &mut wts,
             Some(&rfield_img),
             sky_level,
             cfg.rej_k,
-            1.0 / 3.0,
-            Some(&frame_sigmas),
+            cfg.rej_gate,
+            None,
             true,
+            stack::RejMode::parse(&cfg.rej_mode),
         );
+        // Python `kernel='psfmatch'`：按 PSF 目标把每帧核换成更宽的高斯
+        // （drizzle.py:2032-2130 / `_psfmatch_blur`），只在 drizzle 路径生效。
+        let pm_frames: Option<Vec<Img>> = if cfg.kernel == "psfmatch" || cfg.kernel == "psf" {
+            let v = dwt_rs::pws::psfmatch_frames(&frames, &fwhms, plan.s, cfg.psf_target);
+            if v.is_some() {
+                log(&format!("[核] psfmatch：目标 {} 百分位", cfg.psf_target));
+            }
+            v
+        } else {
+            None
+        };
         for (i, f) in frames.iter().enumerate() {
             check_cancel(cancel)?;
+            let f: &Img = match pm_frames.as_ref() {
+                Some(pm) => &pm[i],
+                None => f,
+            };
             drizzle::drizzle_add(
                 &mut acc,
                 f,
@@ -587,14 +675,17 @@ pub fn run_job_with_progress(
             });
         }
     } else {
-        let stacked = stack::stack_strip(
+        // 非 drizzle 路径才消费 rej_z（Python pws.py:4834/4867）
+        let fsig: Option<&[f32]> = if cfg.rej_z { Some(&frame_sigmas) } else { None };
+        let stacked = stack::stack_strip_mode(
             &frames,
             &mut wts,
             Some(&rfield_img),
             sky_level,
             cfg.rej_k,
-            1.0 / 3.0,
-            Some(&frame_sigmas),
+            cfg.rej_gate,
+            fsig,
+            stack::RejMode::parse(&cfg.rej_mode),
         );
         acc.num = stacked.image.d.clone();
         acc.den = vec![1.0f32; stacked.image.d.len()];
@@ -872,6 +963,36 @@ fn run_colour_job(
     if !cfg.gpu.trim().is_empty() && cfg.gpu.trim().to_ascii_lowercase() != "auto" {
         args.push("--gpu".into()); args.push(cfg.gpu.clone());
     }
+    // 把「能改变成品数值」的参数也原样透传给 dwt-rs.exe（彩机路径走的是子进程，
+    // 少一个 flag 就等于那条流程不认这个参数）。
+    args.push("--fwhm-search".into());
+    args.push(cfg.fwhm_search.to_string());
+    args.push("--snr-clip".into());
+    args.push(cfg.snr_clip.to_string());
+    args.push("--rej-z".into());
+    args.push(if cfg.rej_z { "1".into() } else { "0".into() });
+    args.push("--rej-mode".into());
+    args.push(cfg.rej_mode.clone());
+    args.push("--flux-pow".into());
+    args.push(cfg.flux_pow.to_string());
+    args.push("--sharp-w".into());
+    args.push(cfg.sharp_w.to_string());
+    args.push("--r-mode".into());
+    args.push(cfg.r_mode.clone());
+    args.push("--r-win".into());
+    args.push(cfg.r_win.to_string());
+    args.push("--r-k".into());
+    args.push(cfg.r_k.to_string());
+    args.push("--bg-r".into());
+    args.push(cfg.bg_r.to_string());
+    args.push("--kernel".into());
+    args.push(cfg.kernel.clone());
+    args.push("--psf-target".into());
+    args.push(cfg.psf_target.to_string());
+    args.push("--two-pass".into());
+    args.push(if cfg.two_pass { "1".into() } else { "0".into() });
+    args.push("--fwhm-max".into());
+    args.push(cfg.fwhm_max.to_string());
     let _ = cfg.ref_k;
     let _ = cfg.c_star;
 

@@ -530,5 +530,42 @@ mod tests {
         assert_eq!(c.n_star, 120);
         assert!(c.drizzle);
         assert_eq!(c.r_mode, "max");
+        // 与 Python 对齐的默认值（这几个以前是 off/8）
+        assert_eq!(c.fwhm_search, 0);
+        assert_eq!(c.cfa_raw, "auto");
+        assert_eq!(c.gpu, "auto");
+    }
+
+    /// 面板上的控制项必须真的走到 `JobConfig`，不能只是存进 toml。
+    #[test]
+    fn job_config_passes_wired_parameters_through() {
+        let mut p = Params::default();
+        p.snr_clip = "5".into();
+        p.rej_z = false;
+        p.rej_mode = "mad".into();
+        p.flux_pow = "2".into();
+        p.sharp_w = "5".into();
+        p.r_mode = "band".into();
+        p.r_win = "21".into();
+        p.r_k = "8".into();
+        p.bg_r = "2".into();
+        p.kernel = "psfmatch".into();
+        p.psf_target = "60".into();
+        p.two_pass = true;
+        p.fwhm_max = "5".into();
+        let c = p.job_config().unwrap();
+        assert_eq!(c.snr_clip, 5.0);
+        assert!(!c.rej_z);
+        assert_eq!(c.rej_mode, "mad");
+        assert_eq!(c.flux_pow, 2.0);
+        assert_eq!(c.sharp_w, 5.0);
+        assert_eq!(c.r_mode, "band");
+        assert_eq!(c.r_win, 21.0);
+        assert_eq!(c.r_k, 8.0);
+        assert_eq!(c.bg_r, 2.0);
+        assert_eq!(c.kernel, "psfmatch");
+        assert_eq!(c.psf_target, 60.0);
+        assert!(c.two_pass);
+        assert_eq!(c.fwhm_max, 5.0);
     }
 }
