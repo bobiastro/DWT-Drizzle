@@ -567,13 +567,33 @@ fn run() -> Result<(), String> {
     // ---- frame-to-frame registration --------------------------------------
     // Python's `measure_shifts` (core/drizzle.py) detects stars on every frame,
     // votes for the translation, then refines a similarity fit.  Same here.
+    // `--canvas-from` names the product we must reproduce, so it defines both the
+    // output grid and the geometry: without an external solution (--geom) every
+    // frame is registered against its pixels directly.  The old behaviour solved
+    // frame-to-frame and only borrowed the reference's *size*, which leaves the
+    // mosaic in the probe frame's orientation (a few tenths of a degree away)
+    // and shifts the whole field by tens of pixels.
+    let mut canvas_img: Option<Img> = None;
     let canvas: Option<(usize, usize)> = match &a.canvas_from {
         Some(p) => {
-            let (m, im) = dwt_rs::xisf::read_xisf(std::path::Path::new(p))
+            let (m, mut im) = dwt_rs::xisf::read_xisf(std::path::Path::new(p))
                 .map_err(|e| format!("--canvas-from {p}: {e}"))?;
             println!("[画布] 参考 {p}  {}x{}", im.w, im.h);
             let _ = m;
-            Some((im.w, im.h))
+            // NaN border pixels (uncovered canvas) poison the star table; the
+            // canvas is only used for geometry, so replace them with the sky.
+            let finite: Vec<f32> = im.d.iter().copied().filter(|v| v.is_finite()).collect();
+            if finite.len() != im.d.len() && !finite.is_empty() {
+                let sky = median_of(&finite);
+                for v in &mut im.d {
+                    if !v.is_finite() {
+                        *v = sky;
+                    }
+                }
+            }
+            let sz = (im.w, im.h);
+            canvas_img = Some(im);
+            Some(sz)
         }
         None => None,
     };
@@ -596,47 +616,81 @@ fn run() -> Result<(), String> {
         ));
     }
     let mut sims: Vec<dwt_rs::register::Sim> = vec![dwt_rs::register::Sim::identity(); frames.len()];
+    let mut canvas_anchored = false;
     if register {
         let t = Instant::now();
-        let refc = dwt_rs::register::centroids(&frames[probe], &stars, 8);
-        for (i, f) in frames.iter().enumerate() {
-            if i == probe {
-                continue;
-            }
-            let own = build_star_table(f, 120, 26, 25.0);
-            let c = dwt_rs::register::centroids(f, &own, 8);
-            match dwt_rs::register::estimate(&refc, &c, 64.0) {
-                Some(s) => {
+        // `--canvas-from` without `--geom`: solve each frame against the reference
+        // product itself, so the transforms are already expressed on the output
+        // grid and no bbox rebase is needed.
+        if a.geom.is_none() {
+            if let Some(cim) = canvas_img.as_ref() {
+                let cstars = build_star_table(cim, 400, 26, 25.0);
+                let refc = dwt_rs::register::centroids(cim, &cstars, 8);
+                println!("[配准] 参考画布星表 {} 颗", refc.len());
+                if refc.len() < 8 {
+                    return Err("参考画布上找不到足够的星，无法把帧锚定到参考网格".to_string());
+                }
+                for (i, f) in frames.iter().enumerate() {
+                    let own = build_star_table(f, 400, 26, 25.0);
+                    let c = dwt_rs::register::centroids(f, &own, 8);
+                    let s = dwt_rs::register::estimate(&refc, &c, 64.0).ok_or_else(|| {
+                        format!("帧{i} 无法与参考画布匹配，拒绝用错位的几何出图")
+                    })?;
                     println!(
-                        "[配准] 帧{i}  dx={:+.2} dy={:+.2} rot={:+.3}deg k={:.5} 匹配{} rms={:.2}px",
+                        "[配准] 帧{i} →画布  dx={:+.2} dy={:+.2} rot={:+.3}deg k={:.5} 匹配{} rms={:.2}px",
                         s.ux, s.uy, s.theta, s.k, s.n, s.rms
                     );
                     sims[i] = s;
                 }
-                None => println!("[配准] 帧{i} 匹配失败，退回恒等变换"),
+                canvas_anchored = true;
+                println!(
+                    "[配准] {} 帧锚定到参考画布，用时 {:.2}s",
+                    frames.len(),
+                    t.elapsed().as_secs_f32()
+                );
             }
         }
-        // Everything was solved relative to the probe frame; rebase onto the
-        // requested reference frame (Python's `measure_shifts(ref=...)`).
-        let r = probe;
-        if !sims[r].is_identity() {
-            let inv = sims[r].inverse();
-            for s in sims.iter_mut() {
-                *s = s.compose(&inv);
+        if !canvas_anchored {
+            let refc = dwt_rs::register::centroids(&frames[probe], &stars, 8);
+            for (i, f) in frames.iter().enumerate() {
+                if i == probe {
+                    continue;
+                }
+                let own = build_star_table(f, 120, 26, 25.0);
+                let c = dwt_rs::register::centroids(f, &own, 8);
+                match dwt_rs::register::estimate(&refc, &c, 64.0) {
+                    Some(s) => {
+                        println!(
+                            "[配准] 帧{i}  dx={:+.2} dy={:+.2} rot={:+.3}deg k={:.5} 匹配{} rms={:.2}px",
+                            s.ux, s.uy, s.theta, s.k, s.n, s.rms
+                        );
+                        sims[i] = s;
+                    }
+                    None => println!("[配准] 帧{i} 匹配失败，退回恒等变换"),
+                }
             }
-        }
-        let tmax = sims.iter().map(|s| s.theta.abs()).fold(0.0f32, f32::max);
-        let kmax = sims.iter().map(|s| (s.k - 1.0).abs()).fold(0.0f32, f32::max);
-        println!(
-            "[配准] {} 帧  最大旋转 {tmax:.3}deg  最大尺度偏差 {kmax:.2}  用时 {:.2}s",
-            frames.len(),
-            t.elapsed().as_secs_f32()
-        );
-        if tmax > 0.5 {
-            return Err(format!("旋转 {tmax:.3}deg 超过 0.5deg，与 --canvas-from 的几何不一致，拒绝出图"));
-        }
-        if kmax > 0.01 {
-            return Err(format!("尺度偏差 {kmax:.4} 超过 1%，拒绝出图"));
+            // Everything was solved relative to the probe frame; rebase onto the
+            // requested reference frame (Python's `measure_shifts(ref=...)`).
+            let r = probe;
+            if !sims[r].is_identity() {
+                let inv = sims[r].inverse();
+                for s in sims.iter_mut() {
+                    *s = s.compose(&inv);
+                }
+            }
+            let tmax = sims.iter().map(|s| s.theta.abs()).fold(0.0f32, f32::max);
+            let kmax = sims.iter().map(|s| (s.k - 1.0).abs()).fold(0.0f32, f32::max);
+            println!(
+                "[配准] {} 帧  最大旋转 {tmax:.3}deg  最大尺度偏差 {kmax:.2}  用时 {:.2}s",
+                frames.len(),
+                t.elapsed().as_secs_f32()
+            );
+            if tmax > 0.5 {
+                return Err(format!("旋转 {tmax:.3}deg 超过 0.5deg，与 --canvas-from 的几何不一致，拒绝出图"));
+            }
+            if kmax > 0.01 {
+                return Err(format!("尺度偏差 {kmax:.4} 超过 1%，拒绝出图"));
+            }
         }
     }
 
@@ -886,25 +940,36 @@ fn run() -> Result<(), String> {
             }
             eprintln!("[dbg] bbox from w={} h={}", w, h);
         }
-        let plan = if register {
+        let plan = if let (Some((cw, ch)), None) = (canvas, a.geom.as_ref()) {
+            // The reference product is the grid: origin (0,0), no bbox offset,
+            // no rescale.  Shapes are identical by construction.
+            if (a.dscale - 1.0).abs() > 1e-6 {
+                println!("[画布] --canvas-from 已固定输出网格，忽略 --drizzle-scale {}", a.dscale);
+            }
+            Plan { s: 1.0, ox: 0.0, oy: 0.0, w: cw, h: ch }
+        } else if register {
             Plan::new_sim(w, h, &sims, a.dscale, 1.0, canvas)
         } else {
             Plan::new(w, h, &dx, &dy, a.dscale, 1.0)
         };
         if let Some((cw, ch)) = canvas {
-            // A reference product fixes the field of view.  Anything beyond a
-            // rounding difference means our registration behaves differently
-            // (or the reference used another scale), so refuse instead of
-            // emitting a differently-cropped image.
-            let dw = (plan.w as i64 - cw as i64).abs();
-            let dh = (plan.h as i64 - ch as i64).abs();
-            if dw > 2 || dh > 2 {
-                return Err(format!(
-                    "画布 {}x{} 与本进程解出的包围盒 {}x{} 相差 {}x{} px，超过 2px 容差；                     请核对 --drizzle-scale、参考帧与配准解，或去掉 --canvas-from 单独出图",
-                    cw, ch, plan.w, plan.h, dw, dh
-                ));
+            if a.geom.is_some() {
+                // A reference product fixes the field of view.  Anything beyond a
+                // rounding difference means our registration behaves differently
+                // (or the reference used another scale), so refuse instead of
+                // emitting a differently-cropped image.
+                let dw = (plan.w as i64 - cw as i64).abs();
+                let dh = (plan.h as i64 - ch as i64).abs();
+                if dw > 2 || dh > 2 {
+                    return Err(format!(
+                        "画布 {}x{} 与本进程解出的包围盒 {}x{} 相差 {}x{} px，超过 2px 容差；                     请核对 --drizzle-scale、参考帧与配准解，或去掉 --canvas-from 单独出图",
+                        cw, ch, plan.w, plan.h, dw, dh
+                    ));
+                }
+                println!("[画布] 参考 {}x{}，本进程包围盒 {}x{}（差 {}x{} px）", cw, ch, plan.w, plan.h, dw, dh);
+            } else {
+                println!("[画布] 输出网格 = 参考 {}x{}（原点对齐参考像素）", cw, ch);
             }
-            println!("[画布] 参考 {}x{}，本进程包围盒 {}x{}（差 {}x{} px）", cw, ch, plan.w, plan.h, dw, dh);
         }
         let mut acc = Acc::new(plan);
         // core/drizzle.py:1867 -- the rotating branch passes
