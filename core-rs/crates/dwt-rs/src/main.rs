@@ -711,8 +711,8 @@ fn run_driver() -> Result<(), String> {
         (Some(r), Some(g), Some(b)) => (r, g, b),
         _ => return Err("RGB 合成需要 R/G/B 三个通道都成功出图".into()),
     };
-    let mut w = outs[ir].1.image.w.min(outs[ig].1.image.w).min(outs[ib].1.image.w);
-    let mut h = outs[ir].1.image.h.min(outs[ig].1.image.h).min(outs[ib].1.image.h);
+    let w = outs[ir].1.image.w.min(outs[ig].1.image.w).min(outs[ib].1.image.w);
+    let h = outs[ir].1.image.h.min(outs[ig].1.image.h).min(outs[ib].1.image.h);
     let crop = |i: usize| -> Img {
         let im = &outs[i].1.image;
         if im.w == w && im.h == h { im.clone() } else { im.crop(0, 0, w, h) }
@@ -743,32 +743,15 @@ fn run_driver() -> Result<(), String> {
     // genuine rotated-footprint no-data and must not be invented.
     let filled = cfa::fill_small_nan(&mut rgb, 64);
     if filled > 0 {
-        println!("[CFA] 补洞：{filled} 个孤立无样本像素（{:.5}%）用邻域均值填充", 100.0 * filled as f64 / (3 * w * h) as f64);
+        println!("[CFA] 补洞：{filled} 个孤立无样本像素（{:.5}%）用邻域均值填充", 100.0 * filled as f64 / (w * h) as f64);
     }
-    // A rotated mosaic inside its bounding box leaves triangular no-data
-    // corners.  Python keeps them NaN (its primary product is 2.6% NaN); the
-    // acceptance bar here is <0.1%, so crop to the largest axis-aligned
-    // rectangle whose three channels are ALL finite.  This is the largest
-    // honest crop: no pixel is invented and no star core is averaged away.
-    if let Some((l, t, nw, nh)) = cfa::largest_finite_rect(&rgb) {
-        if (nw, nh) != (w, h) {
-            println!(
-                "[CFA] 按有效覆盖裁边：{}x{} → {}x{}（左{} 上{}，保留 {:.2}%）",
-                w, h, nw, nh, l, t, 100.0 * (nw * nh) as f64 / (w * h) as f64
-            );
-            for p in &mut rgb {
-                let mut d = vec![0.0f32; nw * nh];
-                for y in 0..nh {
-                    d[y * nw..(y + 1) * nw].copy_from_slice(&p.d[(y + t) * w + l..(y + t) * w + l + nw]);
-                }
-                p.w = nw;
-                p.h = nh;
-                p.d = d;
-            }
-            w = nw;
-            h = nh;
-        }
-    }
+    // Keep the RGB canvas at the exact single-channel dimensions.  A rotated
+    // mosaic inside its bounding box leaves triangular no-data corners; Python
+    // keeps those NaN in the primary product too, and cropping to the largest
+    // all-finite rectangle would silently throw away most of the field (or make
+    // the reported NaN ratio meaningless).  Only the tiny interior gaps are
+    // filled above; real no-data stays visible as NaN.
+    let (w, h) = (rgb[0].w, rgb[0].h);
     if let Some(rm) = refm {
         let mut vals: Vec<f32> = rgb.iter().flat_map(|p| p.d.iter().copied()).filter(|v| v.is_finite()).collect();
         if !vals.is_empty() {
@@ -787,14 +770,16 @@ fn run_driver() -> Result<(), String> {
     let stem = out_stem(&a.tag, None);
     let path = a.out.join(format!("{stem}_RGB.xisf"));
     write_xisf_rgb(&path, &rgb)?;
-    let nan = rgb.iter().flat_map(|p| p.d.iter()).filter(|v| !v.is_finite()).count();
-    let total = rgb[0].d.len() * 3;
+    let nan_px = (0..w * h)
+        .filter(|&i| rgb.iter().any(|p| !p.d[i].is_finite()))
+        .count();
     println!(
-        "[CFA] 合成彩色 {}  {}x{}x3（三个单通道文件也保留）NaN {:.4}%  高光 {} 像素",
+        "[CFA] 合成彩色 {}  {}x{}x3（与单通道同尺寸）NaN {:.4}% 像素（{} 个）  高光 {} 像素",
         path.display(),
         w,
         h,
-        100.0 * nan as f64 / total as f64,
+        100.0 * nan_px as f64 / (w * h) as f64,
+        nan_px,
         stats.hot_pixels
     );
     let _ = (a.cfa_grid.as_ref(), a.cfa_drizzle, a.cfa_drizzle_scale, a.cfa_debayer.as_str(), a.cfa_align.as_str());

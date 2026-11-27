@@ -381,6 +381,28 @@ pub fn merge_rgb(
             }
             let bad = ok.iter().filter(|v| !**v).count();
             if bad > 0 {
+                // A saturated (or nearly saturated) star core can lose all R/B
+                // samples to sigma-clipping while G still has a real measurement.
+                // Python's rejection rescue normally avoids that; when it does
+                // not, blanking all three channels leaves a NaN hole exactly on
+                // the star.  For such bright pixels only, keep the G measurement
+                // and use it neutrally for the missing channels.  Sky-level
+                // no-data (the rotated-footprint corners) is untouched.
+                let gate = 50.0 * sky[1];
+                let mut rescued = 0usize;
+                for p in 0..w * h {
+                    if ok[p] {
+                        continue;
+                    }
+                    let g = planes[1].d[p];
+                    if g.is_finite() && g >= gate {
+                        for ch in 0..3 {
+                            data[ch][p] = g;
+                        }
+                        ok[p] = true;
+                        rescued += 1;
+                    }
+                }
                 for ch in 0..3 {
                     for p in 0..w * h {
                         if !ok[p] {
@@ -388,10 +410,16 @@ pub fn merge_rgb(
                         }
                     }
                 }
-                stats.coverage_removed = bad;
-                stats.coverage_pct = 100.0 * bad as f32 / (w * h) as f32;
+                let removed = bad - rescued;
+                stats.coverage_removed = removed;
+                stats.coverage_pct = 100.0 * removed as f32 / (w * h) as f32;
+                if rescued > 0 {
+                    log(&format!(
+                        "[CFA] 亮星核心补位：{rescued} 个像素（R/B 无样本但 G>50×sky，用 G 中性填充）"
+                    ));
+                }
                 log(&format!(
-                    "[CFA] 三通道共同覆盖：裁掉 {bad} 个「某通道无数据」的像素（{:.2}%）",
+                    "[CFA] 三通道共同覆盖：裁掉 {removed} 个「某通道无数据」的像素（{:.2}%）",
                     stats.coverage_pct
                 ));
             }
@@ -511,11 +539,11 @@ pub fn fill_small_nan(planes: &mut [Img; 3], max_area: usize) -> usize {
     let mut comp: Vec<usize> = Vec::new();
     let mut queue: Vec<usize> = Vec::new();
     let mut filled = 0usize;
-    let finite_at = |p: &[Img; 3], i: usize| -> bool {
+    let complete_at = |p: &[Img; 3], i: usize| -> bool {
         p[0].d[i].is_finite() && p[1].d[i].is_finite() && p[2].d[i].is_finite()
     };
     for start in 0..n {
-        if seen[start] || finite_at(planes, start) {
+        if seen[start] || complete_at(planes, start) {
             continue;
         }
         seen[start] = true;
@@ -523,11 +551,15 @@ pub fn fill_small_nan(planes: &mut [Img; 3], max_area: usize) -> usize {
         queue.clear();
         comp.push(start);
         queue.push(start);
+        let mut touches_border = false;
         let mut qi = 0;
         while qi < queue.len() {
             let i = queue[qi];
             qi += 1;
             let (x, y) = (i % w, i / w);
+            if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
+                touches_border = true;
+            }
             let nb = [
                 (x.wrapping_sub(1), y),
                 (x + 1, y),
@@ -542,7 +574,7 @@ pub fn fill_small_nan(planes: &mut [Img; 3], max_area: usize) -> usize {
                 if seen[j] {
                     continue;
                 }
-                if finite_at(planes, j) {
+                if complete_at(planes, j) {
                     seen[j] = true;
                     continue;
                 }
@@ -551,7 +583,10 @@ pub fn fill_small_nan(planes: &mut [Img; 3], max_area: usize) -> usize {
                 queue.push(j);
             }
         }
-        if comp.len() > max_area {
+        // Small gaps are always filled.  A larger hole is only filled when it
+        // is fully interior: components touching the canvas border are the
+        // rotated-footprint no-data wedges and must stay NaN.
+        if comp.len() > max_area && touches_border {
             continue;
         }
         // Fill from the outside in: each pass averages the already-finite
@@ -565,7 +600,7 @@ pub fn fill_small_nan(planes: &mut [Img; 3], max_area: usize) -> usize {
             for &i in remaining.iter() {
                 let (x, y) = (i % w, i / w);
                 let mut vals = [0f64; 3];
-                let mut cnt = 0usize;
+                let mut cnt = [0usize; 3];
                 for dy in -1i64..=1 {
                     for dx in -1i64..=1 {
                         if dx == 0 && dy == 0 {
@@ -577,20 +612,28 @@ pub fn fill_small_nan(planes: &mut [Img; 3], max_area: usize) -> usize {
                             continue;
                         }
                         let j = ny as usize * w + nx as usize;
-                        if finite_at(planes, j) {
-                            for c in 0..3 {
-                                vals[c] += planes[c].d[j] as f64;
+                        for c in 0..3 {
+                            let v = planes[c].d[j];
+                            if v.is_finite() {
+                                vals[c] += v as f64;
+                                cnt[c] += 1;
                             }
-                            cnt += 1;
                         }
                     }
                 }
-                if cnt == 0 {
+                let mut got = false;
+                for c in 0..3 {
+                    if planes[c].d[i].is_finite() {
+                        continue;
+                    }
+                    if cnt[c] > 0 {
+                        planes[c].d[i] = (vals[c] / cnt[c] as f64) as f32;
+                        got = true;
+                    }
+                }
+                if !got {
                     next.push(i);
                     continue;
-                }
-                for c in 0..3 {
-                    planes[c].d[i] = (vals[c] / cnt as f64) as f32;
                 }
                 filled += 1;
                 changed = true;
@@ -602,54 +645,6 @@ pub fn fill_small_nan(planes: &mut [Img; 3], max_area: usize) -> usize {
         }
     }
     filled
-}
-
-/// Largest axis-aligned rectangle whose pixels are finite in all three
-/// channels.  A rotated mosaic leaves triangular no-data corners; simply
-/// stripping all-NaN rows/columns keeps those wedges and leaves percent-level
-/// NaN in the RGB product.  The maximal rectangle is the largest honest crop
-/// that contains no invented pixels (after [`fill_small_nan`] removed only the
-/// sub-pixel drizzle gaps).  O(w*h) with the usual histogram stack.
-pub fn largest_finite_rect(planes: &[Img; 3]) -> Option<(usize, usize, usize, usize)> {
-    let (w, h) = (planes[0].w, planes[0].h);
-    if w == 0 || h == 0 || planes[1].w != w || planes[2].w != w {
-        return None;
-    }
-    let mut heights = vec![0u32; w];
-    let mut best = (0usize, 0usize, 0usize, 0usize); // x0, y0, width, height
-    let mut best_area = 0usize;
-    let mut stack: Vec<(usize, u32)> = Vec::with_capacity(w + 1);
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            let ok = planes[0].d[i].is_finite()
-                && planes[1].d[i].is_finite()
-                && planes[2].d[i].is_finite();
-            heights[x] = if ok { heights[x] + 1 } else { 0 };
-        }
-        stack.clear();
-        for x in 0..=w {
-            let hx = if x == w { 0 } else { heights[x] };
-            let mut start = x;
-            while let Some(&(sx, sh)) = stack.last() {
-                if sh <= hx {
-                    break;
-                }
-                stack.pop();
-                start = sx;
-                let area = (sh as usize) * (x - sx);
-                if area > best_area {
-                    best_area = area;
-                    let y0 = y + 1 - sh as usize;
-                    best = (sx, y0, x - sx, sh as usize);
-                }
-            }
-            if hx > 0 {
-                stack.push((start, hx));
-            }
-        }
-    }
-    if best_area == 0 { None } else { Some(best) }
 }
 
 #[cfg(test)]
@@ -707,21 +702,102 @@ mod tests {
     }
 
     #[test]
-    fn largest_rect_skips_nan_wedge() {
+    fn highlight_protection_recovers_a_missing_channel_at_a_saturated_core() {
+        // A saturated star core in G where the R/B samples were rejected: the
+        // pixel is still a valid G measurement, so highlight protection must
+        // average the finite channels instead of leaving the RGB pixel NaN.
+        let mut p = [Img::new(3, 3), Img::new(3, 3), Img::new(3, 3)];
+        for im in &mut p {
+            im.d.fill(0.01);
+        }
+        let c = 4; // centre
+        p[0].d[c] = f32::NAN;
+        p[1].d[c] = 0.99;
+        p[2].d[c] = 0.35;
+        let cov = [vec![0.0f32; 9], vec![20.0f32; 9], vec![20.0f32; 9]];
+        let (rgb, st) = merge_rgb(
+            &p,
+            Some([cov[0].as_slice(), cov[1].as_slice(), cov[2].as_slice()]),
+            "off",
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(st.hot_pixels, 1);
+        assert!(rgb.iter().all(|im| (im.d[c] - 0.99).abs() < 1e-3), "hot core must be finite and neutral");
+    }
+
+    #[test]
+    fn bright_star_wing_without_rb_samples_is_filled_from_g() {
+        // G=0.6 is >50x the sky (0.01) but below the 0.985 highlight gate: the
+        // star core's wings must still not become NaN when R/B coverage is 0.
+        let mut p = [Img::new(3, 3), Img::new(3, 3), Img::new(3, 3)];
+        for im in &mut p {
+            im.d.fill(0.01);
+        }
+        let c = 4;
+        p[1].d[c] = 0.6;
+        let cov = [vec![0.0f32; 9], vec![20.0f32; 9], vec![0.0f32; 9]];
+        let (rgb, st) = merge_rgb(
+            &p,
+            Some([cov[0].as_slice(), cov[1].as_slice(), cov[2].as_slice()]),
+            "off",
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(st.hot_pixels, 0);
+        assert_eq!(st.coverage_removed, 8);
+        assert!(rgb.iter().all(|im| (im.d[c] - 0.6).abs() < 1e-6));
+        assert!(rgb[0].d[0].is_nan(), "sky-level corner must stay NaN");
+    }
+
+    #[test]
+    fn fill_small_nan_repairs_a_single_missing_channel() {
+        // A star-core pixel can lose only R while G/B are valid.  The small-gap
+        // fill must repair that channel without touching the other two.
+        let mut p = [Img::new(5, 5), Img::new(5, 5), Img::new(5, 5)];
+        for im in &mut p {
+            im.d.fill(0.5);
+        }
+        p[0].d[12] = f32::NAN;
+        p[1].d[12] = 0.9;
+        p[2].d[12] = 0.7;
+        let n = fill_small_nan(&mut p, 64);
+        assert_eq!(n, 1);
+        assert!((p[0].d[12] - 0.5).abs() < 1e-6);
+        assert!((p[1].d[12] - 0.9).abs() < 1e-6);
+        assert!((p[2].d[12] - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn merge_preserves_channel_dimensions_and_keeps_uncovered_nan() {
+        // A 6x5 field with a triangular no-data corner (like a rotated mosaic).
+        // Merge must NOT crop: RGB stays 6x5 and the uncovered pixel stays NaN.
         let w = 6;
         let h = 5;
         let mut p = [Img::new(w, h), Img::new(w, h), Img::new(w, h)];
-        for im in &mut p { im.fill(1.0); }
-        for y in 0..h {
-            for x in 0..w {
-                if x < 2 || y < 1 {
-                    p[0].d[y * w + x] = f32::NAN;
+        for im in &mut p {
+            for y in 0..h {
+                for x in 0..w {
+                    im.d[y * w + x] = if x + y < 3 { f32::NAN } else { 1.0 };
                 }
             }
         }
-        let (x0, y0, rw, rh) = largest_finite_rect(&p).unwrap();
-        assert_eq!((x0, y0), (2, 1));
-        assert_eq!((rw, rh), (4, 4));
+        let mut cov = [vec![1.0f32; w * h], vec![1.0f32; w * h], vec![1.0f32; w * h]];
+        // Make (0,0) uncovered in one channel: common coverage must turn it NaN.
+        cov[1][0] = 0.0;
+        let (rgb, _st) = merge_rgb(
+            &p,
+            Some([cov[0].as_slice(), cov[1].as_slice(), cov[2].as_slice()]),
+            "off",
+            &mut |_| {},
+        )
+        .unwrap();
+        for im in &rgb {
+            assert_eq!((im.w, im.h), (w, h));
+            assert!(im.d[0].is_nan(), "uncovered pixel must stay NaN");
+            assert!(im.d[1 * w + 1].is_nan(), "triangular corner must stay NaN");
+            assert!(im.d[2 * w + 3].is_finite());
+        }
     }
 
     #[test]
