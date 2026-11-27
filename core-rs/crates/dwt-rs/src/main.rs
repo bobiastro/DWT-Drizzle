@@ -15,12 +15,13 @@ use dwt_rs::detect::{build_star_table, measure_fwhm_search, noise_sigma};
 use dwt_rs::cfa;
 use dwt_rs::drizzle::{drizzle_add_many, Acc, FramePlace, Plan};
 use dwt_rs::register::Sim;
-use dwt_rs::image::{downsample, median, median_of, percentile, stack_median, Img};
+use dwt_rs::image::{coverage_count, median, median_of, percentile, sky_sigma, stack_median, Img};
 use dwt_rs::rfield::build_r_field;
-use dwt_rs::stack::{
-    reject_ext, stack_strip, stack_strip_mode, strip_weights_ext, RejMode, WeightOpts,
+use dwt_rs::stack::{stack_strip, strip_weights};
+use dwt_rs::xisf::{
+    aggregate_fits_keywords, aggregate_properties, pws_properties, py_g6, read_xisf,
+    read_xisf_luma, write_npy_f32, write_xisf, write_xisf_rgb, OutMeta, PwsDiag, XisfMeta,
 };
-use dwt_rs::xisf::{read_xisf, read_xisf_luma, write_npy_f32, write_xisf, write_xisf_rgb, OutMeta};
 
 const EXPTIME_REF: f64 = 300.0;
 const A_SHARP: f32 = 20.0;
@@ -82,9 +83,6 @@ struct Args {
     lsp_only: Option<String>,
     rej_k: f32,
     snr_clip: f32,
-    rej_z: bool,
-    sharp_w: f32,
-    rej_mode: RejMode,
     star_grow: f32,
     r_floor: f32,
     drop_mul: f32,
@@ -116,6 +114,7 @@ struct Args {
     cfa_drizzle_scale: f32,
     rgb_balance: String,
     match_scale: bool,
+    crop_cover: f32,
 }
 
 impl Default for Args {
@@ -142,9 +141,6 @@ impl Default for Args {
             lsp_only: None,
             rej_k: REJ_K,
             snr_clip: SNR_CLIP,
-            rej_z: true,
-            sharp_w: 0.0, // Python: drizzle 合成里的 `sharp_w`（core/drizzle.py:1990-2010），默认 0 即无效
-            rej_mode: RejMode::Winsor, // Python: `rej_mode` 默认 winsor
             star_grow: 100.0,
             r_floor: 0.0,
             drop_mul: 0.0,
@@ -161,21 +157,22 @@ impl Default for Args {
             geom: None,
             fixed_probe: false,
             per_frame_stars: false,
-            fwhm_search: 0, // Python: core/pws.py `fwhm_search` 默认 0（不做搜索）
+            fwhm_search: 8,
             report: false,
-            gpu: "auto".into(), // Python: `gpu` 默认 auto（本仓库 GPU 分支仅在 available() 时启用）
+            gpu: "off".into(),
             jobs: 0,
             cfa: "off".into(),
             cfa_debayer: "bilinear".into(),
             cfa_weights: "auto".into(),
             cfa_align: "auto".into(),
-            cfa_raw: "auto".into(), // Python: `cfa_raw` 默认 auto
+            cfa_raw: "off".into(),
             cfa_ref: None,
             cfa_grid: Some("shared".into()),
             cfa_drizzle: false,
             cfa_drizzle_scale: 2.0,
             rgb_balance: "off".into(),
             match_scale: false,
+            crop_cover: 0.9,
         }
     }
 }
@@ -288,24 +285,6 @@ fn parse_args() -> Result<Args, String> {
                 a.snr_clip = num(val()?, flag)? as f32;
                 i += 2;
             }
-            "--rej-mode" => {
-                a.rej_mode = RejMode::parse(val()?);
-                i += 2;
-            }
-            "--sharp-w" => {
-                a.sharp_w = num(val()?, flag)? as f32;
-                i += 2;
-            }
-            "--rej-z" => {
-                // `--rej-z 0` / `--rej-z 1`；裸写 `--rej-z` 视为打开
-                if has_val() {
-                    a.rej_z = num(val()?, flag)? != 0.0;
-                    i += 2;
-                } else {
-                    a.rej_z = true;
-                    i += 1;
-                }
-            }
             "--star-grow" => {
                 a.star_grow = num(val()?, flag)? as f32;
                 i += 2;
@@ -356,6 +335,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--weights-from" => {
                 a.weights_from = Some(val()?.to_string());
+                i += 2;
+            }
+            "--crop-cover" => {
+                a.crop_cover = num(val()?, flag)? as f32;
                 i += 2;
             }
             "--save-aux" => {
@@ -837,7 +820,7 @@ fn run_pipeline(
     let t = Instant::now();
     // Frames are independent: read (and inflate) them in parallel.  `collect`
     // into `Result<Vec<_>>` keeps them in `files` order.
-    let loaded: Result<Vec<(f64, Img)>, String> = files
+    let loaded: Result<Vec<(f64, Img, XisfMeta)>, String> = files
         .par_iter()
         .map(|f| {
             let (meta, img) = read_xisf(f)?;
@@ -846,8 +829,8 @@ fn run_pipeline(
                 // quotes *and* whitespace before matching on them.
                 meta.keywords
                     .iter()
-                    .find(|(n, _)| n == k)
-                    .map(|(_, v)| v.trim_matches('\'').trim().to_string())
+                    .find(|k2| k2.name == k)
+                    .map(|k2| k2.value.trim_matches('\'').trim().to_string())
             };
             let expt = kw("EXPTIME")
                 .or_else(|| kw("EXPOSURE"))
@@ -863,11 +846,15 @@ fn run_pipeline(
                     return Err(format!("{}: FILTER={filt} but --pick {p}", f.display()));
                 }
             }
-            Ok((expt, img))
+            Ok((expt, img, meta))
         })
         .collect();
     let loaded = loaded?;
-    let (expts, full): (Vec<f64>, Vec<Img>) = loaded.into_iter().unzip();
+    // keep every frame header: the product header is aggregated from them the same
+    // way Python's `_aggregate_fits_keywords` / `_aggregate_properties` do
+    let metas: Vec<XisfMeta> = loaded.iter().map(|(_, _, m)| m.clone()).collect();
+    let (expts, full): (Vec<f64>, Vec<Img>) =
+        loaded.into_iter().map(|(e, i, _)| (e, i)).unzip();
     let t_read = t.elapsed().as_secs_f32();
     let t_med = median_of(&expts.iter().map(|v| *v as f32).collect::<Vec<_>>()) as f64;
     println!("[帧] 读 {:.2}s  曝光中位 {t_med}s  内部归一 {EXPTIME_REF}s", t_read);
@@ -1532,13 +1519,7 @@ fn run_pipeline(
 
     // ---- weights + rejection + combine ------------------------------------
     let t = Instant::now();
-    let wopts = WeightOpts {
-        sharp_w: a.sharp_w,
-        flux_pow: 0.0,
-    };
-    let wts = strip_weights_ext(
-        &c, &s, &rfield, a.a_exp, a.b_exp, a.beta, a.max_share, wopts, None, None,
-    );
+    let wts = strip_weights(&c, &s, &rfield, a.a_exp, a.b_exp, a.beta, a.max_share);
     let t_prof_sw = t.elapsed().as_secs_f32();
     if let Some(dir) = &a.dump_w {
         let _ = std::fs::create_dir_all(dir);
@@ -1643,28 +1624,21 @@ fn run_pipeline(
 
     let mut cov_acc: Vec<f32> = Vec::new();
     let mut out_plan: Option<Plan> = None;
-    let (stk, neff, rej_rate) = if let Some((img, nf)) = gpu_out {
+    let (stk, mut neff, rej_rate) = if let Some((img, nf)) = gpu_out {
         (img, nf, f32::NAN)
     } else if drz {
         // Python's drizzle path rejects with plain sigma-clip + detail allowance
-        // (core/drizzle.py:1900-1985): no sky branch, no one-sided exemption, and
-        // **no per-frame sigma normalisation** — `frame_sig` only exists in the
-        // non-drizzle `stack_strip` (core/pws.py:1855, fed by `rej_z` at
-        // pws.py:4834/4867).  Passing `Some(&sigmas)` here (as HEAD did) divides
-        // every deviation by a different σ_i, so the default product differed
-        // from Python; the flag `--rej-z` therefore only affects the averaging
-        // path, exactly like Python.
+        // (core/drizzle.py:1938-1982): no sky branch, no one-sided exemption.
         let t_prof_rj = Instant::now();
-        let rate = reject_ext(
+        let rate = dwt_rs::stack::reject(
             &frames,
             &mut wts,
             Some(&rfield),
             sky0,
             a.rej_k,
             REJ_GATE,
-            None,
+            Some(&sigmas),
             true,
-            a.rej_mode,
         );
         let d_prof_rj = t_prof_rj.elapsed().as_secs_f32();
         let dx = vec![0.0f32; frames.len()];
@@ -1777,15 +1751,8 @@ fn run_pipeline(
         println!("[drizzle] 输出 {}x{}  scale={} pixfrac={} (x{}) drop_mul={}  ox={} oy={}", img.w, img.h, a.dscale, a.dpix, pf, dmul, plan.ox, plan.oy);
         (img, Vec::new(), rate)
     } else {
-        let res = stack_strip_mode(
-            &frames,
-            &mut wts,
-            Some(&rfield),
-            sky0,
-            a.rej_k,
-            REJ_GATE,
-            if a.rej_z { Some(&sigmas) } else { None },
-            a.rej_mode,
+        let res = stack_strip(
+            &frames, &mut wts, Some(&rfield), sky0, a.rej_k, REJ_GATE, Some(&sigmas),
         );
         if let Some(dir) = &a.dump_w {
             for (i, m) in wts.iter().enumerate() {
@@ -1873,43 +1840,159 @@ fn run_pipeline(
     }
     let suffix = ch.map(|c| c.to_string());
     let stem = out_stem(&a.tag, suffix.as_deref());
+
+    // ---- coverage map -----------------------------------------------------
+    // Python's drizzle returns `ncov` (frames per output pixel); the
+    // `--aligned` fast path has no such accumulator, so count the finite
+    // frames per pixel instead of dropping `_ncov.npy` altogether.
+    if cov_acc.is_empty() {
+        cov_acc = coverage_count(&frames, image.w, image.h);
+    }
+    if cov_acc.is_empty() {
+        // Python's wgpu fallback: covered pixels get the frame count
+        let n = frames.len() as f32;
+        cov_acc = image
+            .d
+            .iter()
+            .map(|v| if v.is_finite() && *v != 0.0 { n } else { 0.0 })
+            .collect();
+    }
+    // The drizzle branch has no n_eff map either; the frame count is the
+    // equal-weight limit of Python's `(Σw)²/Σw²`, so reuse the coverage.
+    if neff.len() != image.d.len() && cov_acc.len() == image.d.len() {
+        neff = cov_acc.clone();
+    }
+
+    // ---- PWS properties ---------------------------------------------------
+    let sig_ok: Vec<f32> = sigmas.iter().copied().filter(|v| v.is_finite()).collect();
+    let neff_ok: Vec<f32> = neff.iter().copied().filter(|v| v.is_finite() && *v > 0.0).collect();
+    let fwhm_output = {
+        let probe: Vec<(usize, usize)> = stars.iter().copied().take(48).collect();
+        let v = if probe.is_empty() { f32::NAN } else { measure_fwhm_search(&image, &probe, 16, 0) };
+        if v.is_finite() && v > 0.0 { Some(v as f64) } else { None }
+    };
+    let diag = PwsDiag {
+        a: Some(a.a_exp as f64),
+        b: Some(a.b_exp as f64),
+        rej_k: Some(a.rej_k as f64),
+        rej_gate: Some(1.0 / 3.0),
+        scale_out: if scale_out.is_finite() { Some(scale_out as f64) } else { None },
+        rej_rate: if rej_rate.is_finite() { Some(rej_rate as f64) } else { None },
+        star_count: Some(stars.len() as i64),
+        fwhm_frame_median: Some(fmed as f64),
+        fwhm_output,
+        neff_median: if neff_ok.is_empty() { None } else { Some(median_of(&neff_ok) as f64) },
+        sigma_frame_median: if sig_ok.is_empty() {
+            None
+        } else {
+            Some(median_of(&sig_ok) as f64 * scale_out as f64)
+        },
+        sigma_sky: sky_sigma(&image),
+    };
+
+    // ---- product header: Python's `_aggregate_fits_keywords` + `_pws_props` --
+    let mut keywords = aggregate_fits_keywords(&metas, &expts);
+    // A re-stacked product carries our own three keywords; they must not shadow
+    // the freshly computed ones (Python skips them in `_aggregate_fits_keywords`)
+    keywords.retain(|k| !matches!(k.name.as_str(), "TOTALEXP" | "NCOMBINE" | "STACKMODE"));
+    let mut properties = aggregate_properties(&metas);
+    properties.extend(pws_properties(&diag));
+
     let path = a.out.join(format!("{stem}.xisf"));
     let mode_text = format!("PWS A={} B={} rej_k={}", a.a_exp, a.b_exp, a.rej_k);
     let meta = OutMeta {
         total_exp: expts.iter().sum(),
         ncombine: frames.len() as u32,
         stack_mode: mode_text,
-        passthrough: Vec::new(),
+        keywords: keywords.clone(),
+        properties,
     };
     write_xisf(&path, &image, &meta)?;
     println!("[输出] {}  {}x{}  值域 {:.4e}~{:.4e}", path.display(), image.w, image.h,
         image.d.iter().cloned().fold(f32::INFINITY, f32::min),
         image.d.iter().cloned().fold(0.0f32, f32::max));
 
-    if !cov_acc.is_empty() {
-        let _ = write_npy_f32(&a.out.join(format!("{stem}_ncov.npy")), &cov_acc, image.h, image.w);
+    // ---- diagnostic maps --------------------------------------------------
+    // Python writes the quarter-resolution maps and the weights table on every
+    // run; the full-resolution copies are the `DWT_SAVE_AUX=1` extra.
+    if cov_acc.len() == image.d.len() {
+        write_npy_f32(&a.out.join(format!("{stem}_ncov.npy")), &cov_acc, image.h, image.w)?;
+        let (q, qh, qw) = dwt_rs::cropcover::q4_mean(&cov_acc, image.h, image.w);
+        if qh > 0 {
+            write_npy_f32(&a.out.join(format!("{stem}_ncov_q4.npy")), &q, qh, qw)?;
+        }
+    }
+    if rfield.d.len() == image.d.len() {
+        let (q, qh, qw) = dwt_rs::cropcover::q4_mean(&rfield.d, image.h, image.w);
+        if qh > 0 {
+            write_npy_f32(&a.out.join(format!("{stem}_R_q4.npy")), &q, qh, qw)?;
+        }
+    }
+    if neff.len() == image.d.len() {
+        let (q, qh, qw) = dwt_rs::cropcover::q4_mean(&neff, image.h, image.w);
+        if qh > 0 {
+            write_npy_f32(&a.out.join(format!("{stem}_neff_q4.npy")), &q, qh, qw)?;
+        }
     }
     if a.save_aux {
-        let r4 = downsample(&rfield, 4);
-        write_npy_f32(&a.out.join(format!("{stem}_R_q4.npy")), &r4.d, r4.h, r4.w)?;
-        if !neff.is_empty() && !drz {
-            let nh = h / 4;
-            let nw = w / 4;
-            let mut d = vec![0.0f32; nh * nw];
-            for y in 0..nh {
-                for x in 0..nw {
-                    d[y * nw + x] = neff[(y * 4) * w + x * 4];
-                }
-            }
-            write_npy_f32(&a.out.join(format!("{stem}_neff_q4.npy")), &d, nh, nw)?;
+        if rfield.d.len() == image.d.len() {
+            write_npy_f32(&a.out.join(format!("{stem}_R.npy")), &rfield.d, rfield.h, rfield.w)?;
         }
-        if a.report {
-            let mut txt = String::from("# idx fwhm_px C_sharp sigma S_snr\n");
-            for i in 0..frames.len() {
-                txt.push_str(&format!("{i} {:.5} {:.6} {:.9} {:.6}\n", fwhms[i], c[i], sigmas[i], s[i]));
+        if neff.len() == image.d.len() {
+            write_npy_f32(&a.out.join(format!("{stem}_neff.npy")), &neff, image.h, image.w)?;
+        }
+    }
+    {
+        let mut txt = String::from("# idx fwhm_px C_sharp sigma S_snr\n");
+        for i in 0..frames.len() {
+            // Python: np.savetxt(..., fmt='%.6g') over [idx, fwhm, C, sig_out, S].
+            txt.push_str(&format!(
+                "{} {} {} {} {}\n",
+                i,
+                py_g6(fwhms[i] as f64),
+                py_g6(c[i] as f64),
+                py_g6(sigmas[i] as f64 * scale_out as f64),
+                py_g6(s[i] as f64)
+            ));
+        }
+        std::fs::write(a.out.join(format!("{stem}_weights.txt")), txt)
+            .map_err(|e| format!("write weights: {e}"))?;
+    }
+
+    // ---- auto crop (`crop_cover`, Python's cropcover.crop_box) -------------
+    if a.crop_cover > 0.0 && cov_acc.len() == image.d.len() {
+        if let Some((y0, y1, x0, x1)) = dwt_rs::cropcover::crop_box(
+            &cov_acc,
+            image.w,
+            image.h,
+            a.crop_cover as f64,
+            3.0,
+        ) {
+            let (bh, bw) = (y1 - y0, x1 - x0);
+            if bh >= 32 && bw >= 32 {
+                let sub = image.crop(x0, y0, bw, bh);
+                let mut cprops = aggregate_properties(&metas);
+                let cmode = format!("PWS A={} B={} crop={}", a.a_exp, a.b_exp, a.crop_cover);
+                cprops.extend(pws_properties(&diag.autocrop_subset()));
+                let cmeta = OutMeta {
+                    total_exp: expts.iter().sum(),
+                    ncombine: frames.len() as u32,
+                    stack_mode: cmode,
+                    keywords: keywords.clone(),
+                    properties: cprops,
+                };
+                let cpath = a.out.join(format!("{stem}_autocrop.xisf"));
+                write_xisf(&cpath, &sub, &cmeta)?;
+                if rfield.d.len() == image.d.len() {
+                    let (v, vh, vw) = dwt_rs::cropcover::crop_map(&rfield.d, image.w, y0, y1, x0, x1);
+                    write_npy_f32(&a.out.join(format!("{stem}_autocrop_R.npy")), &v, vh, vw)?;
+                }
+                if neff.len() == image.d.len() {
+                    let (v, vh, vw) = dwt_rs::cropcover::crop_map(&neff, image.w, y0, y1, x0, x1);
+                    write_npy_f32(&a.out.join(format!("{stem}_autocrop_neff.npy")), &v, vh, vw)?;
+                }
+                println!("[输出] {}  {}x{}  裁边 x={x0} y={y0}", cpath.display(), bw, bh);
             }
-            std::fs::write(a.out.join(format!("{stem}_weights.txt")), txt)
-                .map_err(|e| format!("write weights: {e}"))?;
         }
     }
 

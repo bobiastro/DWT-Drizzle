@@ -205,10 +205,10 @@ pub fn detect_pattern(meta: &crate::xisf::XisfMeta) -> Option<String> {
             }
         }
     }
-    for (id, value) in &meta.properties {
-        let id = id.to_ascii_uppercase();
+    for prop in &meta.properties {
+        let id = prop.id.to_ascii_uppercase();
         if id.contains("CFASOURCEPATTERN") || id.contains("BAYERPAT") {
-            if let Some(p) = clean_pattern(value) {
+            if let Some(p) = prop.payload().and_then(|v| clean_pattern(&v)) {
                 return Some(p);
             }
         }

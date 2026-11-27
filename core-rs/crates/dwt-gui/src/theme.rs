@@ -240,3 +240,61 @@ pub fn check_row(ui: &mut Ui, label: &str, value: &mut bool, hint_text: &str) {
     });
     hint_indented(ui, hint_text);
 }
+
+// ── 未实现参数 ────────────────────────────────────────────────────────────────
+// 下面这些参数在 Python 版里有实现，Rust 引擎目前不消费它们的值。控件必须留在
+// 界面上（面板布局要与 Python 版逐项对照），但置灰 + 标签标注 + 悬停说明，
+// 免得用户以为「拨了没反应」是 bug。
+
+/// 未实现控件的标签后缀。
+pub const NOT_SUPPORTED: &str = "（Rust 版暂不支持）";
+
+fn unsupported_scope(ui: &mut Ui, label: &str, tip: &str, row: impl FnOnce(&mut Ui, &str)) {
+    let text = format!("{label}{NOT_SUPPORTED}");
+    let hover = format!("{tip}\n\nRust 版暂不支持该参数：改动这里不会影响输出。");
+    let inner = ui.scope(|ui| {
+        ui.disable();
+        row(ui, &text);
+    });
+    inner.response.on_hover_text(hover);
+}
+
+/// 置灰的 `text_row`（Rust 版未实现该参数）。
+pub fn unsupported_text(ui: &mut Ui, label: &str, value: &mut String, hint_text: &str) {
+    unsupported_scope(ui, label, hint_text, |ui, text| {
+        text_row(ui, text, value, hint_text)
+    });
+}
+
+/// 置灰的 `path_row`（Rust 版未实现该参数）。
+pub fn unsupported_path(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut String,
+    hint_text: &str,
+    folder: bool,
+) {
+    unsupported_scope(ui, label, hint_text, |ui, text| {
+        path_row(ui, text, value, hint_text, folder)
+    });
+}
+
+/// 置灰的 `check_row`（Rust 版未实现该参数）。
+pub fn unsupported_check(ui: &mut Ui, label: &str, value: &mut bool, hint_text: &str) {
+    unsupported_scope(ui, label, hint_text, |ui, text| {
+        check_row(ui, text, value, hint_text)
+    });
+}
+
+/// 置灰的 `choice_row`（Rust 版未实现该参数）。
+pub fn unsupported_choice(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut String,
+    options: &[(&str, &str)],
+    hint_text: &str,
+) {
+    unsupported_scope(ui, label, hint_text, |ui, text| {
+        choice_row(ui, text, value, options, hint_text)
+    });
+}

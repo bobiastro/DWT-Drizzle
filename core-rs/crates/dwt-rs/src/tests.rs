@@ -3,7 +3,36 @@
 use crate::drizzle::{drizzle_add, drizzle_add_gather, drizzle_add_many, Acc, FramePlace, Plan};
 use crate::image::Img;
 use crate::stack::{reject, stack_strip, strip_weights};
-use crate::xisf::{read_xisf, write_xisf, OutMeta};
+use crate::xisf::{py_g6, read_xisf, write_xisf, FitsKeyword, OutMeta, XisfProperty};
+
+/// The weights table is written with Python's `fmt="%.6g"`; make sure the
+/// formatter reproduces C's `%g` exactly, including the carry into exponent
+/// form and the sign of a negative zero.
+#[test]
+fn py_g6_matches_c_printf() {
+    let cases: [(f64, &str); 17] = [
+        (0.0, "0"),
+        (-0.0, "-0"),
+        (1.0, "1"),
+        (2.5, "2.5"),
+        (0.1, "0.1"),
+        (1e-7, "1e-07"),
+        (1234567.0, "1.23457e+06"),
+        (123456.0, "123456"),
+        (1.23456789e-4, "0.000123457"),
+        (3.14159265358979, "3.14159"),
+        (1.0 / 3.0, "0.333333"),
+        (-2.718281828, "-2.71828"),
+        (999999.5, "1e+06"),
+        (1000000.0, "1e+06"),
+        (1e-5, "1e-05"),
+        (1e-4, "0.0001"),
+        (12.345678, "12.3457"),
+    ];
+    for (v, want) in cases {
+        assert_eq!(py_g6(v), want, "py_g6({v})");
+    }
+}
 
 fn img(w: usize, h: usize, v: f32) -> Img {
     Img::from_vec(w, h, vec![v; w * h])
@@ -244,7 +273,8 @@ fn xisf_roundtrip() {
         total_exp: 9600.0,
         ncombine: 8,
         stack_mode: "PWS A=6 B=2 rej_k=3.5".to_string(),
-        passthrough: vec![("INSTRUME".into(), "695A-M".into())],
+        keywords: vec![FitsKeyword::new("INSTRUME", "'695A-M'", "")],
+        properties: vec![XisfProperty::value_prop("PWS:A", "Float64", "6")],
     };
     write_xisf(&path, &im, &meta).expect("write");
     let (back, img) = read_xisf(&path).expect("read");
@@ -257,6 +287,10 @@ fn xisf_roundtrip() {
     assert_eq!(back.keyword_str("STACKMODE").as_deref(), Some("PWS A=6 B=2 rej_k=3.5"));
     assert_eq!(back.keyword_f64("NCOMBINE"), Some(8.0));
     assert_eq!(back.keyword_str("INSTRUME").as_deref(), Some("695A-M"));
+    // properties ride along with the header, value attribute included
+    let pa = back.properties.iter().find(|p| p.id == "PWS:A").expect("property PWS:A");
+    assert_eq!(pa.ty, "Float64");
+    assert_eq!(pa.value(), Some("6"));
     // gzip-free file, but the header must declare the right geometry
     let raw = std::fs::read(&path).unwrap();
     assert_eq!(&raw[..8], b"XISF0100");

@@ -6,6 +6,7 @@
 
 pub mod bggrad;
 pub mod cfa;
+pub mod cropcover;
 pub mod detect;
 pub mod drizzle;
 #[cfg(feature = "gpu")]

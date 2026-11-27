@@ -309,3 +309,50 @@ pub fn stack_median(frames: &[&Img]) -> Img {
     }
     out
 }
+
+/// Frames contributing to each output pixel (`ncov`), for the paths that do not
+/// accumulate it themselves.  Returns an empty map (and lets the caller fall
+/// back) when the scan would be too large to be worth a full extra pass.
+pub fn coverage_count(frames: &[Img], w: usize, h: usize) -> Vec<f32> {
+    if frames.is_empty() || w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let budget = 600_000_000usize; // pixel·frame comparisons
+    if frames.len().saturating_mul(w.saturating_mul(h)) > budget {
+        return Vec::new();
+    }
+    let mut cov = vec![0.0f32; w * h];
+    cov.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let mut n = 0.0f32;
+            for f in frames {
+                if f.w == w && f.h == h && f.d[y * w + x].is_finite() {
+                    n += 1.0;
+                }
+            }
+            row[x] = n;
+        }
+    });
+    cov
+}
+
+/// Python's `sky_sd`: `1.4826 · MAD` over the pixels below the frame median.
+pub fn sky_sigma(img: &Img) -> Option<f64> {
+    let mut all: Vec<f32> = img.d.iter().copied().filter(|v| v.is_finite()).collect();
+    if all.is_empty() {
+        return None;
+    }
+    let med = median(&mut all);
+    let mut low: Vec<f32> = img.d.iter().copied().filter(|v| v.is_finite() && *v < med).collect();
+    if low.is_empty() {
+        return None;
+    }
+    let lm = median(&mut low);
+    let dev: Vec<f32> = low.iter().map(|v| (v - lm).abs()).collect();
+    let sd = 1.4826 * median_of(&dev) as f64;
+    if sd.is_finite() {
+        Some(sd)
+    } else {
+        None
+    }
+}

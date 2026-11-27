@@ -8,6 +8,70 @@ use std::path::Path;
 
 use crate::image::Img;
 
+/// One `<FITSKeyword name="..." value="..." comment="..."/>` child.
+#[derive(Debug, Clone, Default)]
+pub struct FitsKeyword {
+    pub name: String,
+    /// Raw value as written: string keywords keep their surrounding quotes.
+    pub value: String,
+    pub comment: String,
+}
+
+impl FitsKeyword {
+    pub fn new(name: &str, value: impl Into<String>, comment: &str) -> Self {
+        Self { name: name.to_string(), value: value.into(), comment: comment.to_string() }
+    }
+    /// Value with the FITS string quotes stripped (what `_aggregate_fits_keywords`
+    /// compares on: `str(v).strip("'\"")`).
+    pub fn bare(&self) -> String {
+        self.value.trim_matches(|c| c == '\'' || c == '"').to_string()
+    }
+}
+
+/// One `<Property id="..." type="..." .../>` element, attributes kept verbatim so
+/// the cross-frame aggregation can re-emit base64 vectors and structures as-is.
+#[derive(Debug, Clone, Default)]
+pub struct XisfProperty {
+    pub id: String,
+    pub ty: String,
+    pub attributes: Vec<(String, String)>,
+    pub text: Option<String>,
+}
+
+impl XisfProperty {
+    pub fn value_prop(id: &str, ty: &str, value: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            ty: ty.to_string(),
+            attributes: vec![
+                ("id".into(), id.to_string()),
+                ("type".into(), ty.to_string()),
+                ("value".into(), value.to_string()),
+            ],
+            text: None,
+        }
+    }
+    pub fn text_prop(id: &str, ty: &str, text: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            ty: ty.to_string(),
+            attributes: vec![("id".into(), id.to_string()), ("type".into(), ty.to_string())],
+            text: Some(text.to_string()),
+        }
+    }
+    pub fn attr(&self, name: &str) -> Option<&str> {
+        self.attributes.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+    /// The `value` attribute (numeric/typed properties).
+    pub fn value(&self) -> Option<&str> {
+        self.attr("value")
+    }
+    /// Whatever carries the payload: the `value` attribute or the text content.
+    pub fn payload(&self) -> Option<String> {
+        self.value().map(|v| v.to_string()).or_else(|| self.text.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct XisfMeta {
     pub width: usize,
@@ -17,19 +81,19 @@ pub struct XisfMeta {
     pub color_space: String,
     pub pixel_storage: String,
     pub bounds: Option<(f32, f32)>,
-    /// Raw FITSKeyword `name -> value` (quotes kept as written).
-    pub keywords: Vec<(String, String)>,
-    /// XISF `<Property id="..." value="..."/>` pairs (the CFA pattern lives here
-    /// on PixInsight files that do not carry a FITS `BAYERPAT` keyword).
-    pub properties: Vec<(String, String)>,
+    /// FITSKeyword children of `<Image>` in file order.
+    pub keywords: Vec<FitsKeyword>,
+    /// XISF `<Property>` children of `<Image>` (the CFA pattern lives here on
+    /// PixInsight files that do not carry a FITS `BAYERPAT` keyword).
+    pub properties: Vec<XisfProperty>,
 }
 
 impl XisfMeta {
     pub fn keyword(&self, name: &str) -> Option<&str> {
         self.keywords
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+            .find(|k| k.name.eq_ignore_ascii_case(name))
+            .map(|k| k.value.as_str())
     }
     /// FITS string keyword without the surrounding quotes.
     pub fn keyword_str(&self, name: &str) -> Option<String> {
@@ -48,6 +112,61 @@ fn attr<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
     let rest = &xml[start..];
     let end = rest.find('"')?;
     Some(&rest[..end])
+}
+
+fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(p) = rest.find('&') {
+        out.push_str(&rest[..p]);
+        rest = &rest[p..];
+        let ent = [
+            ("&amp;", '&'),
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&quot;", '"'),
+            ("&apos;", '\''),
+        ]
+        .into_iter()
+        .find(|(e, _)| rest.starts_with(e));
+        match ent {
+            Some((e, c)) => {
+                out.push(c);
+                rest = &rest[e.len()..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// XML attribute escaping — ElementTree (`xisf_io`) escapes all five entities in
+/// attribute values, so a byte-level header diff against the Python product needs
+/// the same treatment.
+fn xml_escape_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 pub fn read_xisf(path: &Path) -> Result<(XisfMeta, Img), String> {
@@ -149,32 +268,71 @@ fn read_xisf_flat(path: &Path) -> Result<(XisfMeta, Vec<f32>, usize), String> {
     let compression = attr(image_tag, "compression");
     let byte_order = attr(image_tag, "byteOrder").unwrap_or("little");
 
-    // FITSKeyword children: name/value pairs
-    let mut keywords = Vec::new();
-    let mut rest = image_tag.to_string();
-    let mut cursor = image_end;
-    while let Some(p) = xml[cursor..].find("<FITSKeyword") {
-        let s = cursor + p;
-        let e = s + xml[s..].find('>').unwrap_or(0);
-        let tag = &xml[s..e];
-        if let (Some(n), Some(v)) = (attr(tag, "name"), attr(tag, "value")) {
-            keywords.push((n.to_string(), v.to_string()));
-        }
-        cursor = e;
-    }
-    let _ = &mut rest;
+    // Metadata/properties + FITSKeyword children live inside the `<Image>` element;
+    // the `<Metadata>` block also carries `XISF:` properties, which are *not* the
+    // per-frame instrument/signature set `_aggregate_properties` works on.
+    let body_end = xml[image_start..]
+        .find("</Image>")
+        .map(|p| image_start + p)
+        .unwrap_or(xml.len());
+    let body = &xml[image_end..body_end];
 
-    // XISF <Property> elements anywhere in the header (PCL:CFASourcePattern etc.)
+    let mut keywords = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(p) = body[cursor..].find("<FITSKeyword") {
+        let s = cursor + p;
+        let e = s + body[s..].find('>').unwrap_or(0);
+        let tag = &body[s..e];
+        if let Some(n) = attr(tag, "name") {
+            keywords.push(FitsKeyword {
+                name: n.to_string(),
+                value: attr(tag, "value").map(xml_unescape).unwrap_or_default(),
+                comment: attr(tag, "comment").map(xml_unescape).unwrap_or_default(),
+            });
+        }
+        cursor = e.max(s + 1);
+    }
+
+    // XISF <Property> elements (PCL:CFASourcePattern etc.).  A property payload is
+    // either the `value` attribute or the element text (String/TimePoint).
     let mut properties = Vec::new();
     let mut cursor = 0usize;
-    while let Some(p) = xml[cursor..].find("<Property") {
+    while let Some(p) = body[cursor..].find("<Property") {
         let s = cursor + p;
-        let e = s + xml[s..].find('>').unwrap_or(0);
-        let tag = &xml[s..e];
-        if let (Some(id), Some(v)) = (attr(tag, "id"), attr(tag, "value")) {
-            properties.push((id.to_string(), v.to_string()));
+        let close = body[s..].find('>').map(|q| s + q).unwrap_or(body.len());
+        let tag = &body[s..close];
+        if let Some(id) = attr(tag, "id") {
+            let mut attributes: Vec<(String, String)> = Vec::new();
+            let mut rest = tag;
+            while let Some(eq) = rest.find("=\"") {
+                let before = &rest[..eq];
+                let name_start = before
+                    .rfind(|c: char| c.is_whitespace())
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let name = &before[name_start..];
+                let vstart = eq + 2;
+                let vend = rest[vstart..].find('"').map(|q| vstart + q).unwrap_or(rest.len());
+                if !name.is_empty() {
+                    attributes.push((name.to_string(), xml_unescape(&rest[vstart..vend])));
+                }
+                rest = &rest[(vend + 1).min(rest.len())..];
+            }
+            let self_closing = tag.trim_end().ends_with('/');
+            let text = if self_closing {
+                None
+            } else {
+                let tstart = (close + 1).min(body.len());
+                body[tstart..].find("</Property>").map(|q| xml_unescape(body[tstart..tstart + q].trim()))
+            };
+            let ty = attributes
+                .iter()
+                .find(|(k, _)| k == "type")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            properties.push(XisfProperty { id: id.to_string(), ty, attributes, text });
         }
-        cursor = e;
+        cursor = close.max(s + 1);
     }
 
     let bytes_per_sample = match sample_format.as_str() {
@@ -270,12 +428,62 @@ fn read_xisf_flat(path: &Path) -> Result<(XisfMeta, Vec<f32>, usize), String> {
     ))
 }
 
-/// Values written into the output header. Mirrors `save_linear_xisf` in `core/pws.py`.
+/// Values written into the output header. Mirrors `save_linear_xisf` in `core/pws.py`:
+/// the three product keywords plus the cross-frame aggregated FITS keywords and
+/// XISF properties (`_aggregate_fits_keywords` / `_aggregate_properties` / `_pws_props`).
 pub struct OutMeta {
     pub total_exp: f64,
     pub ncombine: u32,
     pub stack_mode: String,
-    pub passthrough: Vec<(String, String)>,
+    pub keywords: Vec<FitsKeyword>,
+    pub properties: Vec<XisfProperty>,
+}
+
+impl OutMeta {
+    /// The three keywords the product always writes, in `save_linear_xisf` order.
+    pub fn product_keywords(&self) -> [FitsKeyword; 3] {
+        [
+            FitsKeyword::new(
+                "TOTALEXP",
+                format!("{:.1}", self.total_exp),
+                "total exposure seconds of combined frames",
+            ),
+            FitsKeyword::new("NCOMBINE", self.ncombine.to_string(), "frames combined"),
+            // Python drops the mode text straight into the keyword list, so the
+            // value reaches the header unquoted; keep the bytes identical.
+            FitsKeyword::new(
+                "STACKMODE",
+                self.stack_mode.clone(),
+                "partition-weighted stacking (linear output, no stretch)",
+            ),
+        ]
+    }
+}
+
+fn render_keyword(out: &mut String, kw: &FitsKeyword) {
+    out.push_str(&format!(
+        "      <FITSKeyword name=\"{}\" value=\"{}\"",
+        xml_escape_attr(&kw.name),
+        xml_escape_attr(&kw.value)
+    ));
+    if !kw.comment.is_empty() {
+        out.push_str(&format!(" comment=\"{}\"", xml_escape_attr(&kw.comment)));
+    }
+    out.push_str("/>\n");
+}
+
+fn render_property(out: &mut String, p: &XisfProperty) {
+    let mut attrs = String::new();
+    for (k, v) in &p.attributes {
+        attrs.push_str(&format!(" {}=\"{}\"", k, xml_escape_attr(v)));
+    }
+    match &p.text {
+        Some(t) if !t.is_empty() => out.push_str(&format!(
+            "      <Property{attrs}>{}</Property>\n",
+            xml_escape_text(t)
+        )),
+        _ => out.push_str(&format!("      <Property{attrs}/>\n")),
+    }
 }
 
 pub fn write_xisf(path: &Path, img: &Img, meta: &OutMeta) -> Result<(), String> {
@@ -298,21 +506,18 @@ pub fn write_xisf(path: &Path, img: &Img, meta: &OutMeta) -> Result<(), String> 
         hi = 1.0;
     }
     let mut kws = String::new();
-    let mut push_kw = |name: &str, value: String, comment: &str| {
-        kws.push_str(&format!(
-            "      <FITSKeyword name=\"{name}\" value=\"{value}\" comment=\"{comment}\"/>\n"
-        ));
-    };
-    push_kw("TOTALEXP", format!("{:.1}", meta.total_exp), "total exposure seconds of combined frames");
-    push_kw("NCOMBINE", meta.ncombine.to_string(), "frames combined");
-    push_kw("STACKMODE", format!("'{}\'", meta.stack_mode), "partition-weighted stacking (linear output, no stretch)");
-    // pass through the first frame's instrument/observation keywords
-    for (k, v) in &meta.passthrough {
-        if matches!(k.as_str(), "TOTALEXP" | "NCOMBINE" | "STACKMODE") {
+    for kw in meta.product_keywords() {
+        render_keyword(&mut kws, &kw);
+    }
+    // Aggregated per-frame keywords (Python: `fits_keywords = [...] + aggregated`).
+    for kw in &meta.keywords {
+        if matches!(kw.name.to_ascii_uppercase().as_str(), "TOTALEXP" | "NCOMBINE" | "STACKMODE") {
             continue;
         }
-        let esc = v.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;");
-        kws.push_str(&format!("      <FITSKeyword name=\"{k}\" value=\"{esc}\"/>\n"));
+        render_keyword(&mut kws, kw);
+    }
+    for p in &meta.properties {
+        render_property(&mut kws, p);
     }
 
     // two-pass: the header length depends on the digit count of the data offset,
@@ -446,4 +651,432 @@ pub fn write_npy_f32(path: &Path, data: &[f32], h: usize, w: usize) -> Result<()
     f.write_all(&header).map_err(|e| e.to_string())?;
     f.write_all(bytemuck::cast_slice(data)).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Cross-frame metadata aggregation — port of `_aggregate_fits_keywords`,
+// `_aggregate_properties` and the `PWS:` property set in `core/pws.py`.
+// ---------------------------------------------------------------------------
+
+/// Product-owned keywords: never passed through from the input frames.
+const META_SKIP_KW: [&str; 3] = ["TOTALEXP", "NCOMBINE", "STACKMODE"];
+/// Per-frame measurements (`PSF*`, `NOISE*`) only hold for a single frame.
+const META_SKIP_KW_PREFIX: [&str; 2] = ["PSF", "NOISE"];
+
+/// Python `float` repr, close enough for XISF `value` attributes: integral floats
+/// keep the `.0` (`str(1200.0) == '1200.0'`), everything else is shortest round-trip.
+pub fn py_num(v: f64) -> String {
+    if !v.is_finite() {
+        return if v.is_nan() { "nan".into() } else if v > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    if v == v.trunc() && v.abs() < 1e16 {
+        format!("{v:.1}")
+    } else {
+        format!("{v}")
+    }
+}
+
+/// C's `%.6g` (Python's `fmt='%.6g'` in the weights table): six significant
+/// digits, trailing zeros dropped, exponent form outside `1e-4 .. 1e6`.
+pub fn py_g6(v: f64) -> String {
+    if !v.is_finite() {
+        return py_num(v);
+    }
+    if v == 0.0 {
+        // C prints the sign of a negative zero; keep it so the table matches.
+        return if v.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    let sign = if v < 0.0 { "-" } else { "" };
+    let a = v.abs();
+    let mut exp = a.log10().floor() as i32;
+    // `%g` rounds to six significant digits *before* choosing the form, so
+    // 999999.5 prints as `1e+06` and 9.9999999e-5 as `0.0001`.
+    let mut mant = format!("{:.5}", a / 10f64.powi(exp));
+    if mant.parse::<f64>().unwrap_or(0.0) >= 10.0 {
+        exp += 1;
+        mant = format!("{:.5}", a / 10f64.powi(exp));
+    }
+    let digits: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
+    if exp < -4 || exp >= 6 {
+        let m = mant.trim_end_matches('0').trim_end_matches('.').to_string();
+        return format!("{sign}{m}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs());
+    }
+    // Lay the six significant digits around the decimal point.
+    let point = 1 + exp;
+    let mut body = if point <= 0 {
+        format!("0.{}{}", "0".repeat((-point) as usize), digits)
+    } else if point as usize >= digits.len() {
+        digits
+    } else {
+        format!("{}.{}", &digits[..point as usize], &digits[point as usize..])
+    };
+    if body.contains('.') {
+        while body.ends_with('0') {
+            body.pop();
+        }
+        if body.ends_with('.') {
+            body.pop();
+        }
+    }
+    format!("{sign}{body}")
+}
+
+pub fn median_f64(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = s.len();
+    if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        0.5 * (s[n / 2 - 1] + s[n / 2])
+    }
+}
+
+/// Minimal civil-time value with Python `datetime.isoformat()` output, so the
+/// DATE-OBS/DATE-END strings are byte-identical to the Python product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IsoTime {
+    /// Civil seconds since 1970-01-01T00:00:00 (the frame timestamp is UTC-naive).
+    pub secs: i64,
+    pub micros: u32,
+    /// UTC offset in minutes, kept only when the input carried a timezone.
+    pub offset_min: Option<i32>,
+}
+
+impl IsoTime {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let sep = s.find(['T', ' '])?;
+        let (date, mut time) = s.split_at(sep);
+        time = &time[1..];
+        let mut dit = date.split('-');
+        let y: i64 = dit.next()?.parse().ok()?;
+        let mo: i64 = dit.next()?.parse().ok()?;
+        let d: i64 = dit.next()?.parse().ok()?;
+
+        let mut offset_min = None;
+        let mut tz_split = time.len();
+        for (i, c) in time.char_indices() {
+            if c == '+' || (c == '-' && i > 0) || c == 'Z' || c == 'z' {
+                tz_split = i;
+                break;
+            }
+        }
+        let tz = &time[tz_split..];
+        time = &time[..tz_split];
+        if !tz.is_empty() {
+            if tz.eq_ignore_ascii_case("z") {
+                offset_min = Some(0);
+            } else {
+                let sign = if tz.starts_with('-') { -1 } else { 1 };
+                let body: String = tz.chars().filter(|c| c.is_ascii_digit()).collect();
+                let hh: i32 = body.get(0..2).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let mm: i32 = body.get(2..4).and_then(|v| v.parse().ok()).unwrap_or(0);
+                offset_min = Some(sign * (hh * 60 + mm));
+            }
+        }
+
+        let mut tit = time.split(':');
+        let h: i64 = tit.next()?.parse().ok()?;
+        let mi: i64 = tit.next().unwrap_or("0").parse().ok()?;
+        let sec_part = tit.next().unwrap_or("0");
+        let (whole, frac) = match sec_part.find('.') {
+            Some(p) => (&sec_part[..p], &sec_part[p + 1..]),
+            None => (sec_part, ""),
+        };
+        let sec: i64 = whole.parse().ok()?;
+        let micros: u32 = if frac.is_empty() {
+            0
+        } else {
+            let mut digits: String = frac.chars().take(6).collect();
+            while digits.len() < 6 {
+                digits.push('0');
+            }
+            digits.parse().ok()?
+        };
+        let days = days_from_civil(y, mo, d);
+        Some(Self { secs: days * 86_400 + h * 3_600 + mi * 60 + sec, micros, offset_min })
+    }
+
+    pub fn add_seconds(&self, secs: f64) -> Self {
+        let dm = (secs * 1e6).round() as i64;
+        let total = self.secs * 1_000_000 + self.micros as i64 + dm;
+        let (s, us) = (total.div_euclid(1_000_000), total.rem_euclid(1_000_000) as u32);
+        Self { secs: s, micros: us, offset_min: self.offset_min }
+    }
+
+    /// `datetime.isoformat()`: `YYYY-MM-DDTHH:MM:SS[.ffffff][+HH:MM]`.
+    pub fn to_iso(self) -> String {
+        let days = self.secs.div_euclid(86_400);
+        let rem = self.secs.rem_euclid(86_400);
+        let (y, mo, d) = civil_from_days(days);
+        let (h, mi, s) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+        let mut out = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}");
+        if self.micros > 0 {
+            out.push_str(&format!(".{:06}", self.micros));
+        }
+        if let Some(off) = self.offset_min {
+            let sign = if off < 0 { '-' } else { '+' };
+            let a = off.abs();
+            out.push_str(&format!("{sign}{:02}:{:02}", a / 60, a % 60));
+        }
+        out
+    }
+}
+
+/// Howard Hinnant's `days_from_civil` (proleptic Gregorian, no libm/libc).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn push_grouped<'a>(
+    order: &mut Vec<String>,
+    groups: &mut Vec<Vec<&'a FitsKeyword>>,
+    index: &mut std::collections::HashMap<String, usize>,
+    kw: &'a FitsKeyword,
+) {
+    let name = kw.name.to_ascii_uppercase();
+    let i = match index.get(&name) {
+        Some(&i) => i,
+        None => {
+            order.push(name.clone());
+            groups.push(Vec::new());
+            let i = groups.len() - 1;
+            index.insert(name, i);
+            i
+        }
+    };
+    groups[i].push(kw);
+}
+
+/// `_aggregate_fits_keywords`: a keyword present in *every* frame with an equal
+/// value is passed through verbatim (value + comment of the first frame);
+/// DATE-OBS becomes the earliest start and DATE-END the last start plus the
+/// median exposure.  Keywords whose values differ are dropped — Python does not
+/// invent a `VARIOUS` placeholder.
+pub fn aggregate_fits_keywords(metas: &[XisfMeta], exptimes: &[f64]) -> Vec<FitsKeyword> {
+    let n = metas.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: Vec<Vec<&FitsKeyword>> = Vec::new();
+    let mut index = std::collections::HashMap::new();
+    for m in metas {
+        for kw in &m.keywords {
+            push_grouped(&mut order, &mut groups, &mut index, kw);
+        }
+    }
+    let med_exp = median_f64(exptimes);
+    let mut out = Vec::new();
+    for (i, name) in order.iter().enumerate() {
+        let g = &groups[i];
+        if g.len() != n
+            || META_SKIP_KW.contains(&name.as_str())
+            || META_SKIP_KW_PREFIX.iter().any(|p| name.starts_with(p))
+        {
+            continue;
+        }
+        if name == "DATE-OBS" {
+            let mut ts: Vec<IsoTime> = match g.iter().map(|k| IsoTime::parse(&k.bare())).collect::<Option<Vec<_>>>() {
+                Some(v) => v,
+                None => continue,
+            };
+            ts.sort();
+            let first = ts[0];
+            let last = *ts.last().unwrap();
+            out.push(FitsKeyword::new(
+                "DATE-OBS",
+                format!("'{}'", first.to_iso()),
+                "earliest frame start (UTC)",
+            ));
+            let end = if med_exp.is_finite() { last.add_seconds(med_exp) } else { last };
+            out.push(FitsKeyword::new(
+                "DATE-END",
+                format!("'{}'", end.to_iso()),
+                "last frame end (UTC)",
+            ));
+            continue;
+        }
+        let v0 = g[0].bare();
+        if g.iter().all(|k| k.bare() == v0) {
+            out.push(FitsKeyword {
+                name: name.clone(),
+                value: g[0].value.clone(),
+                comment: g[0].comment.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn norm_attrs(p: &XisfProperty) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> =
+        p.attributes.iter().filter(|(k, _)| k != "id").cloned().collect();
+    v.sort();
+    v
+}
+
+/// `_aggregate_properties`: identical properties pass through untouched (base64
+/// vectors stay valid); numeric properties that differ per frame collapse to the
+/// median; `Observation:Time:Start/End` to the earliest/latest.  PCL:/PixInsight:
+/// signatures are per-frame and are dropped.
+pub fn aggregate_properties(metas: &[XisfMeta]) -> Vec<XisfProperty> {
+    let n = metas.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: Vec<Vec<&XisfProperty>> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for m in metas {
+        for p in &m.properties {
+            match index.get(&p.id) {
+                Some(&i) => groups[i].push(p),
+                None => {
+                    order.push(p.id.clone());
+                    groups.push(vec![p]);
+                    index.insert(p.id.clone(), groups.len() - 1);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (i, pid) in order.iter().enumerate() {
+        let g = &groups[i];
+        if g.len() != n || pid.starts_with("PCL:") || pid.starts_with("PixInsight:") {
+            continue;
+        }
+        let same = g
+            .iter()
+            .all(|p| p.ty == g[0].ty && p.text == g[0].text && norm_attrs(p) == norm_attrs(g[0]));
+        if same {
+            out.push(g[0].clone());
+            continue;
+        }
+        let ty = g[0].ty.clone();
+        if matches!(
+            ty.as_str(),
+            "Float32"
+                | "Float64"
+                | "Int8"
+                | "Int16"
+                | "Int32"
+                | "Int64"
+                | "UInt8"
+                | "UInt16"
+                | "UInt32"
+                | "UInt64"
+        ) {
+            let nums: Option<Vec<f64>> = g
+                .iter()
+                .map(|p| p.value().and_then(|v| v.trim().parse::<f64>().ok()))
+                .collect();
+            if let Some(nums) = nums {
+                let med = median_f64(&nums);
+                out.push(XisfProperty::value_prop(pid, &ty, &py_num(med)));
+                continue;
+            }
+        }
+        if ty == "TimePoint" {
+            let vals: Vec<&str> = g.iter().filter_map(|p| p.value()).collect();
+            if vals.len() == n {
+                let pick = if pid.ends_with(":Start") {
+                    vals.iter().min()
+                } else if pid.ends_with(":End") {
+                    vals.iter().max()
+                } else {
+                    None
+                };
+                if let Some(v) = pick {
+                    out.push(XisfProperty::value_prop(pid, &ty, v));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `_pws_props`: the fixed `PWS:` diagnostic set, in the order Python writes it.
+pub fn pws_properties(diag: &PwsDiag) -> Vec<XisfProperty> {
+    let mut out = vec![XisfProperty::text_prop(
+        "PWS:Software",
+        "String",
+        "DWT · Partition-Weighted Stacking",
+    )];
+    fn num(out: &mut Vec<XisfProperty>, id: &str, ty: &str, v: Option<f64>) {
+        if let Some(v) = v {
+            out.push(XisfProperty::value_prop(id, ty, &py_num(v)));
+        }
+    }
+    num(&mut out, "PWS:A", "Float64", diag.a);
+    num(&mut out, "PWS:B", "Float64", diag.b);
+    num(&mut out, "PWS:RejK", "Float64", diag.rej_k);
+    num(&mut out, "PWS:RejGate", "Float64", diag.rej_gate);
+    num(&mut out, "PWS:ScaleOut", "Float64", diag.scale_out);
+    num(&mut out, "PWS:RejRate", "Float64", diag.rej_rate);
+    if let Some(n) = diag.star_count {
+        out.push(XisfProperty::value_prop("PWS:StarCount", "Int32", &n.to_string()));
+    }
+    num(&mut out, "PWS:FwhmFrameMedian", "Float64", diag.fwhm_frame_median);
+    num(&mut out, "PWS:FwhmOutput", "Float64", diag.fwhm_output);
+    num(&mut out, "PWS:NeffMedian", "Float64", diag.neff_median);
+    num(&mut out, "PWS:SigmaFrameMedian", "Float64", diag.sigma_frame_median);
+    num(&mut out, "PWS:SigmaSky", "Float64", diag.sigma_sky);
+    out
+}
+
+/// Engine diagnostics for [`pws_properties`]; `None` = not available, and the
+/// property is then simply not written (same as Python's `diag.get(k) is None`).
+#[derive(Debug, Clone, Default)]
+pub struct PwsDiag {
+    pub a: Option<f64>,
+    pub b: Option<f64>,
+    pub rej_k: Option<f64>,
+    pub rej_gate: Option<f64>,
+    pub scale_out: Option<f64>,
+    pub rej_rate: Option<f64>,
+    pub star_count: Option<i64>,
+    pub fwhm_frame_median: Option<f64>,
+    pub fwhm_output: Option<f64>,
+    pub neff_median: Option<f64>,
+    pub sigma_frame_median: Option<f64>,
+    pub sigma_sky: Option<f64>,
+}
+
+impl PwsDiag {
+    /// The auto-cropped product is written by Python with a much smaller `diag`
+    /// (`A`, `B`, `CropCover`, `CropBox`, `FwhmOutput` only), so its header
+    /// carries just `Software`/`A`/`B`/`FwhmOutput` from `_pws_props`. Mirror
+    /// that subset instead of leaking the main product's diagnostics into it.
+    pub fn autocrop_subset(&self) -> Self {
+        Self {
+            a: self.a,
+            b: self.b,
+            fwhm_output: self.fwhm_output,
+            ..Self::default()
+        }
+    }
 }

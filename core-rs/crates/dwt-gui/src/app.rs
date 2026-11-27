@@ -916,7 +916,7 @@ impl DrizzleApp {
                     );
                     theme::text_row(ui, "清晰度范围", &mut self.params.sharp_w, "空/0 = 全场；2 = 只作用星点");
                     theme::text_row(ui, "FWHM 上限", &mut self.params.fwhm_max, "0/空 = 不筛（一般用 A 就够）");
-                    theme::choice_row(
+                    theme::unsupported_choice(
                         ui,
                         "计算设备",
                         &mut self.params.gpu,
@@ -926,8 +926,8 @@ impl DrizzleApp {
                     theme::text_row(ui, "吞吐权重", &mut self.params.flux_pow, "0 关 / 2 推荐：按每帧收光量加权");
                     theme::text_row(ui, "自动裁边", &mut self.params.crop_cover, "0 关 / 0.9 推荐；裁掉空四角与薄边带");
                     theme::text_row(ui, "径向背景", &mut self.params.bg_r, "0 关 / 2 拟 r² / 4 拟 r²+r⁴");
-                    theme::text_row(ui, "调参 A 候选", &mut self.params.tune_a, "自动调参时尝试的 A 值，逗号分隔");
-                    theme::check_row(ui, "原尺寸副本", &mut self.params.native_1x, "另存一份原生尺寸（1×，块平均）");
+                    theme::unsupported_text(ui, "调参 A 候选", &mut self.params.tune_a, "自动调参时尝试的 A 值，逗号分隔");
+                    theme::unsupported_check(ui, "原尺寸副本", &mut self.params.native_1x, "另存一份原生尺寸（1×，块平均）");
                     theme::check_row(ui, "对齐输入", &mut self.params.aligned, "输入已对齐（跳过配准与插值）");
                     theme::choice_row(
                         ui,
@@ -950,10 +950,10 @@ impl DrizzleApp {
                         &[("auto", "自动"), ("shared", "共用"), ("own", "逐通道")],
                         "自动按通道信噪比决定",
                     );
-                    theme::check_row(ui, "复用配准缓存", &mut self.params.cache, "跨运行复用配准结果");
+                    theme::unsupported_check(ui, "复用配准缓存", &mut self.params.cache, "跨运行复用配准结果");
                     theme::check_row(ui, "排异按噪声归一", &mut self.params.rej_z, "按每帧噪声归一后排异");
                     theme::text_row(ui, "单帧份额上限", &mut self.params.max_share, "0.25 = 单帧最多 25% 权重");
-                    theme::text_row(ui, "参考像帧数", &mut self.params.ref_k, "0 = 自动（取最锐的 8 帧）");
+                    theme::unsupported_text(ui, "参考像帧数", &mut self.params.ref_k, "0 = 自动（取最锐的 8 帧）");
                     theme::choice_row(
                         ui,
                         "彩机画布",
@@ -1009,13 +1009,13 @@ impl DrizzleApp {
                     theme::text_row(ui, "FWHM 搜索", &mut self.params.fwhm_search, "0 = 不搜索；dwt-rs CLI 默认 8");
                     theme::text_row(ui, "星点生长 %", &mut self.params.star_grow_pct, "R 场包络星点生长百分比，默认 100");
                     theme::text_row(ui, "R 场下限", &mut self.params.r_floor, "0..0.95，默认 0");
-                    theme::text_row(ui, "C 星点数", &mut self.params.c_star, "清晰度测量星点数，默认 64");
+                    theme::unsupported_text(ui, "C 星点数", &mut self.params.c_star, "清晰度测量星点数，默认 64");
                     theme::text_row(ui, "信噪比裁剪", &mut self.params.snr_clip, "S 权重限幅 K，默认 3；0 = 关");
-                    theme::text_row(ui, "调参帧数", &mut self.params.tune, "0 = 不调参");
-                    theme::text_row(ui, "调参进程", &mut self.params.tune_jobs, "自动调参并行数，默认 2");
-                    theme::path_row(ui, "帧缓存目录", &mut self.params.frames_dir, "可选：已归一化帧缓存目录", true);
-                    theme::check_row(ui, "保留帧缓存", &mut self.params.keep_frames, "调参时保留中间帧");
-                    theme::text_row(ui, "清晰度分块", &mut self.params.sharp_tiles, "0 = 自动；分块测清晰度");
+                    theme::unsupported_text(ui, "调参帧数", &mut self.params.tune, "0 = 不调参");
+                    theme::unsupported_text(ui, "调参进程", &mut self.params.tune_jobs, "自动调参并行数，默认 2");
+                    theme::unsupported_path(ui, "帧缓存目录", &mut self.params.frames_dir, "可选：已归一化帧缓存目录", true);
+                    theme::unsupported_check(ui, "保留帧缓存", &mut self.params.keep_frames, "调参时保留中间帧");
+                    theme::unsupported_text(ui, "清晰度分块", &mut self.params.sharp_tiles, "0 = 自动；分块测清晰度");
                     theme::text_row(ui, "裁切中心", &mut self.params.center, "cy,cx 或 cy×cx；空 = 自动找目标");
                     theme::check_row(ui, "彩机 drizzle", &mut self.params.cfa_drizzle, "彩机按通道做 drizzle");
                     theme::text_row(ui, "彩机 drizzle 倍率", &mut self.params.cfa_drizzle_scale, "1..4，默认 2");
@@ -1026,8 +1026,8 @@ impl DrizzleApp {
                     theme::text_row(ui, "排异 κ（高级）", &mut self.params.rej_k, "3.5σ，越大越保守");
                     theme::text_row(ui, "清晰度 A（高级）", &mut self.params.a, "与常用页同步");
                     theme::text_row(ui, "星点数（高级）", &mut self.params.n_star, "与常用页同步");
-                    theme::path_row(ui, "几何目录", &mut self.params.xdrz, "WBPP 的 .xdrz 目录（跨夜旋转建议填）", true);
-                    theme::path_row(ui, "裁切参考", &mut self.params.match_path, "可选：裁切参考 XISF", false);
+                    theme::unsupported_path(ui, "几何目录", &mut self.params.xdrz, "WBPP 的 .xdrz 目录（跨夜旋转建议填）", true);
+                    theme::unsupported_path(ui, "裁切参考", &mut self.params.match_path, "可选：裁切参考 XISF", false);
                     theme::path_row(ui, "输出网格", &mut self.params.frame, "填 master：成品宽高/朝向与它一致", false);
             }
         });

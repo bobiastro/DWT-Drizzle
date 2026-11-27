@@ -15,13 +15,14 @@ use std::time::Instant;
 
 use dwt_rs::bggrad;
 use dwt_rs::cfa;
+use dwt_rs::cropcover;
 use dwt_rs::detect;
 use dwt_rs::drizzle::{self, Acc, Plan};
 use dwt_rs::image::{self, Img};
 use dwt_rs::register::{self, Sim};
 use dwt_rs::rfield;
 use dwt_rs::stack;
-use dwt_rs::xisf::{self, OutMeta};
+use dwt_rs::xisf::{self, OutMeta, PwsDiag};
 
 /// Reference exposure used by the Python pipeline.
 const EXPTIME_REF: f32 = 300.0;
@@ -280,6 +281,8 @@ pub fn run_job_with_progress(
     // First pass: dimensions and exposure time.  Cropping happens below.
     let mut dims: Option<(usize, usize)> = None;
     let mut exps = Vec::with_capacity(selected.len());
+    // keep every frame header: the product header is aggregated from them
+    let mut metas: Vec<xisf::XisfMeta> = Vec::with_capacity(selected.len());
     for (i, p) in selected.iter().enumerate() {
         check_cancel(cancel)?;
         let (meta, img) = xisf::read_xisf(p).map_err(|e| format!("读取 {}: {e}", p.display()))?;
@@ -306,6 +309,7 @@ pub fn run_job_with_progress(
             dims = Some((img.w, img.h));
         }
         exps.push(exp);
+        metas.push(meta);
         progress(JobProgress {
             stage: "读取素材".into(),
             current: i + 1,
@@ -621,58 +625,65 @@ pub fn run_job_with_progress(
         neff.fill(frames.len() as f32);
     }
 
-    let (x0, y0, cw2, ch2) = if cfg.crop_cover > 0.0 && cfg.crop_cover < 1.0 {
-        let (bx, by, bw, bh) = autocrop_bounds(&acc.den, acc.plan.w, acc.plan.h, cfg.crop_cover);
-        if bw > 8 && bh > 8 {
-            out_img = out_img.crop(bx, by, bw, bh);
-            let mut n2 = vec![0.0f32; bw * bh];
-            for y in 0..bh {
-                for x in 0..bw {
-                    n2[y * bw + x] = neff[(by + y) * acc.plan.w + bx + x];
-                }
-            }
-            neff = n2;
-            log(&format!("[输出] 自动裁边 {}×{} -> {}×{}", acc.plan.w, acc.plan.h, bw, bh));
-            (bx, by, bw, bh)
-        } else {
-            (0, 0, acc.plan.w, acc.plan.h)
-        }
-    } else {
-        (0, 0, acc.plan.w, acc.plan.h)
-    };
-    let _ = (x0, y0);
+    // ---- coverage (`ncov`) ------------------------------------------------
+    // The drizzle path accumulates it per output pixel; the 1× path does not,
+    // so count the finite frames there (Python always writes `_ncov.npy`).
+    let mut cov: Vec<f32> = acc.cov.clone();
+    if cov.len() != out_img.d.len() || cov.iter().all(|v| *v <= 0.0) {
+        cov = image::coverage_count(&frames, out_img.w, out_img.h);
+    }
+    if cov.len() != out_img.d.len() {
+        cov = vec![frames.len() as f32; out_img.d.len()];
+    }
+
+    // ---- auto crop (Python `cropcover.crop_box`) --------------------------
+    // The main product stays full frame; the crop is its own product, exactly
+    // like `save_linear_xisf` + `{stem}_autocrop.*` in `core/pws.py`.
+    let mut crop: Option<(usize, usize, usize, usize)> = None;
+    if cfg.crop_cover > 0.0 && cfg.crop_cover < 1.0 {
+        crop = cropcover::crop_box(&cov, out_img.w, out_img.h, cfg.crop_cover as f64, 3.0)
+            .filter(|b| b.1 - b.0 >= 32 && b.3 - b.2 >= 32);
+    }
 
     let stem = output_stem(&cfg.tag, &pick);
     let image_path = out_dir.join(format!("{stem}.xisf"));
-    let r_q4 = image::downsample(&rfield_img, 4);
-    let neff_img = Img::from_vec(cw2, ch2, neff);
-    let neff_q4 = image::downsample(&neff_img, 4);
-    let r_path = out_dir.join(format!("{stem}_R_q4.npy"));
-    let neff_path = out_dir.join(format!("{stem}_neff_q4.npy"));
-    let weights_path = out_dir.join(format!("{stem}_weights.txt"));
-    xisf::write_npy_f32(&r_path, &r_q4.d, r_q4.h, r_q4.w)
-        .map_err(|e| format!("写 R 场失败: {e}"))?;
-    xisf::write_npy_f32(&neff_path, &neff_q4.d, neff_q4.h, neff_q4.w)
-        .map_err(|e| format!("写 N_eff 失败: {e}"))?;
-    let mut table = String::from("# idx  fwhm_px  C_sharp  sigma  S_snr\n");
-    for i in 0..frames.len() {
-        table.push_str(&format!(
-            "{i:>4}  {:>8.3}  {:>7.4}  {:>7.4}  {:>7.4}\n",
-            fwhms[i], c[i], frame_sigmas[i], s[i]
-        ));
-    }
-    fs::write(&weights_path, table).map_err(|e| format!("写权重表失败: {e}"))?;
 
+    // ---- product header: frame keywords + PWS properties ------------------
+    let neff_ok: Vec<f32> = neff.iter().copied().filter(|v| v.is_finite() && *v > 0.0).collect();
+    let fwhm_out = {
+        let probe: Vec<(usize, usize)> = stars.iter().copied().take(48).collect();
+        let v = if probe.is_empty() { f32::NAN } else { detect::measure_fwhm(&out_img, &probe, 16) };
+        if v.is_finite() && v > 0.0 {
+            Some(v as f64)
+        } else {
+            None
+        }
+    };
+    let diag = PwsDiag {
+        a: Some(cfg.a as f64),
+        b: Some(cfg.b as f64),
+        rej_k: Some(cfg.rej_k as f64),
+        rej_gate: Some(1.0 / 3.0),
+        scale_out: Some(exp_factor as f64),
+        rej_rate: if rej_rate.is_finite() { Some(rej_rate as f64) } else { None },
+        star_count: Some(stars.len() as i64),
+        fwhm_frame_median: Some(dwt_rs::image::median_of(&fwhms) as f64),
+        fwhm_output: fwhm_out,
+        neff_median: if neff_ok.is_empty() { None } else { Some(dwt_rs::image::median_of(&neff_ok) as f64) },
+        // Python: sig_out = sig * scale_out -- reported in product units.
+        sigma_frame_median: Some(dwt_rs::image::median_of(&frame_sigmas) as f64 * exp_factor as f64),
+        sigma_sky: image::sky_sigma(&out_img),
+    };
+    let mut keywords = xisf::aggregate_fits_keywords(&metas, &exps);
+    keywords.retain(|k| !matches!(k.name.as_str(), "TOTALEXP" | "NCOMBINE" | "STACKMODE"));
+    let mut properties = xisf::aggregate_properties(&metas);
+    properties.extend(xisf::pws_properties(&diag));
     let meta = OutMeta {
         total_exp: exps.iter().sum::<f64>(),
         ncombine: frames.len() as u32,
-        stack_mode: if cfg.drizzle { "PWS-drizzle".into() } else { "PWS".into() },
-        passthrough: vec![
-            ("FILTER".into(), format!("'{pick}'")),
-            ("PWS_A".into(), format!("{:.3}", cfg.a)),
-            ("PWS_REJK".into(), format!("{:.3}", cfg.rej_k)),
-            ("PWS_SCALE".into(), format!("{out_scale:.3}")),
-        ],
+        stack_mode: format!("PWS A={} B={} rej_k={}", cfg.a, cfg.b, cfg.rej_k),
+        keywords: keywords.clone(),
+        properties,
     };
     xisf::write_xisf(&image_path, &out_img, &meta).map_err(|e| format!("写 XISF 失败: {e}"))?;
     log(&format!(
@@ -680,8 +691,70 @@ pub fn run_job_with_progress(
         image_path.display(), out_img.w, out_img.h, rinfo.sigma_psf, rej_rate * 100.0,
         t0.elapsed().as_secs_f32()
     ));
+
+    // ---- companion maps: Python writes the 4×4 block means every run ------
+    let r_q4 = cropcover::q4_mean(&rfield_img.d, rfield_img.h, rfield_img.w);
+    let neff_q4 = cropcover::q4_mean(&neff, out_img.h, out_img.w);
+    let cov_q4 = cropcover::q4_mean(&cov, out_img.h, out_img.w);
+    let r_path = out_dir.join(format!("{stem}_R_q4.npy"));
+    let neff_path = out_dir.join(format!("{stem}_neff_q4.npy"));
+    let ncov_path = out_dir.join(format!("{stem}_ncov.npy"));
+    let ncov_q4_path = out_dir.join(format!("{stem}_ncov_q4.npy"));
+    let weights_path = out_dir.join(format!("{stem}_weights.txt"));
+    xisf::write_npy_f32(&r_path, &r_q4.0, r_q4.1, r_q4.2)
+        .map_err(|e| format!("写 R 场失败: {e}"))?;
+    xisf::write_npy_f32(&neff_path, &neff_q4.0, neff_q4.1, neff_q4.2)
+        .map_err(|e| format!("写 N_eff 失败: {e}"))?;
+    xisf::write_npy_f32(&ncov_path, &cov, out_img.h, out_img.w)
+        .map_err(|e| format!("写覆盖计数失败: {e}"))?;
+    xisf::write_npy_f32(&ncov_q4_path, &cov_q4.0, cov_q4.1, cov_q4.2)
+        .map_err(|e| format!("写 1/4 覆盖计数失败: {e}"))?;
+    let mut table = String::from("# idx fwhm_px C_sharp sigma S_snr\n");
+    for i in 0..frames.len() {
+        table.push_str(&format!(
+            "{} {} {} {} {}\n",
+            i,
+            xisf::py_g6(fwhms[i] as f64),
+            xisf::py_g6(c[i] as f64),
+            xisf::py_g6(frame_sigmas[i] as f64 * exp_factor as f64),
+            xisf::py_g6(s[i] as f64)
+        ));
+    }
+    fs::write(&weights_path, table).map_err(|e| format!("写权重表失败: {e}"))?;
+
+    // ---- the cropped product ---------------------------------------------
+    if let Some((y0, y1, x0, x1)) = crop {
+        let (bw, bh) = (x1 - x0, y1 - y0);
+        let sub = out_img.crop(x0, y0, bw, bh);
+        let mut cprops = xisf::aggregate_properties(&metas);
+        cprops.extend(xisf::pws_properties(&diag.autocrop_subset()));
+        let cmeta = OutMeta {
+            total_exp: exps.iter().sum::<f64>(),
+            ncombine: frames.len() as u32,
+            stack_mode: format!("PWS A={} B={} crop={}", cfg.a, cfg.b, cfg.crop_cover),
+            keywords: keywords.clone(),
+            properties: cprops,
+        };
+        let cpath = out_dir.join(format!("{stem}_autocrop.xisf"));
+        xisf::write_xisf(&cpath, &sub, &cmeta).map_err(|e| format!("写裁边 XISF 失败: {e}"))?;
+        let (rv, rh, rw) = cropcover::crop_map(&rfield_img.d, out_img.w, y0, y1, x0, x1);
+        let (nv, nh, nw) = cropcover::crop_map(&neff, out_img.w, y0, y1, x0, x1);
+        let cr_path = out_dir.join(format!("{stem}_autocrop_R.npy"));
+        let cn_path = out_dir.join(format!("{stem}_autocrop_neff.npy"));
+        xisf::write_npy_f32(&cr_path, &rv, rh, rw)
+            .map_err(|e| format!("写裁边 R 失败: {e}"))?;
+        xisf::write_npy_f32(&cn_path, &nv, nh, nw)
+            .map_err(|e| format!("写裁边 N_eff 失败: {e}"))?;
+        log(&format!(
+            "[输出] {}  {}×{}（裁边 x={x0} y={y0}）",
+            cpath.display(),
+            bw,
+            bh
+        ));
+    }
     log(&format!("[输出] {}", r_path.display()));
     log(&format!("[输出] {}", neff_path.display()));
+    log(&format!("[输出] {}", ncov_path.display()));
     log(&format!("[输出] {}", weights_path.display()));
 
     Ok(JobResult {
@@ -1000,41 +1073,6 @@ fn locate_center(files: &[PathBuf], w: usize, h: usize) -> Option<(f32, f32)> {
     }
     blocks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     blocks.first().map(|&(_, bx, by)| (bx as f32 * 4.0, by as f32 * 4.0))
-}
-
-/// Keep the largest centred rectangle whose border rows/columns have at least
-/// `cover` of their pixels covered by the stack.
-fn autocrop_bounds(den: &[f32], w: usize, h: usize, cover: f32) -> (usize, usize, usize, usize) {
-    let cov = |x: usize, y: usize| den[y * w + x] > 1e-4;
-    let row_frac = |y: usize| {
-        let n = (0..w).filter(|&x| cov(x, y)).count();
-        n as f32 / w as f32
-    };
-    let mut y0 = 0;
-    while y0 < h && row_frac(y0) < cover {
-        y0 += 1;
-    }
-    let mut y1 = h;
-    while y1 > y0 && row_frac(y1 - 1) < cover {
-        y1 -= 1;
-    }
-    let col_frac = |x: usize| {
-        let n = (y0..y1).filter(|&y| cov(x, y)).count();
-        n as f32 / (y1 - y0).max(1) as f32
-    };
-    let mut x0 = 0;
-    while x0 < w && col_frac(x0) < cover {
-        x0 += 1;
-    }
-    let mut x1 = w;
-    while x1 > x0 && col_frac(x1 - 1) < cover {
-        x1 -= 1;
-    }
-    if x1 <= x0 || y1 <= y0 {
-        (0, 0, w, h)
-    } else {
-        (x0, y0, x1 - x0, y1 - y0)
-    }
 }
 
 fn output_stem(tag: &str, filter: &str) -> String {
