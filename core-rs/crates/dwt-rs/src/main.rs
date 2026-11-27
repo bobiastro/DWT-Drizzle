@@ -154,12 +154,12 @@ impl Default for Args {
             cfa: "off".into(),
             cfa_debayer: "bilinear".into(),
             cfa_weights: "auto".into(),
-            cfa_align: "shared".into(),
+            cfa_align: "auto".into(),
             cfa_raw: "off".into(),
             cfa_ref: None,
-            cfa_grid: None,
+            cfa_grid: Some("shared".into()),
             cfa_drizzle: false,
-            cfa_drizzle_scale: 1.0,
+            cfa_drizzle_scale: 2.0,
             rgb_balance: "off".into(),
             match_scale: false,
         }
@@ -592,10 +592,26 @@ fn run_driver() -> Result<(), String> {
     // up shared because its per-channel FWHM correlation is noise, so this
     // reproduces the same decision for well-corrected data while still catching
     // a genuinely mis-registered OSC train.
+    if a.cfa_drizzle {
+        return Err("--cfa-drizzle（Python cfadz：三平面单遍 CFA drizzle）尚未实现；请改用 --cfa-raw on + 三通道逐遍（等价于 Python 未开 --cfa-drizzle 的路径）".into());
+    }
+    let deb = a.cfa_debayer.trim().to_ascii_lowercase();
+    if pattern.is_some() && !deb.is_empty() && deb != "bilinear" && deb != "plane" {
+        println!(
+            "[CFA] 拆色算法 {deb} 未实现（Rust 只有与 Python bilinear/plane 相同的 3×3 同色归一化插值）；改用 bilinear"
+        );
+    }
     let weights_mode = a.cfa_weights.trim().to_ascii_lowercase();
-    let mut shared = match weights_mode.as_str() {
-        "own" => false,
-        "auto" if !per_channel => {
+    let align_mode = a.cfa_align.trim().to_ascii_lowercase();
+    let grid_mode = a.cfa_grid.as_deref().unwrap_or("shared").trim().to_ascii_lowercase();
+    if pattern.is_some() && grid_mode == "own" {
+        println!("[CFA] 彩机画布 own：不强制统一画布；合并时按最小画布裁切");
+    }
+    let mut shared = if weights_mode == "own" || align_mode == "own" {
+        false
+    } else if weights_mode == "shared" || align_mode == "shared" {
+        true
+    } else if !per_channel {
             let pat = pattern.as_deref().unwrap_or("RGGB");
             let mut decided = true;
             match read_xisf(&files[0]) {
@@ -628,8 +644,8 @@ fn run_driver() -> Result<(), String> {
                 Err(e) => println!("[CFA] auto 判色差：读首帧失败（{e}），退回共用几何"),
             }
             decided
-        }
-        _ => true,
+    } else {
+        true
     };
     if per_channel {
         // The inputs are already demosaiced; sharing a G solve would impose one
