@@ -18,6 +18,7 @@ pub mod lsp;
 pub mod register;
 pub mod rfield;
 pub mod stack;
+pub mod tri;
 pub mod xisf;
 
 #[cfg(test)]

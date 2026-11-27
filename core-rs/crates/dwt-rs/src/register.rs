@@ -383,7 +383,65 @@ pub fn estimate(refc: &[(f32, f32, f32)], movc: &[(f32, f32, f32)], max_shift: f
             best = Some(b);
         }
     }
+    // The vote search is weak on cross-night data (a percent or two of pixel
+    // scale, a degree of field rotation, a different optical train).  Python
+    // answers exactly that with the triangle matcher (`core/trireg.py`, called
+    // from `drizzle.py` for frames the fast path rejects), which is invariant
+    // to rotation/scale/translation and needs no initial guess.
+    let weak = best.as_ref().map_or(true, |s| s.rms > 1.5 || s.n < 40);
+    if weak {
+        if let Some(t) = estimate_tri(refc, movc) {
+            let better = match best {
+                None => true,
+                Some(a) => t.n > a.n || (t.n == a.n && t.rms < a.rms),
+            };
+            if better {
+                best = Some(t);
+            }
+        }
+    }
     best
+}
+
+/// Triangle (asterism) registration — port of Python `core/trireg.py`.
+///
+/// `0.98..1.02` is Python's own default scale gate for frame-to-frame
+/// solutions (`trireg.solve(s_lo=0.98, s_hi=1.02)`): a same-optics pair never
+/// changes pixel scale by more than 2 %.  `tol=0.03`, `inlier_px=2.5`,
+/// `max_pts=48` are Python's defaults too, and so is the acceptance
+/// (`n_in >= 15 && rms <= 2.0 px` as used by `core/drizzle.py`).
+pub fn estimate_tri(refc: &[(f32, f32, f32)], movc: &[(f32, f32, f32)]) -> Option<Sim> {
+    if refc.len() < 8 || movc.len() < 8 {
+        return None;
+    }
+    let src: Vec<[f64; 2]> = movc.iter().map(|s| [s.0 as f64, s.1 as f64]).collect();
+    let dst: Vec<[f64; 2]> = refc.iter().map(|s| [s.0 as f64, s.1 as f64]).collect();
+    // Two candidate pools: Python's `k=2` nearest descriptors first (fast and
+    // clean), then a wider `k` for fields whose true triangles are crowded out
+    // by near-ties — a 178 deg meridian flip plus a 2 % scale change does that
+    // on real cross-night data.  The acceptance is identical for both.
+    let mut best: Option<crate::tri::TriSolution> = None;
+    for kk in [2usize, 8] {
+        if let Some(sol) = crate::tri::solve(&src, &dst, None, 48, 0.03, 2.5, 0.98, 1.02, 0.5, 1500, kk)
+        {
+            if sol.n_in < 15 || sol.rms > 2.0 {
+                continue;
+            }
+            let better = best.as_ref().map_or(true, |b| sol.n_in > b.n_in);
+            if better {
+                best = Some(sol);
+            }
+        }
+    }
+    let sol = best?;
+    Some(Sim {
+        ux: sol.t[0] as f32,
+        uy: sol.t[1] as f32,
+        theta: sol.theta_deg as f32,
+        k: sol.scale as f32,
+        rms: sol.rms as f32,
+        n: sol.n_in,
+    })
 }
 
 #[cfg(test)]

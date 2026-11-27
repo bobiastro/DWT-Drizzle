@@ -1071,9 +1071,14 @@ fn run_pipeline(
                     println!("[配准] 参考画布是帧的 {ratio:.3}× 网格，相似变换按此换算");
                 }
                 let mut placed: Vec<dwt_rs::register::Sim> = Vec::new();
-                for (i, f) in frames.iter().enumerate() {
+                let mut centres: Vec<Vec<(f32, f32, f32)>> = Vec::with_capacity(frames.len());
+                for f in frames.iter() {
                     let own = build_star_table(f, 400, 26, 25.0);
-                    let c = dwt_rs::register::centroids(f, &own, 8);
+                    centres.push(dwt_rs::register::centroids(f, &own, 8));
+                }
+                for i in 0..frames.len() {
+                    let c = centres[i].clone();
+                    let f = &frames[i];
                     // The vote grid is integer pixels, so a faint frame occasionally
                     // returns no inlier set at the nominal search radius; widen it
                     // before giving up on the frame.
@@ -1093,16 +1098,51 @@ fn run_pipeline(
                     // false peak.  Refusing it is what keeps junk placements out of
                     // the stack: the reference matcher needs a comparable inlier set,
                     // and a frame that cannot earn one has no honest place here.
-                    let got = got.filter(|s| s.rms <= 1.5 && s.n >= 12);
-                    let s = match got {
-                        Some(s) => dwt_rs::register::Sim {
-                            ux: s.ux * ratio,
-                            uy: s.uy * ratio,
-                            theta: s.theta,
-                            k: s.k * ratio,
-                            rms: s.rms * ratio,
-                            n: s.n,
-                        },
+                    // A direct fit is only trusted when a real inlier set supports
+                    // it; the triangle matcher routinely returns 200+ matches at
+                    // rms<1 px for these frames, so `n>=40, rms<=1.0` costs nothing
+                    // and keeps the rare 15-pair junk solution out of the stack.
+                    let got = got.filter(|s| s.rms <= 1.0 && s.n >= 40);
+                    let direct = got.map(|s| dwt_rs::register::Sim {
+                        ux: s.ux * ratio,
+                        uy: s.uy * ratio,
+                        theta: s.theta,
+                        k: s.k * ratio,
+                        rms: s.rms * ratio,
+                        n: s.n,
+                    });
+                    // Chain fallback (Python's `[位移] 三角配准兜底救回`): a frame
+                    // that cannot be matched against the reference product is first
+                    // matched against its nearest already-placed neighbour and the
+                    // transform is composed onto the canvas.  Neighbours in time see
+                    // the same field with a few pixels of dither, so this is the
+                    // reliable path for a night whose pointing is far off.
+                    let chained = if direct.is_none() && !placed.is_empty() {
+                        let mut best: Option<dwt_rs::register::Sim> = None;
+                        for step in 1..=12usize {
+                            for j in [i.checked_sub(step), Some(i + step)] {
+                                let Some(j) = j else { continue };
+                                if j >= frames.len() || !anchored[j] {
+                                    continue;
+                                }
+                                let wide = 0.5 * frames[0].w.max(frames[0].h) as f32;
+                                if let Some(rel) = dwt_rs::register::estimate(&centres[j], &c, wide) {
+                                    if rel.rms <= 1.0 && rel.n >= 30 {
+                                        best = Some(sims[j].compose(&rel));
+                                        break;
+                                    }
+                                }
+                            }
+                            if best.is_some() {
+                                break;
+                            }
+                        }
+                        best
+                    } else {
+                        None
+                    };
+                    let s = match direct.or(chained) {
+                        Some(s) => s,
                         None => {
                             if placed.is_empty() {
                                 return Err(format!(

@@ -73,6 +73,16 @@ pub struct StackResult {
 /// `stack_strip` path that Python's non-drizzle branch runs).  The drizzle path
 /// also rescues pixels whose every sample was flagged by keeping the sample that
 /// deviates least from the anchor, instead of dropping all of them.
+/// `|d[i][p] - anchor| / signal`, the deviation Python's rejection uses.
+#[inline]
+fn deviation(d: &[Img], frame_sig: Option<&[f32]>, i: usize, p: usize, anchor: f32) -> f32 {
+    let mut dv = (d[i].d[p] - anchor).abs();
+    if let Some(sig) = frame_sig {
+        dv /= sig[i].max(1e-12);
+    }
+    dv
+}
+
 pub fn reject(
     d: &[Img],
     wts: &mut [Img],
@@ -90,9 +100,14 @@ pub fn reject(
     let mut rej_rate = 0.0f32;
 
     if rej_k > 0.0 {
+        // The per-pixel deviation is recomputed on demand instead of being
+        // materialised as an `n * npx` array: 393 frames x 6.1 Mpx would need
+        // 9.6 GB for that array alone (plus 2.4 GB for `sky_bad`), which the
+        // 32 GB box cannot hold together with the frames and their weights.
         let mut vals = vec![0.0f32; n];
-        let mut dev = vec![0.0f32; n * npx];
+        let mut vdev = vec![0.0f32; n];
         let mut anchor = vec![0.0f32; npx];
+        let mut mad = vec![0.0f32; npx];
         for p in 0..npx {
             for i in 0..n {
                 vals[i] = d[i].d[p];
@@ -100,35 +115,52 @@ pub fn reject(
             let a = median(&mut vals);
             anchor[p] = a;
             for i in 0..n {
-                let mut dv = (d[i].d[p] - a).abs();
-                if let Some(sig) = frame_sig {
-                    dv /= sig[i].max(1e-12);
-                }
-                dev[i * npx + p] = dv;
+                vdev[i] = deviation(d, frame_sig, i, p, a);
             }
-        }
-        let mut mad = vec![0.0f32; npx];
-        for p in 0..npx {
-            let mut v: Vec<f32> = (0..n).map(|i| dev[i * npx + p]).collect();
-            mad[p] = 1.4826 * median(&mut v);
+            mad[p] = 1.4826 * median(&mut vdev);
         }
         // detail allowance m: per-frame P99 of dev/signal over R>0.5, then median
         let mut m = 0.0f32;
         let mut sig_det: Option<Vec<f32>> = None;
         if let Some(rr) = r {
             let sig: Vec<f32> = (0..npx).map(|p| (anchor[p] - sky).max(0.0)).collect();
-            let core: Vec<usize> =
-                (0..npx).filter(|p| rr.d[*p] > 0.5 && sig[*p] > 0.0).collect();
-            if !core.is_empty() {
-                let ratios: Vec<f32> = (0..n)
+            // Per-frame P99 of dev/signal over R>0.5 pixels, from a histogram
+            // (0.01 bins over 0..64) instead of storing every sample.
+            const NB: usize = 6400;
+            let mut hist = vec![0u32; n * NB];
+            let mut counts = vec![0u32; n];
+            let mut core_px = 0usize;
+            for p in 0..npx {
+                if !(rr.d[p] > 0.5 && sig[p] > 0.0) {
+                    continue;
+                }
+                core_px += 1;
+                for i in 0..n {
+                    let q = deviation(d, frame_sig, i, p, anchor[p]) / sig[p];
+                    let b = ((q / 0.01) as usize).min(NB - 1);
+                    hist[i * NB + b] += 1;
+                    counts[i] += 1;
+                }
+            }
+            if core_px > 0 {
+                let mut ratios: Vec<f32> = (0..n)
                     .into_par_iter()
                     .map(|i| {
-                        let mut v: Vec<f32> =
-                            core.iter().map(|p| dev[i * npx + p] / sig[*p]).collect();
-                        percentile(&mut v, 99.0)
+                        let c = counts[i] as f64;
+                        if c <= 0.0 {
+                            return 0.0f32;
+                        }
+                        let want = 0.99 * c;
+                        let mut acc = 0f64;
+                        for b in 0..NB {
+                            acc += hist[i * NB + b] as f64;
+                            if acc >= want {
+                                return (b as f32) * 0.01 + 0.005;
+                            }
+                        }
+                        64.0
                     })
                     .collect();
-                let mut ratios = ratios;
                 m = median(&mut ratios);
             }
             sig_det = Some(sig);
@@ -147,7 +179,9 @@ pub fn reject(
             }
         };
         let any_sky = sky_mask.iter().any(|v| *v);
-        let mut sky_bad = vec![false; n * npx];
+        // Only the non-drizzle branch ever sets this; allocating it for the
+        // drizzle path would cost n * npx bytes for nothing.
+        let mut sky_bad: Vec<bool> = if any_sky { vec![false; n * npx] } else { Vec::new() };
         let mut sky_dim = vec![false; npx]; // pixels where the 0.8n guard failed
 
         if any_sky {
@@ -197,7 +231,7 @@ pub fn reject(
             }
             let n = n;
             for i in 0..n {
-                bad[i] = dev[i * npx + p] > thr[i];
+                bad[i] = deviation(d, frame_sig, i, p, anchor[p]) > thr[i];
             }
             if sky_mask[p] {
                 for i in 0..n {
@@ -212,7 +246,7 @@ pub fn reject(
                 // ones the mask already flags: in sky pixels the mask is
                 // overwritten by the one-sided sky test, so restricting the count
                 // to `bad` under-states `_nhi` there.
-                if dev[i * npx + p] > thr[i] && d[i].d[p] > anchor[p] {
+                if deviation(d, frame_sig, i, p, anchor[p]) > thr[i] && d[i].d[p] > anchor[p] {
                     nhi += 1;
                 }
                 if bad[i] {
@@ -233,7 +267,9 @@ pub fn reject(
                 // deviates least from the anchor (core/drizzle.py:1976).
                 let mut best = 0usize;
                 for i in 1..n {
-                    if dev[i * npx + p] < dev[best * npx + p] {
+                    if deviation(d, frame_sig, i, p, anchor[p])
+                        < deviation(d, frame_sig, best, p, anchor[p])
+                    {
                         best = i;
                     }
                 }
