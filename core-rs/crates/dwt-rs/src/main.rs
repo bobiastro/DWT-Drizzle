@@ -80,6 +80,7 @@ struct Args {
     lsp_only: Option<String>,
     rej_k: f32,
     snr_clip: f32,
+    rej_z: bool,
     star_grow: f32,
     r_floor: f32,
     drop_mul: f32,
@@ -137,6 +138,7 @@ impl Default for Args {
             lsp_only: None,
             rej_k: REJ_K,
             snr_clip: SNR_CLIP,
+            rej_z: true,
             star_grow: 100.0,
             r_floor: 0.0,
             drop_mul: 0.0,
@@ -279,6 +281,16 @@ fn parse_args() -> Result<Args, String> {
             "--snr-clip" => {
                 a.snr_clip = num(val()?, flag)? as f32;
                 i += 2;
+            }
+            "--rej-z" => {
+                // `--rej-z 0` / `--rej-z 1`；裸写 `--rej-z` 视为打开
+                if has_val() {
+                    a.rej_z = num(val()?, flag)? != 0.0;
+                    i += 2;
+                } else {
+                    a.rej_z = true;
+                    i += 1;
+                }
             }
             "--star-grow" => {
                 a.star_grow = num(val()?, flag)? as f32;
@@ -1615,7 +1627,13 @@ fn run_pipeline(
         (img, nf, f32::NAN)
     } else if drz {
         // Python's drizzle path rejects with plain sigma-clip + detail allowance
-        // (core/drizzle.py:1938-1982): no sky branch, no one-sided exemption.
+        // (core/drizzle.py:1900-1985): no sky branch, no one-sided exemption, and
+        // **no per-frame sigma normalisation** — `frame_sig` only exists in the
+        // non-drizzle `stack_strip` (core/pws.py:1855, fed by `rej_z` at
+        // pws.py:4834/4867).  Passing `Some(&sigmas)` here (as HEAD did) divides
+        // every deviation by a different σ_i, so the default product differed
+        // from Python; the flag `--rej-z` therefore only affects the averaging
+        // path, exactly like Python.
         let t_prof_rj = Instant::now();
         let rate = dwt_rs::stack::reject(
             &frames,
@@ -1624,7 +1642,7 @@ fn run_pipeline(
             sky0,
             a.rej_k,
             REJ_GATE,
-            Some(&sigmas),
+            None,
             true,
         );
         let d_prof_rj = t_prof_rj.elapsed().as_secs_f32();
@@ -1739,7 +1757,13 @@ fn run_pipeline(
         (img, Vec::new(), rate)
     } else {
         let res = stack_strip(
-            &frames, &mut wts, Some(&rfield), sky0, a.rej_k, REJ_GATE, Some(&sigmas),
+            &frames,
+            &mut wts,
+            Some(&rfield),
+            sky0,
+            a.rej_k,
+            REJ_GATE,
+            if a.rej_z { Some(&sigmas) } else { None },
         );
         if let Some(dir) = &a.dump_w {
             for (i, m) in wts.iter().enumerate() {

@@ -111,8 +111,56 @@ fn grow_support_adaptive(r: &Img, grow_px: f32, peak: &Img, sky_sig: f32, levels
     Img::from_vec(r.w, r.h, out)
 }
 
+/// R 场包络模式（Python `_r_envelope(r_mode=...)`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RMode {
+    /// 亮度归一：窗内极大归一（默认）
+    Max,
+    /// 带通包络：先减局部均值，取正部再按窗内极大归一
+    Band,
+    /// 对比度-噪声：绝对判据 clip((bp−0.8σ)/((k−0.8)σ))
+    Ctn,
+}
+
+impl RMode {
+    pub fn parse(s: &str) -> RMode {
+        match s.trim().to_lowercase().as_str() {
+            "band" => RMode::Band,
+            "ctn" => RMode::Ctn,
+            _ => RMode::Max,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            RMode::Max => "max",
+            RMode::Band => "band",
+            RMode::Ctn => "ctn",
+        }
+    }
+}
+
+/// 奇数窗（`w2 = max(3, round(width) | 1)`）
+fn odd_window(width: f32) -> usize {
+    let w = width.round().max(0.0) as usize;
+    w.max(3) | 1
+}
+
 /// `_r_envelope` for the default `r_mode = "max"` path.
 fn r_envelope(sref: &Img, sigma_psf: f32, env_win_mult: f32, env_eps: f32, env_p: f32) -> (Img, Img, f32) {
+    r_envelope_mode(sref, sigma_psf, env_win_mult, env_eps, env_p, RMode::Max, 0.0, 3.0)
+}
+
+/// `_r_envelope` for all three `r_mode` branches (`core/pws.py:1476-1556`).
+fn r_envelope_mode(
+    sref: &Img,
+    sigma_psf: f32,
+    env_win_mult: f32,
+    env_eps: f32,
+    env_p: f32,
+    mode: RMode,
+    r_win: f32,
+    r_k: f32,
+) -> (Img, Img, f32) {
     let sky = median_of(&sref.d);
     let dev: Vec<f32> = sref.d.iter().map(|v| (v - sky).abs()).collect();
     let sig = 1.4826 * median_of(&dev);
@@ -121,6 +169,60 @@ fn r_envelope(sref: &Img, sigma_psf: f32, env_win_mult: f32, env_eps: f32, env_p
         sref.h,
         sref.d.iter().map(|v| (v - sky).max(0.0)).collect(),
     );
+    let env_p_apply = |v: f32| -> f32 {
+        if (env_p - 1.0).abs() > 1e-9 {
+            v.powf(env_p)
+        } else {
+            v
+        }
+    };
+    if mode == RMode::Band || mode == RMode::Ctn {
+        let w2 = if r_win > 0.0 {
+            odd_window(r_win)
+        } else {
+            odd_window((4.0 * sigma_psf.max(0.5)).max(9.0))
+        };
+        let loc_mean = box_filter(&dm, w2);
+        let bp = Img::from_vec(
+            sref.w,
+            sref.h,
+            dm.d.iter()
+                .zip(loc_mean.d.iter())
+                .map(|(a, b)| a - b)
+                .collect::<Vec<f32>>(),
+        );
+        if mode == RMode::Band {
+            let dd = Img::from_vec(
+                sref.w,
+                sref.h,
+                bp.d.iter().map(|v| v.max(0.0)).collect::<Vec<f32>>(),
+            );
+            let loc = max_filter(&dd, w2);
+            let denom_eps = env_eps * sig.max(1e-30);
+            let mut e = Img::new(sref.w, sref.h);
+            for i in 0..e.d.len() {
+                e.d[i] = env_p_apply(clamp(dd.d[i] / (loc.d[i] + denom_eps), 0.0, 1.0));
+            }
+            return (e, loc, sig.max(1e-30));
+        }
+        // ctn
+        let bp_med = median_of(&bp.d);
+        let absdev: Vec<f32> = bp.d.iter().map(|v| (v - bp_med).abs()).collect();
+        let bs = (1.4826 * median_of(&absdev)).max(1e-30);
+        let lo = 0.8 * bs;
+        let hi = r_k.max(1.05) * bs;
+        let span = (hi - lo).max(1e-30);
+        let mut e = Img::new(sref.w, sref.h);
+        for i in 0..e.d.len() {
+            e.d[i] = env_p_apply(clamp((bp.d[i] - lo) / span, 0.0, 1.0));
+        }
+        let loc = Img::from_vec(
+            sref.w,
+            sref.h,
+            bp.d.iter().map(|v| v.max(0.0)).collect::<Vec<f32>>(),
+        );
+        return (e, loc, bs);
+    }
     let half = (env_win_mult * sigma_psf.max(0.5)).round().max(1.0) as usize;
     let win = 2 * half + 1;
     let loc = max_filter(&dm, win);
@@ -128,11 +230,7 @@ fn r_envelope(sref: &Img, sigma_psf: f32, env_win_mult: f32, env_eps: f32, env_p
     let mut e = Img::new(sref.w, sref.h);
     for i in 0..e.d.len() {
         let v = dm.d[i] / (loc.d[i] + denom_eps);
-        let mut v = clamp(v, 0.0, 1.0);
-        if (env_p - 1.0).abs() > 1e-9 {
-            v = v.powf(env_p);
-        }
-        e.d[i] = v;
+        e.d[i] = env_p_apply(clamp(v, 0.0, 1.0));
     }
     (e, loc, sig.max(1e-30))
 }
@@ -147,6 +245,28 @@ pub fn build_r_field(
     star_grow: f32,
     dec: usize,
     dump: Option<&std::path::Path>,
+) -> (Img, RInfo) {
+    build_r_field_ext(
+        sref, sigma_psf_in, r_floor, env_win_mult, env_eps, env_p, star_grow, dec, dump,
+        RMode::Max, 0.0, 3.0,
+    )
+}
+
+/// `build_r_field` + `r_mode` / `r_win` / `r_k`（Python `_r_envelope` 的三个参数）。
+#[allow(clippy::too_many_arguments)]
+pub fn build_r_field_ext(
+    sref: &Img,
+    sigma_psf_in: f32,
+    r_floor: f32,
+    env_win_mult: f32,
+    env_eps: f32,
+    env_p: f32,
+    star_grow: f32,
+    dec: usize,
+    dump: Option<&std::path::Path>,
+    r_mode: RMode,
+    r_win: f32,
+    r_k: f32,
 ) -> (Img, RInfo) {
     let (h0, w0) = (sref.h, sref.w);
     let mut sigma_psf = sigma_psf_in;
@@ -163,7 +283,7 @@ pub fn build_r_field(
         }
         sigma_psf /= dec as f32;
     }
-    let win = ((sigma_psf * R_WIN_MULT).round().max(3.0) as usize) | 1;
+    let win = ((sigma_psf * env_win_mult).round().max(3.0) as usize) | 1;
 
     let (gy, gx) = gradient(&work);
     let mut g2 = Img::new(work.w, work.h);
@@ -178,7 +298,8 @@ pub fn build_r_field(
         t[i] = rms[i] / sig_hp.max(1e-30);
     }
 
-    let (mut r, loc, sky_sig) = r_envelope(&work, sigma_psf, env_win_mult, env_eps, env_p);
+    let (mut r, loc, sky_sig) =
+        r_envelope_mode(&work, sigma_psf, env_win_mult, env_eps, env_p, r_mode, r_win, r_k);
     if let Some(d) = dump {
         let _ = std::fs::create_dir_all(d);
         let _ = crate::xisf::write_npy_f32(&d.join("e.npy"), &r.d, r.h, r.w);

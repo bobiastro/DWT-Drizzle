@@ -5,6 +5,51 @@ use rayon::prelude::*;
 
 use crate::image::{median, percentile, Img};
 
+/// 排异尺度估计模式（Python `rej_mode`）。
+///
+/// * `Winsor` —— 逐像素 MAD（`1.4826·median_i|dev_i|`）：`core/pws.py`
+///   `stack_strip` 的原始口径，也是 Rust 改动前的唯一口径，故为默认值。
+/// * `Mad` —— 64×64 输出像素分块 MAD（`core/drizzle.py:_block_mad`）。
+/// * `Fast` —— 64×64 分块平均绝对偏差 ×1.2533141（`_fast_scale`）。
+/// * `Esd` —— Rosner 广义 ESD（`_esd_bad`，3 轮，α=0.05），完全替代常规排异。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejMode {
+    Winsor,
+    Mad,
+    Fast,
+    Esd,
+}
+
+impl RejMode {
+    pub fn parse(s: &str) -> RejMode {
+        match s.trim().to_lowercase().as_str() {
+            "mad" => RejMode::Mad,
+            "fast" => RejMode::Fast,
+            "esd" => RejMode::Esd,
+            _ => RejMode::Winsor,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            RejMode::Winsor => "winsor",
+            RejMode::Mad => "mad",
+            RejMode::Fast => "fast",
+            RejMode::Esd => "esd",
+        }
+    }
+}
+
+/// 权重可选项（Python `sharp_w` / `flux_pow`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WeightOpts {
+    /// 清晰度全局补偿：`e += sharp_w·ln C_i`（默认 0 = 关闭）
+    pub sharp_w: f32,
+    /// 吞吐权重：`e += flux_pow·ln T_i`（默认 0 = 关闭）
+    pub flux_pow: f32,
+}
+
+pub const REJ_BLOCK: usize = 64;
+
 /// `W[i,p] = C_i^(A·R_p) · S_i^(B·(1-R_p))`, log-clipped so that no single frame
 /// can own more than `cap` of the total weight, then normalized to `mean_i W = 1`.
 pub fn strip_weights(
@@ -16,11 +61,39 @@ pub fn strip_weights(
     beta: f32,
     cap: f32,
 ) -> Vec<Img> {
+    strip_weights_ext(c, s, r, a_exp, b_exp, beta, cap, WeightOpts::default(), None, None)
+}
+
+/// `strip_weights` + 吞吐权重（`flux_pow·ln T_i`）、清晰度总权重（`sharp_w·ln C_i`）
+/// 与逐帧瓦片清晰度场（`tiles[i]` 已经是输出网格尺寸；`two_pass` 用）。
+#[allow(clippy::too_many_arguments)]
+pub fn strip_weights_ext(
+    c: &[f32],
+    s: &[f32],
+    r: &Img,
+    a_exp: f32,
+    b_exp: f32,
+    beta: f32,
+    cap: f32,
+    opts: WeightOpts,
+    log_t: Option<&[f32]>,
+    tiles: Option<&[Vec<f32>]>,
+) -> Vec<Img> {
     let n = c.len();
     let (h, w) = (r.h, r.w);
     let npx = h * w;
     let lc: Vec<f32> = c.iter().map(|v| v.max(1e-12).ln()).collect();
     let ls: Vec<f32> = s.iter().map(|v| v.max(1e-12).ln()).collect();
+    let extra_c = opts.sharp_w;
+    let fp = opts.flux_pow;
+    let lt: Option<Vec<f32>> = match (log_t, fp) {
+        (Some(t), fp) if fp != 0.0 => {
+            Some(t.iter().map(|v| if v.is_finite() && *v > 0.0 { v.ln() } else { 0.0 }).collect())
+        }
+        _ => None,
+    };
+    // 逐帧、逐像素的额外对数项（瓦片清晰度场，Python `band_cfield` 的最近邻放大结果）
+    let has_tiles = tiles.is_some() && extra_c == 0.0;
     let mut l_cap = f32::INFINITY;
     if cap > 0.0 && cap < 1.0 && n > 1 {
         l_cap = 0.5 * (((n - 1) as f32 * cap / (1.0 - cap)).max(1e-9)).ln();
@@ -42,6 +115,17 @@ pub fn strip_weights(
             let mut acc = 0.0f32;
             for i in 0..n {
                 let mut v = left * lc[i] + right * ls[i];
+                if extra_c != 0.0 {
+                    v += extra_c * lc[i];
+                }
+                if let Some(lt) = lt.as_ref() {
+                    v += fp * lt[i];
+                }
+                if has_tiles {
+                    if let Some(tl) = tiles {
+                        v += tl[i][pj].max(1e-12).ln();
+                    }
+                }
                 if l_cap.is_finite() {
                     // `numpy.clip(v, -L, L)` returns `L` for every element when L < 0
                     // (min > max), which is what happens with n = 2 and cap = 0.25;
@@ -58,6 +142,17 @@ pub fn strip_weights(
         for p in 0..npx {
             let rp = r.d[p];
             let mut v = a_exp * rp * lc[i] + (b_exp * (1.0 - rp) + beta * rp) * ls[i];
+            if extra_c != 0.0 {
+                v += extra_c * lc[i];
+            }
+            if let Some(lt) = lt.as_ref() {
+                v += fp * lt[i];
+            }
+            if has_tiles {
+                if let Some(tl) = tiles {
+                    v += tl[i][p].max(1e-12).ln();
+                }
+            }
             if l_cap.is_finite() {
                 v = if l_cap < 0.0 { l_cap } else { v.clamp(-l_cap, l_cap) };
             }
@@ -101,11 +196,308 @@ pub fn reject(
     frame_sig: Option<&[f32]>,
     drizzle_style: bool,
 ) -> f32 {
+    reject_ext(
+        d, wts, r, sky, rej_k, rej_max_frac, frame_sig, drizzle_style, RejMode::Winsor,
+    )
+}
+
+/// 64×64 分块聚合（`np.kron` 语义：块内取同一个值）
+fn block_reduce(src: &[f32], h: usize, w: usize, block: usize, mode: u8) -> Vec<f32> {
+    let b = block.max(4);
+    let mut out = vec![0.0f32; src.len()];
+    let mut buf: Vec<f32> = Vec::with_capacity(b * b);
+    let mut y0 = 0;
+    while y0 < h {
+        let y1 = (y0 + b).min(h);
+        let mut x0 = 0;
+        while x0 < w {
+            let x1 = (x0 + b).min(w);
+            buf.clear();
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let v = src[y * w + x];
+                    if v.is_finite() && (mode == 0 || v > 0.0) {
+                        buf.push(v);
+                    }
+                }
+            }
+            let v = if buf.is_empty() {
+                0.0
+            } else if mode == 0 {
+                median(&mut buf)
+            } else {
+                buf.iter().sum::<f32>() / buf.len() as f32
+            };
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    out[y * w + x] = v;
+                }
+            }
+            x0 = x1;
+        }
+        y0 = y1;
+    }
+    out
+}
+
+/// 逐像素尺度（排异用）：`Winsor` 逐像素 MAD，`Mad` 分块 MAD，`Fast` 分块平均绝对偏差
+fn scale_map(
+    d: &[Img],
+    frame_sig: Option<&[f32]>,
+    anchor: &[f32],
+    h: usize,
+    w: usize,
+    mode: RejMode,
+) -> Vec<f32> {
+    let n = d.len();
+    let npx = h * w;
+    let mut col = vec![0.0f32; npx];
+    let mut vals = vec![0.0f32; n];
+    for p in 0..npx {
+        for i in 0..n {
+            vals[i] = deviation(d, frame_sig, i, p, anchor[p]);
+        }
+        col[p] = match mode {
+            RejMode::Fast => vals.iter().sum::<f32>() / n as f32,
+            _ => median(&mut vals),
+        };
+    }
+    match mode {
+        RejMode::Winsor => col.iter().map(|v| 1.4826 * v).collect(),
+        RejMode::Mad => block_reduce(&col, h, w, REJ_BLOCK, 0)
+            .iter()
+            .map(|v| 1.4826 * v)
+            .collect(),
+        _ => block_reduce(&col, h, w, REJ_BLOCK, 1)
+            .iter()
+            .map(|v| 1.2533141 * v)
+            .collect(),
+    }
+}
+
+/// Rosner 广义 ESD：返回逐 (帧, 像素) 的离群标记（`core/drizzle.py:_esd_bad`）。
+fn esd_bad(d: &[Img], h: usize, w: usize, n_iter: usize, alpha: f64) -> Vec<bool> {
+    let n = d.len();
+    let npx = h * w;
+    let mut bad = vec![false; n * npx];
+    if n < 3 {
+        return bad;
+    }
+    let mut alive = vec![true; n * npx];
+    let mut v = vec![0.0f32; n];
+    let mut tmp: Vec<f32> = Vec::with_capacity(n);
+    for _ in 0..n_iter.max(1) {
+        for p in 0..npx {
+            let mut cnt = 0usize;
+            let mut sum = 0.0f64;
+            for i in 0..n {
+                let a = alive[i * npx + p];
+                v[i] = d[i].d[p];
+                if a && v[i].is_finite() {
+                    cnt += 1;
+                    sum += v[i] as f64;
+                }
+            }
+            if cnt < 5 {
+                continue;
+            }
+            let mu = sum / cnt as f64;
+            let mut var = 0.0f64;
+            for i in 0..n {
+                if alive[i * npx + p] && v[i].is_finite() {
+                    let dv = v[i] as f64 - mu;
+                    var += dv * dv;
+                }
+            }
+            let sd = (var / (cnt as f64 - 1.0)).sqrt().max(1e-30);
+            let lam = esd_lambda(cnt, alpha);
+            let mut best = usize::MAX;
+            let mut rmax = -1.0f64;
+            for i in 0..n {
+                if !(alive[i * npx + p] && v[i].is_finite()) {
+                    continue;
+                }
+                let dev = (v[i] as f64 - mu).abs() / sd;
+                if dev > rmax {
+                    rmax = dev;
+                    best = i;
+                }
+            }
+            if best != usize::MAX && rmax > lam {
+                alive[best * npx + p] = false;
+                bad[best * npx + p] = true;
+            }
+        }
+        let _ = &mut tmp;
+    }
+    bad
+}
+
+/// `(c-1)·t / sqrt((c-2+t²)·c)`，`t = student_t_ppf(1 - α/(2c), c-2)`
+///（`core/drizzle.py:_esd_lambda`）。
+fn esd_lambda(c: usize, alpha: f64) -> f64 {
+    if c < 3 {
+        return f64::INFINITY;
+    }
+    let p = 1.0 - alpha / (2.0 * c as f64);
+    let t = student_t_ppf(p, (c - 2) as f64);
+    let cf = c as f64;
+    (cf - 1.0) * t / ((cf - 2.0 + t * t) * cf).sqrt()
+}
+
+/// 正则化不完全 Beta 的连分式（Numerical Recipes `betacf`）
+fn betacf(a: f64, b: f64, x: f64) -> f64 {
+    const MAXIT: usize = 300;
+    const EPS: f64 = 3.0e-12;
+    const FPMIN: f64 = 1.0e-300;
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut dd = 1.0 - qab * x / qap;
+    if dd.abs() < FPMIN {
+        dd = FPMIN;
+    }
+    dd = 1.0 / dd;
+    let mut h = dd;
+    for m in 1..=MAXIT {
+        let m_f = m as f64;
+        let m2 = 2.0 * m_f;
+        let aa = m_f * (b - m_f) * x / ((qam + m2) * (a + m2));
+        dd = 1.0 + aa * dd;
+        if dd.abs() < FPMIN {
+            dd = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        dd = 1.0 / dd;
+        h *= dd * c;
+        let aa = -(a + m_f) * (qab + m_f) * x / ((a + m2) * (qap + m2));
+        dd = 1.0 + aa * dd;
+        if dd.abs() < FPMIN {
+            dd = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        dd = 1.0 / dd;
+        let del = dd * c;
+        h *= del;
+        if (del - 1.0).abs() < EPS {
+            break;
+        }
+    }
+    h
+}
+
+/// 正则化不完全 Beta `I_x(a,b)`
+fn betai(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let lbeta = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b);
+    let front = (lbeta + a * x.ln() + b * (1.0 - x).ln()).exp();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        front * betacf(a, b, x) / a
+    } else {
+        1.0 - front * betacf(b, a, 1.0 - x) / b
+    }
+}
+
+/// Lanczos 近似的 ln Γ(x)
+fn ln_gamma(x: f64) -> f64 {
+    const G: [f64; 9] = [
+        0.99999999999980993,
+        676.5203681218851,
+        -1259.1392167224028,
+        771.32342877765313,
+        -176.61502916214059,
+        12.507343278686905,
+        -0.13857109526572012,
+        9.9843695780195716e-6,
+        1.5056327351493116e-7,
+    ];
+    if x < 0.5 {
+        return std::f64::consts::PI.ln()
+            - (std::f64::consts::PI * x).sin().abs().ln()
+            - ln_gamma(1.0 - x);
+    }
+    let x = x - 1.0;
+    let mut a = G[0];
+    let t = x + 7.5;
+    for (i, g) in G.iter().enumerate().skip(1) {
+        a += g / (x + i as f64);
+    }
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
+}
+
+/// Student-t 的 CDF：`P(T ≤ t)`，`ν = df`
+fn student_t_cdf(t: f64, df: f64) -> f64 {
+    let x = df / (df + t * t);
+    let p = 0.5 * betai(df / 2.0, 0.5, x);
+    if t > 0.0 {
+        1.0 - p
+    } else {
+        p
+    }
+}
+
+/// Student-t 分位数（二分 + Newton 混合，精度 ~1e-10）
+fn student_t_ppf(p: f64, df: f64) -> f64 {
+    if df <= 0.0 {
+        return f64::NAN;
+    }
+    let mut lo = -1.0e4f64;
+    let mut hi = 1.0e4f64;
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if student_t_cdf(mid, df) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn reject_ext(
+    d: &[Img],
+    wts: &mut [Img],
+    r: Option<&Img>,
+    sky: f32,
+    rej_k: f32,
+    rej_max_frac: f32,
+    frame_sig: Option<&[f32]>,
+    drizzle_style: bool,
+    mode: RejMode,
+) -> f32 {
     let n = d.len();
     let h = d[0].h;
     let w = d[0].w;
     let npx = h * w;
     let mut rej_rate = 0.0f32;
+
+    if rej_k > 0.0 && mode == RejMode::Esd {
+        // `core/drizzle.py:1905`：ESD 完全替代常规排异，不做逐像素比例门控
+        let bad = esd_bad(d, h, w, 3, 0.05);
+        let mut nb = 0usize;
+        for i in 0..n {
+            for p in 0..npx {
+                if bad[i * npx + p] {
+                    wts[i].d[p] = 0.0;
+                    nb += 1;
+                }
+            }
+        }
+        return nb as f32 / (n as f32 * npx as f32);
+    }
 
     if rej_k > 0.0 {
         // The per-pixel deviation is recomputed on demand instead of being
@@ -113,20 +505,14 @@ pub fn reject(
         // 9.6 GB for that array alone (plus 2.4 GB for `sky_bad`), which the
         // 32 GB box cannot hold together with the frames and their weights.
         let mut vals = vec![0.0f32; n];
-        let mut vdev = vec![0.0f32; n];
         let mut anchor = vec![0.0f32; npx];
-        let mut mad = vec![0.0f32; npx];
         for p in 0..npx {
             for i in 0..n {
                 vals[i] = d[i].d[p];
             }
-            let a = median(&mut vals);
-            anchor[p] = a;
-            for i in 0..n {
-                vdev[i] = deviation(d, frame_sig, i, p, a);
-            }
-            mad[p] = 1.4826 * median(&mut vdev);
+            anchor[p] = median(&mut vals);
         }
+        let mad = scale_map(d, frame_sig, &anchor, h, w, mode);
         // detail allowance m: per-frame P99 of dev/signal over R>0.5, then median
         let mut m = 0.0f32;
         let mut sig_det: Option<Vec<f32>> = None;
@@ -350,4 +736,76 @@ fn erfc(x: f32) -> f32 {
     let e = t * poly.exp();
     let v = if x64 >= 0.0 { e } else { 2.0 - e };
     v as f32
+}
+
+#[cfg(test)]
+mod rej_z_tests {
+    use super::*;
+
+    fn lcg(seed: &mut u32) -> f32 {
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (*seed >> 8) as f32 / 16_777_216.0
+    }
+
+    /// n 帧平坦场 + 确定性噪声（值域 10 ± 1）
+    fn frames(n: usize, w: usize, h: usize) -> Vec<Img> {
+        let mut seed = 12_345u32;
+        (0..n)
+            .map(|_| {
+                let mut im = Img::new(w, h);
+                for p in 0..w * h {
+                    im.d[p] = 10.0 + 2.0 * (lcg(&mut seed) - 0.5);
+                }
+                im
+            })
+            .collect()
+    }
+
+    fn ones(n: usize, w: usize, h: usize) -> Vec<Img> {
+        (0..n)
+            .map(|_| {
+                let mut im = Img::new(w, h);
+                im.d.iter_mut().for_each(|v| *v = 1.0);
+                im
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rej_z_uniform_sigma_is_bit_identical() {
+        // σ 相同 ⇒ dev/σ 只差一个常数因子，阈值的 m 项同样除以 σ ⇒ 结果必须逐位一致
+        let (n, w, h) = (5, 16, 16);
+        let mut d = frames(n, w, h);
+        d[0].d[40] = 30.0;
+        let sig = vec![1.0f32; n];
+        let mut w_none = ones(n, w, h);
+        let mut w_some = ones(n, w, h);
+        let r_none = reject(&d[..], &mut w_none[..], None, 0.0, 3.5, 1.0 / 3.0, None, true);
+        let r_some = reject(
+            &d[..], &mut w_some[..], None, 0.0, 3.5, 1.0 / 3.0, Some(&sig), true,
+        );
+        assert_eq!(r_none, r_some, "σ 全 1 时 rej_z 不应改变结果");
+        for i in 0..n {
+            assert_eq!(w_none[i].d, w_some[i].d, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn rej_z_rescales_deviation_by_frame_sigma() {
+        // 第 4 帧噪声是别人的 8 倍：按 σ 归一下它的亮斑回到阈值内，不该被剔（pws.py:1855）
+        let (n, w, h) = (5, 16, 16);
+        let mut d = frames(n, w, h);
+        d[4].d[100] = 19.0;
+        let sig = vec![1.0f32, 1.0, 1.0, 1.0, 8.0];
+        let mut w_none = ones(n, w, h);
+        let mut w_some = ones(n, w, h);
+        let r_none = reject(&d[..], &mut w_none[..], None, 0.0, 3.5, 1.0 / 3.0, None, true);
+        let r_some = reject(
+            &d[..], &mut w_some[..], None, 0.0, 3.5, 1.0 / 3.0, Some(&sig), true,
+        );
+        assert_eq!(w_none[4].d[100], 0.0, "未按 σ 归一时亮斑应被剔除");
+        assert_eq!(w_some[4].d[100], 1.0, "按 σ 归一后应保留");
+        // 归一化同时改变全局 mad（大噪声帧的 dev 也被压缩），剔除率因此不同
+        assert_ne!(r_none, r_some, "none={r_none} some={r_some}");
+    }
 }
