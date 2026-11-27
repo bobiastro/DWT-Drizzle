@@ -692,7 +692,22 @@ pub fn stack_strip(
     rej_max_frac: f32,
     frame_sig: Option<&[f32]>,
 ) -> StackResult {
-    let rej_rate = reject(d, wts, r, sky, rej_k, rej_max_frac, frame_sig, false);
+    stack_strip_mode(d, wts, r, sky, rej_k, rej_max_frac, frame_sig, RejMode::Winsor)
+}
+
+/// `stack_strip` + 选择排异口径（`rej_mode`）；其余完全相同。
+#[allow(clippy::too_many_arguments)]
+pub fn stack_strip_mode(
+    d: &[Img],
+    wts: &mut [Img],
+    r: Option<&Img>,
+    sky: f32,
+    rej_k: f32,
+    rej_max_frac: f32,
+    frame_sig: Option<&[f32]>,
+    mode: RejMode,
+) -> StackResult {
+    let rej_rate = reject_ext(d, wts, r, sky, rej_k, rej_max_frac, frame_sig, false, mode);
     let n = d.len();
     let h = d[0].h;
     let w = d[0].w;
@@ -857,6 +872,72 @@ mod weight_opt_tests {
         let zero = strip_weights_ext(&c, &s, &r, 20.0, 2.0, 0.0, 0.0, opts0, None, None);
         for i in 0..2 {
             assert_eq!(zero[i].d, base[i].d, "sharp_w=0 必须与旧实现逐位一致");
+        }
+    }
+}
+
+#[cfg(test)]
+mod rej_mode_tests {
+    use super::*;
+
+    fn noisy(n: usize, w: usize, h: usize) -> Vec<Img> {
+        let mut seed = 777u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (*&seed >> 8) as f32 / 16_777_216.0
+        };
+        (0..n)
+            .map(|_| {
+                let mut im = Img::new(w, h);
+                for p in 0..w * h {
+                    im.d[p] = 100.0 + 40.0 * (rnd() - 0.5);
+                }
+                im
+            })
+            .collect()
+    }
+
+    fn ones(n: usize, w: usize, h: usize) -> Vec<Img> {
+        (0..n)
+            .map(|_| {
+                let mut im = Img::new(w, h);
+                im.d.iter_mut().for_each(|v| *v = 1.0);
+                im
+            })
+            .collect()
+    }
+
+    #[test]
+    fn winsor_matches_legacy_reject() {
+        let (n, w, h) = (6, 32, 32);
+        let mut d = noisy(n, w, h);
+        for i in 0..n {
+            d[i].d[17] = if i % 2 == 0 { 400.0 } else { 100.0 };
+        }
+        let mut a = ones(n, w, h);
+        let mut b = ones(n, w, h);
+        let ra = reject(&d[..], &mut a[..], None, 0.0, 3.5, 1.0 / 3.0, None, true);
+        let rb = reject_ext(
+            &d[..], &mut b[..], None, 0.0, 3.5, 1.0 / 3.0, None, true, RejMode::Winsor,
+        );
+        assert_eq!(ra, rb);
+        for i in 0..n {
+            assert_eq!(a[i].d, b[i].d, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn other_modes_change_the_rejection_scale() {
+        let (n, w, h) = (6, 64, 64);
+        let d = noisy(n, w, h);
+        let mut base = ones(n, w, h);
+        let r_base = reject_ext(
+            &d[..], &mut base[..], None, 0.0, 3.0, 1.0 / 3.0, None, true, RejMode::Winsor,
+        );
+        for mode in [RejMode::Mad, RejMode::Fast, RejMode::Esd] {
+            let mut wt = ones(n, w, h);
+            let r = reject_ext(&d[..], &mut wt[..], None, 0.0, 3.0, 1.0 / 3.0, None, true, mode);
+            assert_ne!(r, r_base, "{} 的剔除率应与 winsor 不同", mode.name());
         }
     }
 }

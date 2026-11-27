@@ -17,7 +17,9 @@ use dwt_rs::drizzle::{drizzle_add_many, Acc, FramePlace, Plan};
 use dwt_rs::register::Sim;
 use dwt_rs::image::{downsample, median, median_of, percentile, stack_median, Img};
 use dwt_rs::rfield::build_r_field;
-use dwt_rs::stack::{stack_strip, strip_weights_ext, WeightOpts};
+use dwt_rs::stack::{
+    reject_ext, stack_strip, stack_strip_mode, strip_weights_ext, RejMode, WeightOpts,
+};
 use dwt_rs::xisf::{read_xisf, read_xisf_luma, write_npy_f32, write_xisf, write_xisf_rgb, OutMeta};
 
 const EXPTIME_REF: f64 = 300.0;
@@ -82,6 +84,7 @@ struct Args {
     snr_clip: f32,
     rej_z: bool,
     sharp_w: f32,
+    rej_mode: RejMode,
     star_grow: f32,
     r_floor: f32,
     drop_mul: f32,
@@ -141,6 +144,7 @@ impl Default for Args {
             snr_clip: SNR_CLIP,
             rej_z: true,
             sharp_w: 0.0, // Python: drizzle 合成里的 `sharp_w`（core/drizzle.py:1990-2010），默认 0 即无效
+            rej_mode: RejMode::Winsor, // Python: `rej_mode` 默认 winsor
             star_grow: 100.0,
             r_floor: 0.0,
             drop_mul: 0.0,
@@ -282,6 +286,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--snr-clip" => {
                 a.snr_clip = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--rej-mode" => {
+                a.rej_mode = RejMode::parse(val()?);
                 i += 2;
             }
             "--sharp-w" => {
@@ -1647,7 +1655,7 @@ fn run_pipeline(
         // from Python; the flag `--rej-z` therefore only affects the averaging
         // path, exactly like Python.
         let t_prof_rj = Instant::now();
-        let rate = dwt_rs::stack::reject(
+        let rate = reject_ext(
             &frames,
             &mut wts,
             Some(&rfield),
@@ -1656,6 +1664,7 @@ fn run_pipeline(
             REJ_GATE,
             None,
             true,
+            a.rej_mode,
         );
         let d_prof_rj = t_prof_rj.elapsed().as_secs_f32();
         let dx = vec![0.0f32; frames.len()];
@@ -1768,7 +1777,7 @@ fn run_pipeline(
         println!("[drizzle] 输出 {}x{}  scale={} pixfrac={} (x{}) drop_mul={}  ox={} oy={}", img.w, img.h, a.dscale, a.dpix, pf, dmul, plan.ox, plan.oy);
         (img, Vec::new(), rate)
     } else {
-        let res = stack_strip(
+        let res = stack_strip_mode(
             &frames,
             &mut wts,
             Some(&rfield),
@@ -1776,6 +1785,7 @@ fn run_pipeline(
             a.rej_k,
             REJ_GATE,
             if a.rej_z { Some(&sigmas) } else { None },
+            a.rej_mode,
         );
         if let Some(dir) = &a.dump_w {
             for (i, m) in wts.iter().enumerate() {
