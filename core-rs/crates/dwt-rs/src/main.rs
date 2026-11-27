@@ -17,7 +17,7 @@ use dwt_rs::drizzle::{drizzle_add_many, Acc, FramePlace, Plan};
 use dwt_rs::register::Sim;
 use dwt_rs::image::{downsample, median, median_of, percentile, stack_median, Img};
 use dwt_rs::rfield::build_r_field;
-use dwt_rs::stack::{stack_strip, strip_weights};
+use dwt_rs::stack::{stack_strip, strip_weights_ext, WeightOpts};
 use dwt_rs::xisf::{read_xisf, read_xisf_luma, write_npy_f32, write_xisf, write_xisf_rgb, OutMeta};
 
 const EXPTIME_REF: f64 = 300.0;
@@ -81,6 +81,7 @@ struct Args {
     rej_k: f32,
     snr_clip: f32,
     rej_z: bool,
+    sharp_w: f32,
     star_grow: f32,
     r_floor: f32,
     drop_mul: f32,
@@ -139,6 +140,7 @@ impl Default for Args {
             rej_k: REJ_K,
             snr_clip: SNR_CLIP,
             rej_z: true,
+            sharp_w: 0.0, // Python: drizzle 合成里的 `sharp_w`（core/drizzle.py:1990-2010），默认 0 即无效
             star_grow: 100.0,
             r_floor: 0.0,
             drop_mul: 0.0,
@@ -280,6 +282,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--snr-clip" => {
                 a.snr_clip = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--sharp-w" => {
+                a.sharp_w = num(val()?, flag)? as f32;
                 i += 2;
             }
             "--rej-z" => {
@@ -1518,7 +1524,13 @@ fn run_pipeline(
 
     // ---- weights + rejection + combine ------------------------------------
     let t = Instant::now();
-    let wts = strip_weights(&c, &s, &rfield, a.a_exp, a.b_exp, a.beta, a.max_share);
+    let wopts = WeightOpts {
+        sharp_w: a.sharp_w,
+        flux_pow: 0.0,
+    };
+    let wts = strip_weights_ext(
+        &c, &s, &rfield, a.a_exp, a.b_exp, a.beta, a.max_share, wopts, None, None,
+    );
     let t_prof_sw = t.elapsed().as_secs_f32();
     if let Some(dir) = &a.dump_w {
         let _ = std::fs::create_dir_all(dir);

@@ -809,3 +809,54 @@ mod rej_z_tests {
         assert_ne!(r_none, r_some, "none={r_none} some={r_some}");
     }
 }
+
+#[cfg(test)]
+mod weight_opt_tests {
+    use super::*;
+
+    fn rfield() -> Img {
+        let mut r = Img::new(8, 8);
+        for (p, v) in r.d.iter_mut().enumerate() {
+            *v = if p % 3 == 0 { 0.0 } else { 0.6 };
+        }
+        r
+    }
+
+    #[test]
+    fn sharp_w_zero_matches_plain_strip_weights() {
+        // 默认（sharp_w=0 / flux_pow=0）必须与旧的 strip_weights 逐位一致
+        let c = vec![1.0f32, 1.05, 0.97, 1.2];
+        let s = vec![1.0f32, 0.9, 1.1, 1.0];
+        let r = rfield();
+        let old = strip_weights(&c, &s, &r, 20.0, 2.0, 0.0, 0.25);
+        let new = strip_weights_ext(
+            &c, &s, &r, 20.0, 2.0, 0.0, 0.25, WeightOpts::default(), None, None,
+        );
+        assert_eq!(old.len(), new.len());
+        for i in 0..old.len() {
+            assert_eq!(old[i].d, new[i].d, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn sharp_w_adds_log_c_to_the_exponent() {
+        // e = A*R*lc + (B*(1-R)+beta*R)*ls + sharp_w*lc（core/drizzle.py:1990-2010）
+        // cap=0 时逐像素归一 w_i = exp(e_i)/mean(exp(e))，故 w1/w0 = C1^sharp_w
+        let c = vec![1.0f32, 1.3];
+        let s = vec![1.0f32, 1.0];
+        let mut r = Img::new(4, 4);
+        r.d.iter_mut().for_each(|v| *v = 0.5);
+        let base = strip_weights(&c, &s, &r, 20.0, 2.0, 0.0, 0.0);
+        let opts = WeightOpts { sharp_w: 1.0, flux_pow: 0.0 };
+        let sharp = strip_weights_ext(&c, &s, &r, 20.0, 2.0, 0.0, 0.0, opts, None, None);
+        let ratio_base = base[1].d[0] / base[0].d[0];
+        let ratio_sharp = sharp[1].d[0] / sharp[0].d[0];
+        // 基线里 C 也进了 A*R 项，比值 = 1.3^(20*0.5) ；sharp_w 再乘一份 C → 1.3^(1+10)
+        assert!((ratio_sharp / ratio_base - 1.3).abs() < 1e-4, "{ratio_sharp} / {ratio_base}");
+        let opts0 = WeightOpts::default();
+        let zero = strip_weights_ext(&c, &s, &r, 20.0, 2.0, 0.0, 0.0, opts0, None, None);
+        for i in 0..2 {
+            assert_eq!(zero[i].d, base[i].d, "sharp_w=0 必须与旧实现逐位一致");
+        }
+    }
+}
