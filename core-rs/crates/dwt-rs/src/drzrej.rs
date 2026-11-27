@@ -49,6 +49,225 @@ impl RGrid<'_> {
     }
 }
 
+/// Rejection block size in output pixels (`REJ_BLOCK` in `core/drizzle.py`).
+pub const REJ_BLOCK: usize = 64;
+/// Stride of the block subsample (`_winsor_scale(..., st=3)`).
+const WINSOR_ST: usize = 3;
+/// Python multiplies the block mean of `|dev|` by this
+/// (`vals = 1.15*nanmean(dv)`, `core/drizzle.py:1726`).
+const WINSOR_SCALE: f32 = 1.15;
+
+/// `1.15 * mean|dev|` expressed as a multiple of the per-sample sigma: for a
+/// Gaussian `mean|dev| = sqrt(2/pi) * sigma = 0.7979 sigma`, so the block value
+/// sits at `1.15 * 0.7979 = 0.9176 sigma`.  Python's clip is calibrated against
+/// that number, not against a true sigma, which is why `--rej-mode esd
+/// --rej-k 3.5` (kclip 1.75) rejects ~10% and not the ~8% a plain 1.75-sigma
+/// cut would give (`[wgpu] 剔除率 9.862%` on HFG1-3 O).
+pub const WINSOR_CAL: f32 = 1.15 * 0.797_884_6;
+
+/// Python's block-scale estimator (`core/drizzle.py::_winsor_scale`, `:1704`)
+/// transcribed onto the quantity this clip actually tests.
+///
+/// Python builds one drizzled plane per frame, forms `dev = |plane - anchor|`
+/// over the whole stack and then estimates the scatter **per 64x64 output
+/// block** instead of per pixel:
+///
+/// 1. `lim[block] = k * median(s_pix)` over the block's `::3` subsample, where
+///    `s_pix = nanstd(planes, axis=0)` is the per-pixel cross-frame sigma.  The
+///    winsor limit keeps a handful of saturated / trailed pixels from inflating
+///    the block.
+/// 2. `scale[block] = 1.15 * nanmean(minimum(dev, lim))`, again on the `::3`
+///    subsample.  See [`WINSOR_CAL`] for why 1.15 lands at 0.92 sigma.
+/// 3. The block value is broadcast to every covered pixel of the block
+///    (`np.kron(vals, ones((64,64)))[:bh,:W]`, masked by `goodcol`).
+///
+/// The per-pixel MAD this module used before was taken over 16 *drizzled*
+/// frames instead: that is the scatter of a 16-frame mean, so the drizzle
+/// smoothing divides it again, and one bad frame in the sample dominates the
+/// block.  On HFG1-3 O (393 frames, O) it measured 9.84e-5 against the 1.07e-4
+/// this estimator returns — the same order, but it is a per-pixel statistic
+/// with no winsor limit, so a single trailed frame moves whole blocks and the
+/// clip fires on structure rather than on scatter.
+///
+/// NaN/edge handling follows Python: pixels with no weight are skipped in both
+/// passes (`nanstd`/`nanmean` skip NaN), a block with no sample at all keeps a
+/// NaN scale (Python's `where(goodcol, .., 0)` never tests those pixels), and
+/// partial blocks at the right/bottom edge are clipped exactly like the
+/// `[:bh,:W]` slice.
+pub fn winsor_block_scale(
+    frames: &[Img],
+    wts: &[Img],
+    sims: &[Sim],
+    plan: Plan,
+    anchor: &Img,
+    k_winsor: f32,
+) -> Img {
+    let (ow, oh) = (plan.w, plan.h);
+    let npx = ow * oh;
+    let mut out = Img::new(ow, oh);
+    out.d.fill(f32::NAN);
+    if npx == 0 || frames.is_empty() {
+        return out;
+    }
+
+    // ---- 1. per-pixel cross-frame sigma (`_s_pix = np.nanstd(v, axis=0)`) ----
+    // Welford, in f64: the frames sit on a ~1e-3 pedestal with 1e-4 noise, so a
+    // plain sum of squares would lose most of the variance to cancellation.
+    let mut cnt = vec![0u32; npx];
+    let mut mean = vec![0f64; npx];
+    let mut m2 = vec![0f64; npx];
+    for (i, f) in frames.iter().enumerate() {
+        let sim = &sims[i];
+        let th = sim.theta.to_radians();
+        let (ct, st) = (th.cos(), th.sin());
+        let w = f.w;
+        let wm = &wts[i];
+        for y in 0..f.h {
+            let yc = y as f32 + 0.5;
+            for x in 0..w {
+                let p = y * w + x;
+                let v = f.d[p];
+                if !(wm.d[p] > 0.0) || !v.is_finite() {
+                    continue;
+                }
+                let Some(q) = cell_of(sim, &plan, ct, st, x as f32 + 0.5, yc) else {
+                    continue;
+                };
+                let v = v as f64;
+                let n = cnt[q] + 1;
+                cnt[q] = n;
+                let d = v - mean[q];
+                mean[q] += d / n as f64;
+                m2[q] += d * (v - mean[q]);
+            }
+        }
+    }
+    let mut sigma = vec![0f32; npx];
+    for q in 0..npx {
+        if cnt[q] >= 2 {
+            sigma[q] = (m2[q] / cnt[q] as f64).max(0.0).sqrt() as f32;
+        }
+    }
+    drop(mean);
+    drop(m2);
+
+    // ---- 2. per-block winsor limit (`lim = k*median(sp[sy0:sy1, sx0:sx1])`) --
+    let bw = ow.div_ceil(REJ_BLOCK);
+    let bh = oh.div_ceil(REJ_BLOCK);
+    let mut lim = vec![f32::INFINITY; bw * bh];
+    let mut buf: Vec<f32> = Vec::with_capacity(REJ_BLOCK * REJ_BLOCK / (WINSOR_ST * WINSOR_ST) + 8);
+    for by in 0..bh {
+        for bx in 0..bw {
+            let y0 = by * REJ_BLOCK;
+            let y1 = ((by + 1) * REJ_BLOCK).min(oh);
+            let x0 = bx * REJ_BLOCK;
+            let x1 = ((bx + 1) * REJ_BLOCK).min(ow);
+            // `sub = sp[::st, ::st]` then `sub[(y0+st-1)//st : (y1+st-1)//st, ..]`
+            buf.clear();
+            let mut iy = (y0 + WINSOR_ST - 1) / WINSOR_ST;
+            while iy * WINSOR_ST < y1 {
+                let row = iy * WINSOR_ST * ow;
+                let mut ix = (x0 + WINSOR_ST - 1) / WINSOR_ST;
+                while ix * WINSOR_ST < x1 {
+                    let v = sigma[row + ix * WINSOR_ST];
+                    if v > 0.0 {
+                        buf.push(v);
+                    }
+                    ix += 1;
+                }
+                iy += 1;
+            }
+            if buf.is_empty() {
+                continue;
+            }
+            buf.sort_by(|a, b| a.total_cmp(b));
+            let n = buf.len();
+            let med = if n % 2 == 1 {
+                buf[n / 2]
+            } else {
+                0.5 * (buf[n / 2 - 1] + buf[n / 2])
+            };
+            // Python would win the block at `0` here (no sigma sample at all),
+            // which turns the threshold into "reject every sample"; a block with
+            // an all-zero sigma plane can only be one with <2 frames on it, and
+            // leaving it unwinsorised is the only finite reading.
+            if med > 0.0 {
+                lim[by * bw + bx] = k_winsor * med;
+            }
+        }
+    }
+
+    // ---- 3. block mean of the winsorised |dev| -------------------------------
+    // Python subsamples the *output* grid by `st` before the block reduce
+    // (`dv = blk[:, gc]`, `blk` already `dev[:, ::st, ::st]`), so only 1/9 of
+    // the taps enter; that is also what keeps this pass cheap.
+    let mut bsum = vec![0f64; bw * bh];
+    let mut bcnt = vec![0u64; bw * bh];
+    for (i, f) in frames.iter().enumerate() {
+        let sim = &sims[i];
+        let th = sim.theta.to_radians();
+        let (ct, st) = (th.cos(), th.sin());
+        let w = f.w;
+        let wm = &wts[i];
+        for y in 0..f.h {
+            if y % WINSOR_ST != 0 {
+                continue;
+            }
+            let yc = y as f32 + 0.5;
+            for x in 0..w {
+                let p = y * w + x;
+                let v = f.d[p];
+                if !(wm.d[p] > 0.0) || !v.is_finite() {
+                    continue;
+                }
+                let Some(q) = cell_of(sim, &plan, ct, st, x as f32 + 0.5, yc) else {
+                    continue;
+                };
+                let (qy, qx) = (q / ow, q % ow);
+                if qy % WINSOR_ST != 0 || qx % WINSOR_ST != 0 {
+                    continue;
+                }
+                let a = anchor.d[q];
+                if !a.is_finite() {
+                    continue;
+                }
+                let d = (v - a).abs();
+                if !d.is_finite() {
+                    continue;
+                }
+                let bi = (qy / REJ_BLOCK) * bw + qx / REJ_BLOCK;
+                bsum[bi] += d.min(lim[bi]) as f64;
+                bcnt[bi] += 1;
+            }
+        }
+    }
+
+    // ---- 4. broadcast the block value to every covered pixel ----------------
+    for by in 0..bh {
+        for bx in 0..bw {
+            let bi = by * bw + bx;
+            if bcnt[bi] == 0 {
+                continue;
+            }
+            let v = (WINSOR_SCALE as f64 * (bsum[bi] / bcnt[bi] as f64)) as f32;
+            if !(v.is_finite() && v > 0.0) {
+                continue;
+            }
+            let y1 = ((by + 1) * REJ_BLOCK).min(oh);
+            let x1 = ((bx + 1) * REJ_BLOCK).min(ow);
+            for y in by * REJ_BLOCK..y1 {
+                let row = y * ow;
+                for x in bx * REJ_BLOCK..x1 {
+                    if cnt[row + x] > 0 {
+                        out.d[row + x] = v;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Everything the canvas rule needs, already on the output grid.
 pub struct CanvasRule<'a> {
     pub anchor: &'a Img,
@@ -264,6 +483,16 @@ pub fn canvas_reject(
     dropped as f32 / total as f32
 }
 
+/// The one-sided rate a `kclip` cut implies under Python's scale convention
+/// (`scale = 1.15 * mean|dev| = WINSOR_CAL * sigma`): `erfc(kclip*WINSOR_CAL/sqrt2)`.
+///
+/// With the nominal k (=3.5) the block scale still rejects only ~0.14%; the
+/// production Python run passes `--rej-mode esd --rej-k 3.5`, i.e. kclip 1.75,
+/// and `expected_rate(1.75) = 10.7%` against the `9.862%` it logs.
+pub fn expected_rate(kclip: f32) -> f32 {
+    erfc(kclip * WINSOR_CAL / std::f32::consts::SQRT_2)
+}
+
 /// `erfc` without pulling in a dependency: Abramowitz & Stegun 7.1.26 is well
 /// inside the tolerance this gate needs (it only shifts a count limit by <1%).
 fn erfc(x: f32) -> f32 {
@@ -395,5 +624,124 @@ mod tests {
         let rate = canvas_reject(&frames, &mut wts, &sims, plan, &rule, 3);
         assert!(rate.is_finite());
         assert!(wts[0].at(12, 12) > 0.0, "NaN anchor must not reject");
+    }
+
+    /// Deterministic N(0,1) source (xorshift64* + Box–Muller) so the tests need
+    /// no extra crate and are bit-reproducible.
+    struct Rng(u64);
+    impl Rng {
+        fn u(&mut self) -> f64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            let v = x.wrapping_mul(0x2545F4914F6CDD1D);
+            ((v >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        }
+        fn norm(&mut self) -> f32 {
+            let u1 = self.u();
+            let u2 = self.u();
+            ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()) as f32
+        }
+    }
+
+    /// Gaussian noise stack + a few cosmic rays; returns frames, anchor (per-pixel
+    /// mean, as the canvas anchor is), unit weights and identity placements.
+    fn noisy_stack(n: usize, h: usize, w: usize, sky: f32, sig: f32) -> (Vec<Img>, Img) {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut frames: Vec<Img> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut im = Img::new(w, h);
+            for v in im.d.iter_mut() {
+                *v = sky + sig * rng.norm();
+            }
+            frames.push(im);
+        }
+        // one hot pixel every 8th frame: these must be winsorised out of the scale
+        for f in frames.iter_mut().step_by(8) {
+            f.set(h / 3, w / 3, sky + 500.0 * sig);
+        }
+        let mut anchor = Img::new(w, h);
+        for q in 0..anchor.d.len() {
+            let mut s = 0.0f64;
+            for f in &frames {
+                s += f.d[q] as f64;
+            }
+            anchor.d[q] = (s / n as f64) as f32;
+        }
+        (frames, anchor)
+    }
+
+    /// The block scale must reproduce Python's calibration: for Gaussian noise
+    /// `1.15 * mean|dev|` lands on `0.918 sigma` (`WINSOR_CAL`), not on `1 sigma`.
+    #[test]
+    fn winsor_block_scale_calibrates_to_sigma() {
+        let (n, h, w) = (64usize, 128usize, 128usize);
+        let (sky, sig) = (1000.0f32, 3.0f32);
+        let (frames, anchor) = noisy_stack(n, h, w, sky, sig);
+        let wts: Vec<Img> = frames
+            .iter()
+            .map(|f| {
+                let mut m = Img::new(f.w, f.h);
+                m.apply(|_| 1.0);
+                m
+            })
+            .collect();
+        let sims: Vec<Sim> = (0..n).map(|_| Sim::identity()).collect();
+        let plan = Plan { s: 1.0, ox: 0.0, oy: 0.0, w, h };
+        let sc = winsor_block_scale(&frames, &wts, &sims, plan, &anchor, 3.0);
+        let mut vals: Vec<f32> = sc.d.iter().copied().filter(|v| v.is_finite()).collect();
+        assert_eq!(vals.len(), w * h, "every covered canvas pixel needs a scale");
+        vals.sort_by(|a, b| a.total_cmp(b));
+        let med = vals[vals.len() / 2];
+        let ratio = med / sig;
+        assert!(
+            (ratio - WINSOR_CAL).abs() < 0.12 * WINSOR_CAL,
+            "block scale is {ratio:.3} sigma, want {WINSOR_CAL:.3}"
+        );
+    }
+
+    /// The rejection rate the rule actually produces has to sit on the rate the
+    /// same kclip predicts — that is the whole point of the calibration, and the
+    /// bug being fixed here was a scale 2.3x too small (rate ~20x too high).
+    #[test]
+    fn winsor_kclip_rejects_at_the_theoretical_rate() {
+        let (n, h, w) = (64usize, 128usize, 128usize);
+        let (sky, sig) = (1000.0f32, 3.0f32);
+        let (frames, anchor) = noisy_stack(n, h, w, sky, sig);
+        let sims: Vec<Sim> = (0..n).map(|_| Sim::identity()).collect();
+        let plan = Plan { s: 1.0, ox: 0.0, oy: 0.0, w, h };
+        let mut r = Img::new(w, h);
+        r.apply(|_| 0.0);
+        for &kclip in &[3.0f32, 1.75] {
+            let wts: Vec<Img> = frames
+                .iter()
+                .map(|f| {
+                    let mut m = Img::new(f.w, f.h);
+                    m.apply(|_| 1.0);
+                    m
+                })
+                .collect();
+            let mut wts = wts;
+            let sc = winsor_block_scale(&frames, &wts, &sims, plan, &anchor, kclip.max(2.0));
+            let rule = CanvasRule {
+                anchor: &anchor,
+                scale: &sc,
+                r: RGrid::Canvas(&r),
+                sky,
+                kclip,
+                rej_k: kclip,
+                gate: 1.0 / 3.0,
+            };
+            let rate = canvas_reject(&frames, &mut wts, &sims, plan, &rule, 3);
+            let want = expected_rate(kclip);
+            assert!(
+                (rate - want).abs() <= 0.30 * want,
+                "kclip {kclip}: rejected {:.4}%, theory {:.4}%",
+                rate * 100.0,
+                want * 100.0
+            );
+        }
     }
 }

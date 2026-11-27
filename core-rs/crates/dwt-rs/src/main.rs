@@ -1933,10 +1933,13 @@ fn run_pipeline(
         // the comparison runs at two different smoothing levels (a pixfrac-1
         // anchor against pixfrac-2 samples looks far more scattered than it is and
         // the clip fires on pure smoothing mismatch).
+        // Drop side must follow Python: mono uses pixfrac*s (dmul = 1), CFA uses
+        // pixfrac*s*2 (handled in the `raw` branch below).  The old "register => 2"
+        // heuristic doubled the drop whenever registration was on, which is exactly
+        // the same as the CFA factor: at scale=2 it blurred the product by ~2 input
+        // pixels (measured FWHM 10.81 px vs the Python master's 6.87 px on HFG1-3 O).
         let dmul = if a.drop_mul > 0.0 {
             a.drop_mul
-        } else if register {
-            2.0
         } else {
             1.0
         };
@@ -1973,18 +1976,38 @@ fn run_pipeline(
                 let mut acc_a = Acc::new(plan);
                 dwt_rs::drizzle::drizzle_add_many(&mut acc_a, &places, pf);
                 let anchor = acc_a.finish();
-                // Scale: MAD over a stratified sample of the stack (never the
-                // sharpest frames — they are also the cleanest, see below).
+                // Scale: Python's estimator — one 64x64 block value per block,
+                // from the winsorised block mean of |dev| over the *whole* stack
+                // (`core/drizzle.py::_winsor_scale`, `:1704`, called from `:1948`
+                // with `k = max(2.0, rej_k)`).
+                //
+                // The previous estimator took a per-pixel MAD over a stratified
+                // sample of 16 *drizzled* frames.  Two things are wrong with it:
+                // those 16 frames are a 16-frame mean (so the scatter shrinks by
+                // sqrt(16) on top of the drizzle's own four-tap averaging), and a
+                // per-pixel MAD is dominated by whichever residual those 16 frames
+                // happen to share.  Measured on HFG1-3 O it landed at 0.44x the
+                // canvas noise, so every threshold sat ~2.3x low.
                 let nf = frames.len();
-                let step = (nf / 16).max(1);
-                let spread: Vec<usize> = (0..nf).step_by(step).take(16).collect();
-                let (_, sc, _) = sharp_ref_sim(&frames, &spread, &sims, &plan, &stars, probe, pf);
+                let kw = a.rej_k.max(2.0);
+                let sc =
+                    dwt_rs::drzrej::winsor_block_scale(&frames, &wts, &sims, plan, &anchor, kw);
+                // Python's drizzle backend clips at `max(1, rej_k/2)` in esd mode
+                // (core/gpu_wgpu_cfa_fatom.py: p[31]).
+                let kclip = if a.rej_mode == RejMode::Esd {
+                    (0.5 * a.rej_k).max(1.0)
+                } else {
+                    a.rej_k
+                };
+                let smed = median_of(&sc.d.iter().copied().filter(|v| v.is_finite()).collect::<Vec<f32>>());
                 println!(
-                    "[排异] 画布锚 = 全栈 {} 帧等权 drizzle 均值（输出网格，pixfrac {}），尺度 = {} 帧分层抽样 MAD 中位 {:.3e}；参考像自量 FWHM {:.2}px",
+                    "[排异] 画布锚 = 全栈 {} 帧等权 drizzle 均值（输出网格，pixfrac {}），尺度 = 64x64 块 winsor(k={:.2}) 中位 {:.3e}；kclip {:.2} → 单边理论 {:.2}%；参考像自量 FWHM {:.2}px",
                     nf,
                     pf,
-                    spread.len(),
-                    median_of(&sc.d.iter().copied().filter(|v| v.is_finite()).collect::<Vec<f32>>()),
+                    kw,
+                    smed,
+                    kclip,
+                    100.0 * dwt_rs::drzrej::expected_rate(kclip),
                     sig.map(|v| v * 2.3548).unwrap_or(f32::NAN)
                 );
                 let rule = dwt_rs::drzrej::CanvasRule {
@@ -1995,11 +2018,7 @@ fn run_pipeline(
                     // Python's drizzle backend clips at `max(1, rej_k/2)` in esd
                     // mode (core/gpu_wgpu_cfa_fatom.py: p[31]) — the mode name
                     // promises a stronger test than the nominal k.
-                    kclip: if a.rej_mode == RejMode::Esd {
-                        (0.5 * a.rej_k).max(1.0)
-                    } else {
-                        a.rej_k
-                    },
+                    kclip,
                     rej_k: a.rej_k,
                     gate: REJ_GATE,
 
