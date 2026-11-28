@@ -4835,6 +4835,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _lsp_pmap = r_d.get('p') if isinstance(r_d, dict) else None
             except Exception:
                 _lsp_pmap = None
+            _pmap_src = '着色器同源' if _lsp_pmap else None
             # CPU 叠加没有着色器，r_d['p'] 为空 ⇒ 帧域否决门整段被跳过（2.7.122 及更早
             # 都是这个状态）。这里按**与 GPU 着色器完全相同的公式**由 drz_plan + 每帧
             # 变换补出 p6 表，让 p 表在 CPU 路径上同样存在：
@@ -4858,7 +4859,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     # 真值判断（数组会触发 "truth value ... is ambiguous"）
                     _lsp_pmap = {int(_i): _rows[_i] for _i in range(len(_rows))}
                     r_d['p'] = _lsp_pmap
-                    globals()['_WGPU_PATH_DONE'] = False
+                    _pmap_src = 'CPU 同源（drz_plan 合成）'
                     log('[LSPR] 帧域验证：p 表 %d 帧（CPU 同源，由 drz_plan 合成）'
                         % len(_lsp_pmap))
                 except Exception as _e_p:
@@ -5332,8 +5333,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                             return _cc[j]
                         _lsp_nf = int(len(_pm_l))
                         _lsp_sf = float(np.median(fs.sigma)) if fs.sigma is not None else None
-                        _pg = 'CPU 同源（drz_plan 合成）' if (not _WGPU_PATH_DONE) else '着色器同源'
-                        log('[LSPR] 帧域验证：p 表 %d 帧（%s）' % (_lsp_nf, _pg))
+                        log('[LSPR] 帧域验证：p 表 %d 帧（%s）'
+                            % (_lsp_nf, _pmap_src or '来源未知'))
                         if _DBG_L:
                             try:
                                 log('[LSPR][debug] fs: shape=%s n=%d mm=%s arrays=%s path=%s exists=%s'
