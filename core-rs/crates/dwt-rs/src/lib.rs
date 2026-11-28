@@ -6,7 +6,7 @@
 
 /// Single source of truth for the release string: `dwt-rs --version`, the GUI
 /// about page and the GUI window title all read this constant.
-pub const VERSION: &str = "2.7.122-D";
+pub const VERSION: &str = "2.7.123-D";
 
 pub mod bggrad;
 pub mod cfa;
