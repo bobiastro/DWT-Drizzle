@@ -475,15 +475,16 @@ fn scatter_band(
     let (r0f, r1f) = (r0 as f32, r1 as f32);
     for y in 0..frame.h {
         let yc = y as f32 + 0.5;
-        // The serial path culls whole rows with a single sample at `xc = 0.0`.
-        // That test is *not* a conservative bound once the frame is rotated (the
-        // drops of one row can travel thousands of pixels along x), so it loses
-        // contributions — reproducing it verbatim is what keeps the mosaic
-        // bit-identical to the per-frame loop this replaces.
-        let cy0 = plan.s * (k * (ct * yc) + d.uy) + plan.oy;
-        if cy0 + fp < -1.0 || cy0 - fp > plan.h as f32 + 1.0 {
-            continue;
-        }
+        // A whole-row early-out used to sit here: it sampled `cy` once at
+        // `xc = 0.0` and dropped the row when that single point fell off the
+        // canvas.  `cy` is affine in `xc`, so on a rotated frame (theta = 176°
+        // leaves `st ≈ 0.06`) one row's drops travel thousands of pixels along
+        // x and that point says nothing about the row — it threw away
+        // contributions that land well inside the canvas.  Removed; off-canvas
+        // drops are still discarded per sample by the `y0`/`y1` clamp below and
+        // by `x1 <= 0 || x0 >= ow`.  (It also cost the mosaic its bit-identity
+        // with the old serial loop, which was the only reason it existed.)
+        //
         // `cy` is affine in `xc`, so its value at the two ends of the row bounds
         // every drop in that row: skip the row outright when the span misses the
         // band.  This is what keeps the per-band rescans cheap, and it is exact —
@@ -607,4 +608,143 @@ pub fn drizzle_add_gather(
 fn overlap(fp: f32, d: f32) -> f32 {
     let v = (fp + 0.5) - d.abs();
     v.clamp(0.0, (2.0 * fp).min(1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic 64x64 ramp; only the geometry matters here.
+    fn frame64() -> Img {
+        let mut img = Img::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                img.d[y * 64 + x] = 1.0 + (y * 64 + x) as f32 * 1e-4;
+            }
+        }
+        img
+    }
+
+    /// Replay of `scatter_band`'s inner loop over the whole canvas, so the two
+    /// states of the row cull can be compared on identical arithmetic.
+    /// `old_cull` reinstates the removed single-sample test at `xc = 0.0`
+    /// verbatim.  Returns `(contributions, Σw, den)`.
+    fn replay(
+        plan: &Plan,
+        frame: &Img,
+        theta_deg: f32,
+        k: f32,
+        ux: f32,
+        uy: f32,
+        fp: f32,
+        old_cull: bool,
+    ) -> (u64, f64, Vec<f32>) {
+        let th = theta_deg.to_radians();
+        let (ct, st) = (th.cos(), th.sin());
+        let fw = frame.w;
+        let ow = plan.w as i64;
+        let oh = plan.h as i64;
+        let mut den = vec![0.0f32; plan.w * plan.h];
+        let (mut n, mut sw) = (0u64, 0f64);
+        for y in 0..frame.h {
+            let yc = y as f32 + 0.5;
+            if old_cull {
+                // The removed test, verbatim.
+                let cy0 = plan.s * (k * (ct * yc) + uy) + plan.oy;
+                if cy0 + fp < -1.0 || cy0 - fp > plan.h as f32 + 1.0 {
+                    continue;
+                }
+            }
+            for x in 0..frame.w {
+                let xc = x as f32 + 0.5;
+                let cx = plan.s * (k * (ct * xc - st * yc) + ux) + plan.ox;
+                let cy = plan.s * (k * (st * xc + ct * yc) + uy) + plan.oy;
+                let y0 = ((cy - fp - 1.0).floor() as i64).max(0);
+                let y1 = ((cy + fp).ceil() as i64).min(oh);
+                if y1 <= y0 {
+                    continue;
+                }
+                let x0 = (cx - fp - 1.0).floor() as i64;
+                let x1 = (cx + fp).ceil() as i64;
+                if x1 <= 0 || x0 >= ow {
+                    continue;
+                }
+                for oy_i in y0..y1 {
+                    let wy = overlap(fp, oy_i as f32 + 0.5 - cy);
+                    if wy <= 0.0 {
+                        continue;
+                    }
+                    for ox_i in x0.max(0)..x1.min(ow) {
+                        let wx = overlap(fp, ox_i as f32 + 0.5 - cx);
+                        if wx <= 0.0 {
+                            continue;
+                        }
+                        n += 1;
+                        sw += (wx * wy) as f64;
+                        den[oy_i as usize * plan.w + ox_i as usize] += wx * wy;
+                    }
+                }
+            }
+        }
+        (n, sw, den)
+    }
+
+    #[test]
+    fn rotated_row_cull_no_longer_drops_canvas_contributions() {
+        let frame = frame64();
+        // theta = 176 deg => st = 0.0698, so one 64px source row sweeps ~4.4
+        // output pixels along x while its `xc = 0.0` sample sits off canvas.
+        let plan = Plan { s: 1.0, ox: 100.0, oy: 0.0, w: 260, h: 200 };
+        let fp = 0.5 * plan.s;
+
+        let (n_new, w_new, den_new) = replay(&plan, &frame, 176.0, 1.0, 0.0, 0.0, fp, false);
+        let (n_old, w_old, den_old) = replay(&plan, &frame, 176.0, 1.0, 0.0, 0.0, fp, true);
+        println!(
+            "contributions: old={n_old} new={n_new} (+{})  Σw: old={w_old:.4} new={w_new:.4} (+{:.4})",
+            n_new - n_old,
+            w_new - w_old
+        );
+
+        assert!(n_old > 0, "the old criterion must still accumulate something");
+        assert!(
+            n_new > n_old,
+            "removing the single-point cull must add samples: old={n_old} new={n_new}"
+        );
+        assert!(
+            w_new > w_old,
+            "the recovered samples must carry weight: old={w_old} new={w_new}"
+        );
+        assert!(
+            w_new - w_old > 1.0,
+            "lost flux should be substantial, got {:.4}",
+            w_new - w_old
+        );
+
+        // Guard the shipping kernel, not just the replay: `scatter_band` must
+        // now produce exactly what the un-culled replay says.
+        let mut acc = Acc::new(plan);
+        let wmap = vec![1.0f32; frame.len()];
+        drizzle_add(&mut acc, &frame, 0.0, 0.0, 176.0, 1.0, 1.0, &wmap);
+        let den_sum: f64 = acc.den.iter().map(|v| *v as f64).sum();
+        assert!(
+            (den_sum - w_new).abs() <= 1e-5 * w_new,
+            "kernel Σw {den_sum} != replay {w_new}"
+        );
+        let mism = acc
+            .den
+            .iter()
+            .zip(&den_new)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(mism <= 1e-6, "kernel and replay disagree by {mism}");
+
+        // The recovered flux lands on canvas pixels the old path also touched,
+        // so compare per-pixel weight rather than coverage.
+        let dmax = den_new
+            .iter()
+            .zip(&den_old)
+            .map(|(a, b)| a - b)
+            .fold(0.0f32, f32::max);
+        assert!(dmax > 1e-3, "no output pixel gained weight (max Δ {dmax})");
+    }
 }
