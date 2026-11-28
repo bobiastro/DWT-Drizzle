@@ -3146,7 +3146,7 @@
      idx = np.argsort(np.nan_to_num(fwhms, nan=1e9))[:k]
  
      if star_grow_pct > 0:
-@@ -1586,94 +3736,1341 @@
+@@ -1586,94 +3736,1345 @@
      else:
          log('[拖线] 星点锐帧扩展已关闭（0%）')
  
@@ -3925,6 +3925,10 @@
 +    elif _CFA.get('want_wshare') and _CFA.get('ch') == 'G':
 +        _CFA['share'] = (np.array(C, copy=True), np.array(S, copy=True),
 +                         None if T is None else np.array(T, copy=True))
++    # LSPR 帧域 pmap：drizzle 分支里由 r_d['p'] 赋值；aligned×1 走下面的 else
++    # 分支（不开 drizzle），若不在分支前初始化，后面 5241 读它就是 UnboundLocalError，
++    # 帧域否决门被 except 吞掉、静默退回叠加域判据。这里先置空，drizzle 分支照常覆盖。
++    _lsp_pmap = None
 +    if drz_on:
 +        # ---- drizzle：每帧按自己的位移落点，输出网格逐像素排异，分母 ΣW·c ----
 +        _gm = str(getattr(p, 'gpu', 'auto') or 'auto').lower()
@@ -4554,7 +4558,7 @@
      # 分区分读：细节区 vs 朦胧区的 N_eff 与噪声
      det = R > 0.5
      amb = R < 0.1
-@@ -1688,11 +5085,61 @@
+@@ -1688,11 +5089,61 @@
          log(f'[读数] {name:<18} 占 {msk.mean():6.2%}  N_eff 中位 '
              f'{np.median(neff[msk]):5.2f}  σ {sd:.4e}')
  
@@ -4619,7 +4623,7 @@
  
      res = {
          'n': n, 'shape': Stk.shape, 'fwhms': fwhms, 'C': C, 'S': S, 'sigma': sig_out,
-@@ -1700,27 +5147,385 @@
+@@ -1700,27 +5151,385 @@
          'R_info': rinfo, 'neff': neff, 'rej_rate': float(rej_rate),
          'A': A, 'B': B, 'rej_k': rej_k, 'stars': stars,
          'metas': metas, 'skies': skies, 'scale_out': float(scale_out),
@@ -5010,7 +5014,7 @@
  
      log(f'[时] 总计 {time.perf_counter() - t_start:.1f}s')
      _emit('输出', 1.0, '完成')
-@@ -1741,6 +5546,11 @@
+@@ -1741,6 +5550,11 @@
          default = getattr(base, prm.key)
          if prm.kind == 'check':
              ap.add_argument(flag, action='store_true', default=default, help=text)
@@ -5022,7 +5026,7 @@
          elif prm.kind == 'float':
              ap.add_argument(flag, type=float, default=default, help=text)
          elif prm.kind == 'int':
-@@ -1750,13 +5560,23 @@
+@@ -1750,13 +5564,23 @@
                              choices=[v for _, v in prm.choices], help=text)
          else:
              ap.add_argument(flag, default=default, help=text)
@@ -5046,7 +5050,7 @@
      try:
          run(p)
      except Cancelled:
-@@ -1764,5 +5584,82 @@
+@@ -1764,5 +5588,82 @@
      return 0
  
  
@@ -14908,7 +14912,7 @@
 +        """关于：方法与原文出处（PWS，D.Cikey）"""
 +        messagebox.showinfo(
 +            "关于 DWT · Drizzle",
-+            "DWT · Drizzle 2.7.122-D\n\n" + LICENSE_TEXT)
++            "DWT · Drizzle 2.7.123-D\n\n" + LICENSE_TEXT)
 +
 +    def show_help(self):
 +        """打开内置使用说明（不依赖浏览器 / 外部程序）"""

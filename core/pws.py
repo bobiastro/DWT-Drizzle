@@ -4484,6 +4484,10 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     elif _CFA.get('want_wshare') and _CFA.get('ch') == 'G':
         _CFA['share'] = (np.array(C, copy=True), np.array(S, copy=True),
                          None if T is None else np.array(T, copy=True))
+    # LSPR 帧域 pmap：drizzle 分支里由 r_d['p'] 赋值；aligned×1 走下面的 else
+    # 分支（不开 drizzle），若不在分支前初始化，后面 5241 读它就是 UnboundLocalError，
+    # 帧域否决门被 except 吞掉、静默退回叠加域判据。这里先置空，drizzle 分支照常覆盖。
+    _lsp_pmap = None
     if drz_on:
         # ---- drizzle：每帧按自己的位移落点，输出网格逐像素排异，分母 ΣW·c ----
         _gm = str(getattr(p, 'gpu', 'auto') or 'auto').lower()
