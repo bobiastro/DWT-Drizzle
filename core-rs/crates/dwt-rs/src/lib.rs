@@ -25,6 +25,7 @@ pub mod pws;
 pub mod register;
 pub mod rfield;
 pub mod stack;
+pub mod trail;
 pub mod tri;
 pub mod xisf;
 

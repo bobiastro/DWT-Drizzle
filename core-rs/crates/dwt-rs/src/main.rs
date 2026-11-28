@@ -89,6 +89,8 @@ struct Args {
     sharp_w: f32,
     flux_pow: f32,
     fwhm_max: f32,
+    trail_drop: bool,
+    trail_penalty: f32,
     two_pass: bool,
     kernel: String,
     psf_target: f32,
@@ -159,6 +161,10 @@ impl Default for Args {
             sharp_w: 0.0, // Python: drizzle 合成里的 `sharp_w`（core/drizzle.py:1990-2010），默认 0 即无效
             flux_pow: 0.0, // Python: 吞吐权重 `T^fp`，默认 0 即无效
             fwhm_max: 0.0, // Python: FWHM 上限筛帧（core/pws.py:3833-3841），0 即不筛
+            // Python 2.7.122-D：卫星拖尾整帧剔除（core/pws.py:3460-3488），默认开；
+            // `trail_penalty` 只是退路，仅在 drop 关闭时生效
+            trail_drop: true,
+            trail_penalty: 1.0,
             two_pass: false, // Python: `two_pass` 两遍加权（pws.py:4665-4690），默认关闭
             kernel: "box".to_string(), // Python: `kernel`（box/psfmatch），core/drizzle.py:2032-2130
             psf_target: 50.0, // Python: `psf_target` 百分位，默认 50
@@ -353,6 +359,18 @@ fn parse_args() -> Result<Args, String> {
             }
             "--fwhm-max" => {
                 a.fwhm_max = num(val()?, flag)? as f32;
+                i += 2;
+            }
+            "--trail-drop" => {
+                a.trail_drop = if has_val() { num(val()?, flag)? != 0.0 } else { true };
+                i += if has_val() { 2 } else { 1 };
+            }
+            "--no-trail-drop" => {
+                a.trail_drop = false;
+                i += 1;
+            }
+            "--trail-penalty" => {
+                a.trail_penalty = num(val()?, flag)? as f32;
                 i += 2;
             }
             "--rej-mode" => {
@@ -1105,6 +1123,66 @@ fn run_pipeline(
         }
     }
     println!("[天] 天空基准 {sky0:.6e}  噪声中位 {sig_med:.6e}  归一 {:.2}s", t.elapsed().as_secs_f32());
+
+    // ---- 卫星拖尾：整帧剔除（core/pws.py:3460-3488）------------------------
+    // 放在逐帧星点/FWHM 统计之前：命中帧不进 fmed/C、不进权重表，也不参与配准与
+    // 叠加。Python 那边的等价物是 `fwhms[_tdrop]=NaN` + `keep=False` + `n_keep-1`。
+    // 为什么不能只降权：`strip_weights` 逐像素归一 mean_i(W)=1，某个画布像素只有
+    // 这一帧覆盖时分母只剩它自己，标量权重被整体约掉，拖尾照样留痕（Python 注释里
+    // 实测只压掉 16%）。
+    let mut probe_req = a.ref_frame.or(a.seed_frame);
+    if a.trail_drop {
+        let t_tr = Instant::now();
+        let hits: Vec<Option<(usize, f32)>> = frames
+            .par_iter()
+            .map(|f| {
+                let (px, ln) = dwt_rs::trail::trail_pixels(f);
+                (ln > 0.0).then_some((px, ln))
+            })
+            .collect();
+        let hit_idx: Vec<usize> = (0..hits.len()).filter(|&i| hits[i].is_some()).collect();
+        if hit_idx.is_empty() {
+            println!(
+                "[C] 未检出卫星拖尾（{} 帧全干净）  {:.1}s",
+                frames.len(),
+                t_tr.elapsed().as_secs_f32()
+            );
+        } else {
+            let n_total = frames.len();
+            let parts: Vec<String> = hit_idx
+                .iter()
+                .map(|&i| format!("#{i}（长 {:.0}px）", hits[i].expect("hit").1))
+                .collect();
+            println!(
+                "[C] 卫星拖尾：剔除帧 {}  参与 {}/{}  {:.1}s",
+                parts.join(" "),
+                n_total - hit_idx.len(),
+                n_total,
+                t_tr.elapsed().as_secs_f32()
+            );
+            // 整帧不参与：frames/skies/sigmas/mosaics 同步收缩，索引仍然对齐
+            let keep: Vec<usize> = (0..n_total).filter(|&i| hits[i].is_none()).collect();
+            let mut src: Vec<Option<Img>> =
+                std::mem::take(&mut frames).into_iter().map(Some).collect();
+            frames = keep.iter().map(|&i| src[i].take().expect("frame taken twice")).collect();
+            skies = keep.iter().map(|&i| skies[i]).collect();
+            sigmas = keep.iter().map(|&i| sigmas[i]).collect();
+            if !mosaics.is_empty() {
+                let mut ms: Vec<Option<Img>> =
+                    std::mem::take(&mut mosaics).into_iter().map(Some).collect();
+                mosaics =
+                    keep.iter().map(|&i| ms[i].take().expect("mosaic taken twice")).collect();
+            }
+            // --ref-frame/--seed-frame 是原始编号：换到新下标（被剔掉就回退到自动）
+            probe_req = probe_req.and_then(|i| keep.iter().position(|&k| k == i));
+            println!(
+                "[筛选] 卫星拖尾帧不参与叠加：{}/{} 帧  （{}）",
+                hit_idx.len(),
+                n_total,
+                hit_idx.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(" ")
+            );
+        }
+    }
     if let Some(dir) = &a.dump_frames {
         let _ = std::fs::create_dir_all(dir);
         for (i, d) in frames.iter().enumerate() {
@@ -1132,7 +1210,7 @@ fn run_pipeline(
             if want400 {
                 fstars = frames.par_iter().map(|f| build_star_table(f, 400, 26, 25.0)).collect();
             }
-            let probe = match a.ref_frame.or(a.seed_frame) {
+            let probe = match probe_req {
                 Some(i) => i.min(frames.len() - 1),
                 None => {
                     let mut best = (0usize, 0usize);
@@ -1623,6 +1701,46 @@ fn run_pipeline(
     let mut fmed = if finite.is_empty() { 1.0 } else { median_of(&finite) };
     let mut c: Vec<f32> = fwhms.iter().map(|v| if v.is_finite() && *v > 0.0 { fmed / *v } else { 1.0 }).collect();
     let mut s: Vec<f32> = dwt_rs::pws::snr_weights(&sigmas, sig_med, a.snr_clip);
+    // ---- 卫星拖尾惩罚（退路，默认关，core/pws.py:3594-3621）-----------------
+    // 只有 `--no-trail-drop` 且 `0 < trail_penalty < 0.999` 时才走这里。
+    // 局限已在 pws.py 注释里写明：逐像素归一 mean_i(W)=1 会把标量权重整体约掉，
+    // 某像素只有这一帧覆盖时沿线照样留痕（实测只能压掉 16%）。能剔除就剔除。
+    if !a.trail_drop && a.trail_penalty > 0.0 && a.trail_penalty < 0.999 {
+        let t_tr = Instant::now();
+        let hits: Vec<(usize, usize, f32)> = frames
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let (px, ln) = dwt_rs::trail::trail_pixels(f);
+                (ln > 0.0).then_some((i, px, ln))
+            })
+            .collect();
+        if hits.is_empty() {
+            println!(
+                "[C] 未检出卫星拖尾（{} 帧全干净）  {:.1}s",
+                frames.len(),
+                t_tr.elapsed().as_secs_f32()
+            );
+        } else {
+            for (i, _, _) in &hits {
+                c[*i] *= a.trail_penalty;
+            }
+            println!(
+                "[C] 卫星拖尾惩罚 {} 帧 ×{:.2}（检出长直线结构，未剔除）  {:.1}s",
+                hits.len(),
+                a.trail_penalty,
+                t_tr.elapsed().as_secs_f32()
+            );
+            let mut top = hits.clone();
+            top.sort_by(|x, y| y.2.total_cmp(&x.2));
+            for (i, px, ln) in top.iter().take(3) {
+                println!(
+                    "[C] 拖尾帧 #{i} 长 {ln:.0}px / {px} 像素  FWHM {:.2}px  C→{:.3}",
+                    fwhms[*i], c[*i]
+                );
+            }
+        }
+    }
     // --weights-from: inject an external C/S table (python's PWS_t_weights.txt) so the
     // rest of the pipeline can be compared without the PSF-metrology difference.
     if let Some(p) = &a.weights_from {
