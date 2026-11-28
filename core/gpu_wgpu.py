@@ -16,7 +16,7 @@
     行方向不再有相位锁定的权重起伏。
   - 代价：没有逐像素排异（那需要保留每帧样本），饱和星的点扩散略软。
 
-R 场处理：strip_weights 的权重是 W_i(p)=C_i^{A·R(p)}·S_i^{B·(1−R(p))}，指数随
+R 场处理：strip_weights 的权重是 W_i(p)=C_i^{A·R(p)}·S_i^{B·(1-R(p))}，指数随
 像素变化，GPU 端传不了空间变化的指数。这里跑两遍——R=0（只看信噪比）与 R=1
 （只看清晰度）——再按 R 线性混合。这是**近似**，与 CPU 的逐像素指数不同；
 分支 B 的目的是验证可移植后端与速度，数值等价留给后续。
@@ -198,7 +198,7 @@ def affine_from(dx: float, dy: float, theta: float, k: float,
     """输出画布坐标 (X,Y) → 源像素索引 (u,v) 的仿射系数。
 
     与 `_xy_rows` 同一约定：源像素索引 u 的中心在画布上映射为
-        X = s·(k·(ct·(u+0.5) − st·(v+0.5)) + ux) + ox ，ux = −dx 。
+        X = s·(k·(ct·(u+0.5) - st·(v+0.5)) + ux) + ox ，ux = -dx 。
     反解得 u = a·X + b·Y + c，v = d·X + e·Y + f。
     """
     s = float(plan['s'])

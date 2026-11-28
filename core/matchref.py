@@ -237,7 +237,7 @@ def _solve(src: np.ndarray, ref: np.ndarray, k: float, sr: np.ndarray) -> dict:
 def _resample(src: np.ndarray, ref_shape, k: float, th: float, u,
               want_cov: bool = False):
     c, s = np.cos(np.radians(th)), np.sin(np.radians(th))
-    # 逆映射：参考像素 q → 成品像素 p_src = k·Rᵀ(q − u)。
+    # 逆映射：参考像素 q → 成品像素 p_src = k·Rᵀ(q - u)。
     # scipy 的 affine_transform 用 (row, col) = (y, x)，所以对 R 和 u 各做一次坐标对换。
     # 成品的坐标是参考的 k 倍，所以线性部分也要乘 k（不是只乘平移）
     M = k * np.array([[c, -s], [s, c]], np.float64)

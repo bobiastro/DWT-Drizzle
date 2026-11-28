@@ -8,8 +8,8 @@ float 缓冲；每条带把帧数据上传一次，三遍扫描都在显存里�
 
 三遍：
   pass0  Σw, Σwv, Σw²      → μ
-  pass1  Σw·min(|v−μ|,3σ)  → winsor 尺度 s = 1.15·Σw|dev|/Σw
-  pass2  只保留 |v−μ| ≤ k·s → Σw, Σwv, Σw²（成品）
+  pass1  Σw·min(|v-μ|,3σ)  → winsor 尺度 s = 1.15·Σw|dev|/Σw
+  pass2  只保留 |v-μ| ≤ k·s → Σw, Σwv, Σw²（成品）
 """
 from __future__ import annotations
 
@@ -602,7 +602,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
         _dbg_stage('mean_pass')
         mean_pass()       # μ
         _dbg_stage('scatter1')
-        scatter(1, 0.0)                     # Σw|v−μ0|
+        scatter(1, 0.0)                     # Σw|v-μ0|
         _dbg_stage('block_scale')
         block_scale(k_clip=3.0, scale=1.15)  # 粗尺度 s0（写回 sd，作为 mode4/3 的截尾半径）
         # ---- 稳健锚点：迭代截尾均值，逼近 CPU 的逐像素中位数 ----
@@ -618,7 +618,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                 log('[wgpu] 帧放不进显存（环形缓冲）：跳过锚点迭代，'
                     'scatter 由 6 遍降为 3 遍')
             queue.write_buffer(aD, 0, np.zeros(n_pix, np.float32).tobytes())
-            scatter(1, 0.0)                 # Σw|v−μ0|
+            scatter(1, 0.0)                 # Σw|v-μ0|
             block_scale(k_clip=1.0, scale=1.15)
         else:
             for _k_it in (1, 2):
@@ -627,7 +627,7 @@ def stack_cfa_fatom(fs, C, S, dx, dy, th, kk, plan, A, B, rej_k, rej_gate,
                 scatter(4, 0.0)                 # Σw·clip(v, μ±3s)
                 mean_pass()                     # 写回新的 μ
             queue.write_buffer(aD, 0, np.zeros(n_pix, np.float32).tobytes())
-            scatter(1, 0.0)                     # Σw|v−μ_robust|
+            scatter(1, 0.0)                     # Σw|v-μ_robust|
             block_scale(k_clip=1.0, scale=1.15)  # 最终 winsor 尺度
 
         queue.write_buffer(aW, 0, np.zeros(n_pix, np.float32).tobytes())

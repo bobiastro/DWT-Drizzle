@@ -9,8 +9,8 @@
   · 落点是边长 P 的方框（pixfrac），重叠面积按 1/P² 归一；
   · 覆盖 cov 与值×覆盖 num 分开累加，最后 num/cov；
   · 排异：锚点/中位/MAD 只用最多 ANCHOR_N 帧的子集估计，阈值
-    thr = rej_k·MAD + m·R·(a−sky)，m 由核心区分位数 p99 估；
-  · 合成权重 e = A·R·lnC + B·(1−R)·lnS + sharp_w·lnC + flux_pow·lnT。
+    thr = rej_k·MAD + m·R·(a-sky)，m 由核心区分位数 p99 估；
+  · 合成权重 e = A·R·lnC + B·(1-R)·lnS + sharp_w·lnC + flux_pow·lnT。
 """
 import math
 

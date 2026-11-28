@@ -5,7 +5,7 @@
 `w·area·v`、`w·area` 用定点整数原子加累加。因此任意 scale/pixfrac 都与 CPU 的
 `_scatter_band` 同几何。
 
-WGSL 没有浮点原子 → `atomic<u32>` 存定点：图值用 `(2^24−1)/vmax`（按带标定），
+WGSL 没有浮点原子 → `atomic<u32>` 存定点：图值用 `(2^24-1)/vmax`（按带标定），
 统计用 `2048/vmax`（只用来估 σ），权重用 `2^16`。
 两遍：pass1 出 Σw、Σ(wv)、Σ(wv²) → μ/σ；pass2 按 k·σ 剔除后出成品。
 """
@@ -92,7 +92,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicAdd(&aV[idx], u32(max(w * v, 0.0) * Q.sc_v));
         atomicAdd(&aV2[idx], u32(max(w * v * v, 0.0) * Q.sc_v2));
       } else if (Q.mode < 1.5) {
-        // pass2：估 winsor 尺度 = 1.15·mean|v−μ|（与 CPU 的 winsor 同口径）
+        // pass2：估 winsor 尺度 = 1.15·mean|v-μ|（与 CPU 的 winsor 同口径）
         atomicAdd(&aW[idx], u32(w * Q.sc_w));
         let _dv = min(abs(v - mu[idx]), max(sd[idx], 0.0));
         atomicAdd(&aV[idx], u32(_dv * w * Q.sc_d));
@@ -256,7 +256,7 @@ def stack_cfa_scatter(fs, C, S, dx, dy, th, kk, plan, A, B, pattern: str,
         sc_v2 = 2048.0 / max(vmax * vmax * wmax * nn_f, 1e-12)
         sc_w = (2.0 ** 24 - 1.0) / max(wmax * nn_f, 1e-12)
         sc_w2 = (2.0 ** 26 - 1.0) / max(wmax * wmax * nn_f, 1e-12)
-        # dev = |v−μ| 比 v 小两个数量级，必须单独标定，否则定点截断成 0
+        # dev = |v-μ| 比 v 小两个数量级，必须单独标定，否则定点截断成 0
         _devmax = float(vmax) * 0.25
         sc_d = (2.0 ** 24 - 1.0) / max(_devmax * wmax * nn_f, 1e-12)
 
@@ -271,7 +271,7 @@ def stack_cfa_scatter(fs, C, S, dx, dy, th, kk, plan, A, B, pattern: str,
                 ux, uy = -float(dx[i]), -float(dy[i])
                 p = np.zeros(29, np.float32)
                 p[0] = np.float32(s_grid * ks * ct)          # a: s·k·cosθ
-                p[1] = np.float32(-s_grid * ks * stn)        # b: −s·k·sinθ
+                p[1] = np.float32(-s_grid * ks * stn)        # b: -s·k·sinθ
                 p[2] = np.float32(s_grid * ux + ox)          # c: 平移（(gx0+0.5) 已含 0.5）
                 p[3] = np.float32(s_grid * ks * stn)
                 p[4] = np.float32(s_grid * ks * ct)
