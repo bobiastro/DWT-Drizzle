@@ -9,6 +9,13 @@ import drizzle
 import gpu_band
 import gpu_dz
 
+if getattr(gpu_dz, 'cp', None) is None:
+    if __name__ == '__main__':
+        print('GPU-BAND-SKIP（本机没有 cupy，带核走 wgpu 路径，cupy 版比对无从做）')
+        raise SystemExit(0)
+    import unittest
+    raise unittest.SkipTest('本机没有 cupy，跳过 cupy 带核比对')
+
 rng = np.random.default_rng(7)
 
 

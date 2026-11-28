@@ -11,7 +11,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pydeps'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'upstream', 'core'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'core'))
 
 import drizzle as dz  # noqa: E402
 

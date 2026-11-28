@@ -6,7 +6,9 @@
 import sys
 import numpy as np
 
-sys.path.insert(0, 'upstream/core')
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / 'core'))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import drizzle as D
 
 

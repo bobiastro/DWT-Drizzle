@@ -6,7 +6,14 @@
     · 模型在天空块上零均值（减掉它不动公共天空水平）
     · model_strip 与整帧模型逐位一致（分带读帧不引入接缝）
 """
+import sys
+from pathlib import Path
+
 import numpy as np
+
+HERE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(HERE / 'core'))
+sys.path.insert(0, str(HERE))
 
 import bggrad
 

@@ -1347,6 +1347,72 @@ def _task_flux(job):
                             dx=dx, dy=dy)
     return int(i), fl
 
+def trail_pixels(frame: np.ndarray, ds: int = 2, sigma: float = 6.0,
+                 min_len: float = 400.0, box_r: int = 4):
+    """数一帧里「长直线结构」（卫星 / 流星 / 飞机拖尾）的像素，一遍扫完。
+
+    步骤（无迭代，比 RANSAC 更省时）：
+      1. 1/ds 降采样 → 均值盒滤波高通（累积和实现，O(N)）；
+      2. MAD 定噪声 σ，按 sigma·σ 二值化；
+      3. 8 邻域连通域，逐个算二阶矩：长轴 3.5·√λmax ≥ min_len、长短轴比
+         ≥ 6·ds、填充率 ≤ 0.45 判为拖尾。
+
+    星点核是圆的（长短轴比 ≈ 1）、星云团块填充率高，都过不了这几条；
+    只有细长直线结构会命中。返回 ``(覆盖像素数, 最长拖尾长度 px)``，
+    干净帧返回 ``(0, 0.0)``。
+    """
+    a = np.asarray(frame, np.float32)
+    if a.ndim != 2 or min(a.shape) < 64:
+        return 0, 0.0
+    ds = max(1, int(ds))
+    sub = a[::ds, ::ds]
+    # 均值盒滤波高通：拖尾是一条横贯上千像素的直线，大尺度上是"背景"，
+    # 高通后它整条留下，星点只留下核心，星云留下的团块填充率高。
+    r = max(1, int(box_r))
+    k = 2 * r + 1
+    ap = np.pad(np.asarray(sub, np.float64), r, mode='edge')
+    cs = np.cumsum(np.cumsum(np.pad(ap, ((1, 0), (1, 0))), 0), 1)
+    hh, ww = sub.shape
+    bg = (cs[k:k + hh, k:k + ww] - cs[0:hh, k:k + ww]
+          - cs[k:k + hh, 0:ww] + cs[0:hh, 0:ww]) / float(k * k)
+    d = sub - bg
+    s = 1.4826 * float(np.median(np.abs(d - np.median(d))))
+    if not np.isfinite(s) or s <= 0:
+        return 0, 0.0
+    m = d > float(sigma) * s
+    if not bool(m.any()):
+        return 0, 0.0
+    lab, nl = ndimage.label(m, structure=np.ones((3, 3), int))
+    if nl < 1:
+        return 0, 0.0
+    objs = ndimage.find_objects(lab)
+    tot, longest = 0, 0.0
+    _min_bbox = max(8, int(min_len / ds / 2))
+    for kk in range(1, nl + 1):
+        sl = objs[kk - 1]
+        if sl is None:
+            continue
+        h_ = sl[0].stop - sl[0].start
+        w_ = sl[1].stop - sl[1].start
+        if max(h_, w_) < _min_bbox:
+            continue
+        ys, xs = np.nonzero(lab[sl] == kk)
+        if len(xs) < 24:
+            continue
+        cxx = np.cov(np.vstack([xs.astype(np.float64), ys.astype(np.float64)]))
+        ev = np.linalg.eigvalsh(cxx)
+        if ev[1] <= 0.0:
+            continue
+        el = float(np.sqrt(ev[1] / max(ev[0], 1e-9)))          # 长短轴比
+        ln = 3.5 * float(np.sqrt(ev[1])) * ds                  # 全长 ≈ 3.5σ 长轴
+        fill = len(xs) / float(max(1, (xs.max() - xs.min() + 1)
+                                   * (ys.max() - ys.min() + 1)))
+        if el >= 6.0 * ds and ln >= float(min_len) and fill <= 0.45:
+            tot += len(xs) * ds * ds
+            longest = max(longest, ln)
+    return int(tot), float(longest)
+
+
 def measure_fwhm(img: np.ndarray, stars: List[Tuple[int, int]],
                  fwhm_guess: float = 6.0, half: int = 16,
                  fit_shape: int = 29) -> float:
@@ -3238,11 +3304,19 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     _emit('读帧', 0.0, '准备')
 
     # ---- 阶段 0：读帧 + 帧级归一（自动选驻留 / memmap）----
-    center = resolve_center(frames, crop, parse_center(p.center))
+    # --frame 模式下画布就是参考栅格，--crop 只是保存时的数组切片：帧必须整幅
+    # 参与叠加（只裁输入的话，画布中心那块根本没有数据，切出来是空的），
+    # 所以输入帧不裁，裁剪框在写盘前按画布坐标算。
+    _frame_mode = bool(str(getattr(p, 'frame', '') or '').strip())
+    _crop_in = int(crop or 0)
+    if _frame_mode and _crop_in > 0:
+        log(f'[裁剪] --frame 模式：输入帧不裁，{_crop_in}×{_crop_in} 在保存时按画布坐标切')
+        _crop_in = 0
+    center = resolve_center(frames, _crop_in, parse_center(p.center))
     # 三通道共用几何时，读帧 / 减背景 / 量天空这十几秒只需做一次。
     # 同一个 run 内按（帧列表、裁剪、中心、上限、背景模型）缓存；帧数据只读
     # （拆色在 _PlaneFS 里按需做），复用不会污染任何通道。
-    _ck = (tuple(str(f) for f in frames), int(crop), tuple(center or ()),
+    _ck = (tuple(str(f) for f in frames), int(_crop_in), tuple(center or ()),
            int(limit or 0), int(getattr(p, 'bgdeg', 1) or 0),
            int(getattr(p, 'bg_r', 0) or 0), bool(keep_frames))
     _hit = _FS_CACHE.get(_ck)
@@ -3256,7 +3330,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         except Exception:
             pass
     else:
-        fs = prepare_frames(frames, ';'.join(str(s) for s in sources), crop, center,
+        fs = prepare_frames(frames, ';'.join(str(s) for s in sources), _crop_in, center,
                             limit, frames_dir, keep_frames=keep_frames,
                             bgdeg=int(getattr(p, 'bgdeg', 1) or 0),
                             bg_r=int(getattr(p, 'bg_r', 0) or 0))
@@ -3486,6 +3560,38 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     log('[C] 最糊 3 帧 ' + '  '.join(
         f'#{int(i)}({fwhms[int(i)]:.2f}px)' for i in order[-3:]))
 
+    # ---- 卫星拖尾惩罚：整帧含长直线结构时压低清晰度权重 ----
+    # C 经 C^A（A=20）放大后单帧能占到千分之几的权重，于是帧里那条 2–3 px 宽的
+    # 卫星拖尾会被当成"细节"叠进成品，在沿线上留一条假线（实测 2026-10-08 那帧
+    # C=1.38 时沿线 +2.6e-5）。逐帧 FWHM 中位对这种帧并不敏感——拖尾很少正好穿过
+    # 星点小窗（实测最近小窗中心距拖尾 49 px），所以问题不在 FWHM 而在权重：
+    # 有直线结构的帧数据本身被污染，必须单独降权，而不是让它的"锐"去换权重。
+    _tp = float(getattr(p, 'trail_penalty', 0.65) or 0.0)
+    if 0.0 < _tp < 0.999:
+        t1c = time.perf_counter()
+        _hit = []
+        for i in range(n):
+            _check_cancel()
+            try:
+                _px, _ln = trail_pixels(fs.frame(i))
+            except Exception:
+                _px, _ln = 0, 0.0
+            if _ln > 0:
+                _hit.append((i, _px, _ln))
+            _emit('查拖尾', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
+        if _hit:
+            _mul = np.ones(n, np.float64)
+            for _i, _px, _ln in _hit:
+                _mul[_i] = _tp
+            C = C * _mul
+            log(f'[C] 卫星拖尾惩罚 {len(_hit)} 帧 ×{_tp:.2f}（检出长直线结构）  '
+                f'{time.perf_counter() - t1c:.1f}s')
+            for _i, _px, _ln in sorted(_hit, key=lambda r: -r[2])[:3]:
+                log(f'[C] 拖尾帧 #{int(_i)} 长 {_ln:.0f}px / {_px} 像素  '
+                    f'FWHM {fwhms[int(_i)]:.2f}px  C→{C[int(_i)]:.3f}')
+        else:
+            log(f'[C] 未检出卫星拖尾（{n} 帧全干净）  {time.perf_counter() - t1c:.1f}s')
+
     # ---- 逐瓦片清晰度（可选）：每帧在 K×K 瓦片里各量一个 FWHM ----
     C_tiles = None
     _kt = int(getattr(p, 'sharp_tiles', 0) or 0)
@@ -3639,6 +3745,11 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
 
     drz_on = bool(getattr(p, 'drizzle', False))
     _aligned_in = bool(int(getattr(p, 'aligned', 0) or 0))
+    # --frame / --crop 的参考栅格信息：在这里先初始化。drizzle 可能被下面的
+    # “已对齐且 ×1”分支关掉，那时写盘前的切片判断若再引用就会 NameError。
+    _frame_ref = str(getattr(p, 'frame', '') or '').strip()
+    _ref_wh = None
+    _inv_grid = 1.0
     if _aligned_in:
         # 旧行为：无条件关掉 drizzle → --drizzle-scale 被忽略，成品恒为 1×（bug）。
         # 现在保留用户要求的倍率：已对齐的帧位移≈0，走 drizzle 只是把样本投到 s× 网格；
@@ -3894,6 +4005,12 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             drz_plan = plan_output(fs.shape, dx, dy, drz_s, theta=th, k=kk)
         except Exception:
             drz_plan = None
+        # --frame / --crop 的参考栅格信息：必须在 drizzle 分支之外初始化。
+        # 否则 `--aligned 1` 且 ×1 时 drizzle 被关掉，这段赋值被跳过，
+        # 写盘前的切片判断会 NameError: _frame_ref（2.7.119-D 的回归）。
+        _frame_ref = str(getattr(p, 'frame', '') or '').strip()
+        _inv_grid = 1.0
+        _ref_wh = None
         _fin = np.isfinite(dx) & np.isfinite(dy)
         if drz_on and _fin.any():
             _mx = float(np.nanmax(np.abs(dx[_fin])))
@@ -3973,6 +4090,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         drz_plan = plan_output(fs.shape, dx, dy, drz_s, theta=th, k=kk)
         _frame_ref = str(getattr(p, 'frame', '') or '').strip()
         _inv_grid = 1.0          # 参考栅格相对原生像素的放大倍数（无参考图时为 1）
+        _ref_wh = None           # 参考栅格的 (宽,高)；--crop 切片要拿它核对画布
         if _frame_ref and matchref is not None:
             try:
                 _refv = np.asarray(
@@ -4062,33 +4180,39 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                                 f'({_off[0]:+.2f}, {_off[1]:+.2f})px')
                     except Exception as _e2:
                         log(f'[网格] 星点对账跳过（{type(_e2).__name__}: {_e2}）')
-                    # 输出网格决定「画布几何」，但用户选的 drizzle 倍率是
-                    # 相对**原生像素**的。参考图本身可能就是 2× drizzle 产物
-                    # （文件名带 _drizzle_2x，或星点匹配量到 _inv≈2），
-                    # 直接再乘一次会让画布变成 4×，星点被拉成 4 像素方糖。
-                    # 所以这里换算成「相对参考栅格」的倍率：s = 倍率 / _inv。
+                    # 输出网格就是参考栅格本身：画布宽高/原点都照参考像素，
+                    # 采样倍率固定 1（1 输出像素 = 1 参考像素 = _inv 倍原生像素）。
+                    # 以前按 s = 倍率 / _inv 折算，2× 的 master 会被缩回原生 1×，
+                    # 画布只有参考的一半，--crop 的切片坐标也就对不上参考像素。
                     _s_req = float(drz_s) if drz_on else 1.0
-                    _s_grid = _s_req / _inv if _inv else _s_req
-                    _s_grid = max(0.05, min(8.0, _s_grid))
-                    if abs(_inv - 1.0) > 0.02:
-                        log(f'[网格] 参考图本身是 {_inv:.2f}× 上采样（相对原生像素）；'
-                            f'drizzle {_s_req:g}× 按原生像素折算 → 画布 = 参考 × {_s_grid:.2f}')
-                    drz_plan = {'s': _s_grid, 'ox': 0.0, 'oy': 0.0,
-                                'W': int(round(_w * _s_grid)),
-                                'H': int(round(_h * _s_grid))}
-                    log(f'[网格] 输出画布取参考 {Path(_frame_ref).name}'
-                        f' {_w}×{_h} × {_s_grid:g} = {drz_plan["W"]}×{drz_plan["H"]}'
-                        f'（放大 {_inv:.4f}× 旋转 {_thm:+.2f}°）')
+                    if drz_on:
+                        if abs(_s_req - 1.0) > 1e-9:
+                            log(f'[网格] --frame 模式下画布固定为参考栅格，'
+                                f'--drizzle-scale {_s_req:g} 不生效（参考栅格已是最终采样）')
+                        drz_plan = {'s': 1.0, 'ox': 0.0, 'oy': 0.0,
+                                    'W': int(_w), 'H': int(_h)}
+                        log(f'[网格] 输出画布 = 参考 {Path(_frame_ref).name}'
+                            f' {_w}×{_h}（原点对齐参考像素，{_inv:.4f}× 原生像素，'
+                            f'旋转 {_thm:+.2f}°）')
+                    else:
+                        _s_grid = _s_req / _inv if _inv else _s_req
+                        _s_grid = max(0.05, min(8.0, _s_grid))
+                        drz_plan = {'s': _s_grid, 'ox': 0.0, 'oy': 0.0,
+                                    'W': int(round(_w * _s_grid)),
+                                    'H': int(round(_h * _s_grid))}
+                        log(f'[网格] 输出画布取参考 {Path(_frame_ref).name}'
+                            f' {_w}×{_h} × {_s_grid:g} = {drz_plan["W"]}×{drz_plan["H"]}'
+                            f'（放大 {_inv:.4f}× 旋转 {_thm:+.2f}°）')
+                    _ref_wh = (int(_w), int(_h))
                 else:
                     log(f'[网格] 参考图配准失败，退回包围盒画布：{_fi.get("error")}')
             except Exception as _e:
                 log(f'[网格] 参考网格不可用（{type(_e).__name__}: {_e}），退回包围盒画布')
-        # ---- --frame 与 --crop 同时给出：画布口径无法同时满足（裁剪块坐标与
-        #      参考栅格换算未通过验证：实测内容错位、corr≈0），这里显式告警。
+        # ---- --frame 与 --crop 同时给出：画布就是参考栅格，裁剪只是写盘前的
+        #      数组切片（不换算仿射/原点），切片框在保存时算。
         if _frame_ref and int(crop or 0) > 0:
-            log('[网格] 警告：--frame 与 --crop 同时给出时，输出画布取参考整幅、'
-                '裁剪不起作用（该组合的画布换算未通过验证：实测内容错位 corr≈0）。'
-                '要裁剪请在 PI/Siril 里做，或去掉 --frame 用包围盒画布。')
+            log(f'[裁剪] --frame 模式：画布 = 参考栅格 {_ref_wh or "?"}，'
+                f'写盘前切 {int(crop)}×{int(crop)}（超出画布会直接报错）')
         # ---- CFA：三通道必须共用同一个变换和同一张画布。各自配准会让画布差
         #      几个像素、通道之间整体错位（实测 R 12702 宽 vs G/B 12700 宽，
         #      合成出来是一堆分开的红绿蓝点）。这里存的必须是**帧块修正之后**的
@@ -4232,7 +4356,9 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             _ho = max(16, int(round(16 * _px_scale * _sm)))
             _so = max(29, int(round(29 * _px_scale * _sm)))
             _so = _so | 1
-            _st = _seed_map(_plm, _px_scale * _sm)
+            # 星点位是在参考栅格上的（_seed_map 里已乘过 _inv），换成这张图的
+            # 画布像素要用它自己的 s；用 _px_scale*_sm 只有在 _inv=1 时才对。
+            _st = _seed_map(_plm, float(_plm['s']))
             _fr = float(measure_fwhm(sref, _st, fwhm_guess=6.0 * _px_scale * _sm,
                                      half=_ho, fit_shape=_so))
         except Exception:
@@ -5189,6 +5315,35 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                     % (_sat, 100.0 * _sat / float(Stk.size)))
         except Exception:
             pass
+        # ---- --frame + --crop：画布就是参考栅格，裁剪 = 写盘前对数组切片。
+        #      裁剪框沿用非 frame 路径的口径（以 center 为中心，缺省画面中心），
+        #      只是坐标换到画布上；越界或画布不是参考栅格就直接报错，不静默出图。
+        if _frame_ref and int(crop or 0) > 0:
+            _cn = int(crop)
+            _chh, _cww = int(Stk.shape[0]), int(Stk.shape[1])
+            if _ref_wh is None or (_cww, _chh) != (int(_ref_wh[0]), int(_ref_wh[1])):
+                log(f'[裁剪] 画布 {_cww}×{_chh} 不是参考栅格 '
+                    f'{_ref_wh[0] if _ref_wh else "?"}×{_ref_wh[1] if _ref_wh else "?"}'
+                    f'（--frame 配准失败或未启用 --drizzle），拒绝按 --crop 切片出图')
+                raise SystemExit(2)
+            if _cn > min(_chh, _cww):
+                log(f'[裁剪] --crop {_cn} 超出参考画布 {_cww}×{_chh}，拒绝出图')
+                raise SystemExit(2)
+            if center is None:
+                _ccy, _ccx = _chh // 2, _cww // 2
+            else:
+                _ccy, _ccx = int(center[0]), int(center[1])
+            _chalf = _cn // 2
+            _cy0 = max(0, min(_ccy - _chalf, _chh - _cn))
+            _cx0 = max(0, min(_ccx - _chalf, _cww - _cn))
+            Stk = np.ascontiguousarray(Stk[_cy0:_cy0 + _cn, _cx0:_cx0 + _cn])
+            neff = np.ascontiguousarray(neff[_cy0:_cy0 + _cn, _cx0:_cx0 + _cn])
+            if cov_map is not None:
+                cov_map = np.ascontiguousarray(cov_map[_cy0:_cy0 + _cn, _cx0:_cx0 + _cn])
+            R = np.ascontiguousarray(R[_cy0:_cy0 + _cn, _cx0:_cx0 + _cn])
+            log(f'[裁剪] --frame 模式：画布 {_cww}×{_chh} → 切片 '
+                f'y {_cy0}..{_cy0 + _cn}  x {_cx0}..{_cx0 + _cn}'
+                f'（{_cn}×{_cn}，中心 {_ccx},{_ccy}）')
         save_linear_xisf(p_out, Stk, metas,
                          f'PWS A={A:g} B={B:g} rej_k={rej_k:g}',
                          diag={'A': A, 'B': B, 'RejK': rej_k, 'RejGate': rej_gate,

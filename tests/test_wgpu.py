@@ -6,7 +6,12 @@
   1. 冲激响应在整数对齐下应回到 1.0（Catmull-Rom 双三次的相位正确）；
   2. 平移 +0.5 像素后总量守恒（归一化没写坏）。
 """
+import sys
+import pathlib
+
 import numpy as np
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / 'core'))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 
 def main():
