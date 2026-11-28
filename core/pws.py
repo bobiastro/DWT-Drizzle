@@ -4835,6 +4835,36 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 _lsp_pmap = r_d.get('p') if isinstance(r_d, dict) else None
             except Exception:
                 _lsp_pmap = None
+            # CPU 叠加没有着色器，r_d['p'] 为空 ⇒ 帧域否决门整段被跳过（2.7.122 及更早
+            # 都是这个状态）。这里按**与 GPU 着色器完全相同的公式**由 drz_plan + 每帧
+            # 变换补出 p6 表，让 p 表在 CPU 路径上同样存在：
+            #   X = p0*(gx+0.5) + p1*(gy+0.5) + p2
+            #   Y = p3*(gx+0.5) + p4*(gy+0.5) + p5
+            if (not _lsp_pmap) and isinstance(r_d, dict) and drz_plan is not None:
+                try:
+                    _sp = float(drz_plan.get('s', 1.0))
+                    _pox = float(drz_plan.get('ox', 0.0))
+                    _poy = float(drz_plan.get('oy', 0.0))
+                    _rows = []
+                    for _j in range(int(np.atleast_1d(dx).size)):
+                        _t = 0.0 if th is None else math.radians(float(th[_j]))
+                        _c, _sn = math.cos(_t), math.sin(_t)
+                        _k = float(kk[_j]) if kk is not None else 1.0
+                        _rows.append((_sp * _k * _c, -_sp * _k * _sn,
+                                      _sp * (-float(dx[_j])) + _pox,
+                                      _sp * _k * _sn, _sp * _k * _c,
+                                      _sp * (-float(dy[_j])) + _poy))
+                    # 与 GPU 同类型：dict{帧号: (p0..p5)}，下游有 dict(_lsp_pmap) 与
+                    # 真值判断（数组会触发 "truth value ... is ambiguous"）
+                    _lsp_pmap = {int(_i): _rows[_i] for _i in range(len(_rows))}
+                    r_d['p'] = _lsp_pmap
+                    globals()['_WGPU_PATH_DONE'] = False
+                    log('[LSPR] 帧域验证：p 表 %d 帧（CPU 同源，由 drz_plan 合成）'
+                        % len(_lsp_pmap))
+                except Exception as _e_p:
+                    _lsp_pmap = None
+                    if os.environ.get('DWT_WGPU_DEBUG') == '1':
+                        log('[LSPR][debug] CPU p 表合成失败：%s: %s' % (type(_e_p).__name__, _e_p))
             if bool(int(getattr(p, 'two_pass', 0) or 0)):
                 _wmap = _local_sharp_maps(fs, np.arange(n), drz_plan, 64, log)
                 if _wmap is not None:
@@ -5302,7 +5332,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                             return _cc[j]
                         _lsp_nf = int(len(_pm_l))
                         _lsp_sf = float(np.median(fs.sigma)) if fs.sigma is not None else None
-                        log('[LSPR] 帧域验证：p 表 %d 帧（着色器同源）' % _lsp_nf)
+                        _pg = 'CPU 同源（drz_plan 合成）' if (not _WGPU_PATH_DONE) else '着色器同源'
+                        log('[LSPR] 帧域验证：p 表 %d 帧（%s）' % (_lsp_nf, _pg))
                         if _DBG_L:
                             try:
                                 log('[LSPR][debug] fs: shape=%s n=%d mm=%s arrays=%s path=%s exists=%s'
