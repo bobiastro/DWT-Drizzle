@@ -1554,6 +1554,48 @@ fn run_pipeline(
     };
     let tmax = sims.iter().map(|s| s.theta.abs()).fold(0.0f32, f32::max);
     let kmax = sims.iter().map(|s| (s.k - 1.0).abs()).fold(0.0f32, f32::max);
+
+    // ---- accumulation grid ------------------------------------------------
+    // Drizzle is a weighted mean, so *where* each sample's weight lands decides
+    // the noise.  Scattering onto a canvas that is `g` times finer than the
+    // frames hands every cell a different share of each sample (`a = wx*wy`,
+    // with the sub-pixel phase re-drawn every frame), and that per-cell weight
+    // jitter does not average down: a Monte-Carlo over this field's own dither
+    // measured 1.34x the photon limit on the fine grid, against 0.51x for a 1x
+    // accumulate plus one resample to the canvas.  Python accumulates at 1x for
+    // the same reason (its `[wgpu][start] scale=1.00` on a 2x canvas, then
+    // `ndimage.zoom`), so the stack is always accumulated on the grid where one
+    // input pixel is one cell, and the canvas is reached by resampling once.
+    //
+    // `g` is that factor: canvas cells per input pixel.  For the `--canvas-from`
+    // case the canvas is the 2x reference and the frames sit at k ~ 2, so
+    // `plan.s*k_med = 1*2` -> g = 2 and the accumulation grid is exactly the
+    // native 2758x2204 raster.  `g == 1` leaves every code path below untouched,
+    // which is what keeps a `--drizzle-scale 1` product bit-identical.
+    let k_med = {
+        let kv: Vec<f32> = sims
+            .iter()
+            .map(|s| s.k.abs())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .collect();
+        if kv.is_empty() {
+            1.0
+        } else {
+            median_of(&kv)
+        }
+    };
+    // A shared run fixed the canvas *and* the R field; re-deriving a grid from
+    // the shared plan would index that R field with the wrong stride.  And when
+    // the run does not drizzle at all (the same predicate as `drz` below, which
+    // is computed after this point), the product stays on the frame grid, so
+    // there is nothing to coarsen and `--drizzle-scale 1` keeps its bytes.
+    let will_drz = register || a.geom.is_some() || (a.drizzle && (a.force_drizzle || a.dscale > 1.001));
+    let grid_g = if share.is_some() || !will_drz {
+        1
+    } else {
+        Plan::fit_coarsen(plan_r.s * k_med)
+    };
+    let plan_r = plan_r.coarsen(grid_g);
     let (sref, sigma_meas) = if let Some(sh) = share {
         (sh.rfield.clone(), None)
     } else if tmax < 0.5 && kmax < 0.005 {
@@ -1680,8 +1722,10 @@ fn run_pipeline(
             _ => sigma_psf,
         };
         println!(
-            "[R] 参考像自量 FWHM {:.2}px（输出网格）→ R 场 σ_psf {:.2}px（中位帧折算 {:.2}px）",
-            sigma_ref * 2.3548,
+            "[R] 参考像自量 FWHM {:.2}px（画布网格）→ R 场建在 {}x{} 网格上，σ_psf {:.2}px（中位帧折算 {:.2}px）",
+            sigma_ref * 2.3548 * grid_g as f32,
+            sref.w,
+            sref.h,
             sigma_ref,
             sigma_psf
         );
@@ -1918,6 +1962,12 @@ fn run_pipeline(
                 println!("[画布] 输出网格 = 参考 {}x{}（原点对齐参考像素）", cw, ch);
             }
         }
+        // The accumulation grid (see `grid_g` above): one input pixel per cell.
+        // Everything that has to agree pixel for pixel — the rejection anchor, the
+        // per-pixel scale, the R field and the coverage map — lives on this grid,
+        // not on the canvas; only the resample at the end knows about `plan`.
+        let acc_plan = plan.coarsen(grid_g);
+        let acc_s = acc_plan.s;
         lsp_plan = Some(plan);
         out_plan = Some(plan);
         // Rejection is a *cross-frame* decision, so it has to be taken where the
@@ -1949,9 +1999,15 @@ fn run_pipeline(
         } else {
             a.dpix * dmul
         };
+        // `pf` above is the drop side in *input* pixels, which on the accumulation
+        // grid is the same number of cells.  The scatter turns it into
+        // `fp = 0.5*plan.s*pixfrac` grid pixels, so it has to be expressed in that
+        // grid's scale: with `acc.s = plan.s/g` the sample then lands whole in one
+        // cell (`--drizzle-pixfrac 1`, no partial coverage anywhere).
+        let pf = if grid_g > 1 { pf / acc_s } else { pf };
         let rate = if a.rej_k > 0.0 {
             if register || a.geom.is_some() {
-                let (_, _, sig) = sharp_ref_sim(&frames, &ref_idx, &sims, &plan, &stars, probe, pf);
+                let (_, _, sig) = sharp_ref_sim(&frames, &ref_idx, &sims, &acc_plan, &stars, probe, pf);
                 // Anchor: the equal-weight mean of the *whole* stack, drizzled at
                 // the stack's own pixfrac.  A median of the k sharpest frames has
                 // √8 more noise of its own, and rejecting on |v − noisy anchor|
@@ -1973,7 +2029,7 @@ fn run_pipeline(
                         cfa: None,
                     })
                     .collect();
-                let mut acc_a = Acc::new(plan);
+                let mut acc_a = Acc::new(acc_plan);
                 dwt_rs::drizzle::drizzle_add_many(&mut acc_a, &places, pf);
                 let anchor = acc_a.finish();
                 // Scale: Python's estimator — one 64x64 block value per block,
@@ -1991,7 +2047,7 @@ fn run_pipeline(
                 let nf = frames.len();
                 let kw = a.rej_k.max(2.0);
                 let sc =
-                    dwt_rs::drzrej::winsor_block_scale(&frames, &wts, &sims, plan, &anchor, kw);
+                    dwt_rs::drzrej::winsor_block_scale(&frames, &wts, &sims, acc_plan, &anchor, kw);
                 // Python's drizzle backend clips at `max(1, rej_k/2)` in esd mode
                 // (core/gpu_wgpu_cfa_fatom.py: p[31]).
                 let kclip = if a.rej_mode == RejMode::Esd {
@@ -2001,14 +2057,16 @@ fn run_pipeline(
                 };
                 let smed = median_of(&sc.d.iter().copied().filter(|v| v.is_finite()).collect::<Vec<f32>>());
                 println!(
-                    "[排异] 画布锚 = 全栈 {} 帧等权 drizzle 均值（输出网格，pixfrac {}），尺度 = 64x64 块 winsor(k={:.2}) 中位 {:.3e}；kclip {:.2} → 单边理论 {:.2}%；参考像自量 FWHM {:.2}px",
+                    "[排异] 累加网格锚 = 全栈 {} 帧等权 drizzle 均值（{}x{}，pixfrac {}），尺度 = 64x64 块 winsor(k={:.2}) 中位 {:.3e}；kclip {:.2} → 单边理论 {:.2}%；参考像自量 FWHM {:.2}px",
                     nf,
+                    acc_plan.w,
+                    acc_plan.h,
                     pf,
                     kw,
                     smed,
                     kclip,
                     100.0 * dwt_rs::drzrej::expected_rate(kclip),
-                    sig.map(|v| v * 2.3548).unwrap_or(f32::NAN)
+                    sig.map(|v| v * 2.3548 * grid_g as f32).unwrap_or(f32::NAN)
                 );
                 let rule = dwt_rs::drzrej::CanvasRule {
                     anchor: &anchor,
@@ -2023,7 +2081,7 @@ fn run_pipeline(
                     gate: REJ_GATE,
 
                 };
-                dwt_rs::drzrej::canvas_reject(&frames, &mut wts, &sims, plan, &rule, 24)
+                dwt_rs::drzrej::canvas_reject(&frames, &mut wts, &sims, acc_plan, &rule, 24)
             } else {
                 // Pre-aligned stack: the frames already share a pixel grid, so the
                 // frame-space rule is the right one.
@@ -2045,7 +2103,7 @@ fn run_pipeline(
             0.0
         };
         let d_prof_rj = t_prof_rj.elapsed().as_secs_f32();
-        let mut acc = Acc::new(plan);
+        let mut acc = Acc::new(acc_plan);
         let t_prof_dz = Instant::now();
         let cfa_mask = if raw {
             cfa::mask2(pattern.unwrap_or("RGGB"), ch.unwrap_or('G'))
@@ -2066,10 +2124,10 @@ fn run_pipeline(
         // Python `kernel='psfmatch'`：按 PSF 目标把每帧的核换成更宽的高斯
         // （core/drizzle.py:2032-2130；`_psfmatch_blur` 用 `extra/s` 源像素 σ）。
         let pm_frames: Option<Vec<Img>> = if a.kernel == "psfmatch" || a.kernel == "psf" {
-            let v = dwt_rs::pws::psfmatch_frames(&frames, &fwhms, plan.s, a.psf_target);
+            let v = dwt_rs::pws::psfmatch_frames(&frames, &fwhms, acc_s, a.psf_target);
             match &v {
                 Some(pm) => {
-                    let extra = dwt_rs::pws::psfmatch_extra_sigma(&fwhms, plan.s, a.psf_target)
+                    let extra = dwt_rs::pws::psfmatch_extra_sigma(&fwhms, acc_s, a.psf_target)
                         .unwrap_or_default();
                     println!(
                         "[核] psfmatch：目标 {} 百分位 σ_psf={:.3}px（输出网格），额外 σ(源像素) = {}",
@@ -2117,9 +2175,35 @@ fn run_pipeline(
                 t_prof_dz.elapsed().as_secs_f32()
             );
         }
-        let img = acc.finish();
-        cov_acc = std::mem::take(&mut acc.cov);
-        println!("[drizzle] 输出 {}x{}  scale={} pixfrac={} (x{}) drop_mul={}  ox={} oy={}", img.w, img.h, a.dscale, a.dpix, pf, dmul, plan.ox, plan.oy);
+        let acc_img = acc.finish();
+        let acc_cov = std::mem::take(&mut acc.cov);
+        // The stack lives on the accumulation grid; the canvas is reached with one
+        // cubic-convolution resample for the image (sharper than `order=1`, which
+        // costs 0.31 px of FWHM on this field — see `drizzle::upsample`) and a
+        // bilinear one for the coverage counts.  Doing the resample here, after
+        // the average, is not the same thing as drizzling onto the fine grid: the
+        // average then never sees a partial-coverage weight.  Both are no-ops for
+        // `g == 1`, so a 1x canvas keeps its bytes.
+        let img = dwt_rs::drizzle::upsample(&acc_img, &plan, grid_g);
+        cov_acc = dwt_rs::drizzle::upsample_slice(
+            &acc_cov,
+            acc_plan.w,
+            acc_plan.h,
+            plan.w,
+            plan.h,
+            grid_g,
+            false,
+        );
+        println!(
+            "[drizzle] 输出 {}x{}  scale={} pixfrac={} (x{}) drop_mul={}  ox={} oy={}",
+            img.w, img.h, plan.s, a.dpix, pf, dmul, plan.ox, plan.oy
+        );
+        if grid_g > 1 {
+            println!(
+                "[drizzle] 累加网格 {}x{}（1×，pixfrac {} → 每样本整份落 1 格）→ 三次卷积上采样 ×{} 到画布",
+                acc_plan.w, acc_plan.h, pf, grid_g
+            );
+        }
         (img, Vec::new(), rate)
     } else {
         let res = stack_strip_mode(
@@ -2291,6 +2375,20 @@ fn run_pipeline(
         image.d.iter().cloned().fold(0.0f32, f32::max));
 
     // ---- diagnostic maps --------------------------------------------------
+    // Python keeps the R support field at (at most) half resolution and zooms it
+    // to the canvas at the very end (`core/pws.py:4289`,
+    // `np.clip(ndimage.zoom(R,2,order=1)[:H,:W],0,1)`).  The accumulation grid
+    // *is* that half grid, so resample here before the maps, the crop search and
+    // the shared-run export read it.
+    let rfield = if grid_g > 1 && (rfield.w != image.w || rfield.h != image.h) {
+        dwt_rs::drizzle::upsample_linear(
+            &rfield,
+            &Plan { s: 1.0, ox: 0.0, oy: 0.0, w: image.w, h: image.h },
+            grid_g,
+        )
+    } else {
+        rfield
+    };
     // Python writes the quarter-resolution maps and the weights table on every
     // run; the full-resolution copies are the `DWT_SAVE_AUX=1` extra.
     if cov_acc.len() == image.d.len() {
