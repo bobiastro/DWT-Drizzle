@@ -293,3 +293,10 @@ Stage A 在算 fmed/C **之前**跑一遍：命中的帧 `fwhms[i] = NaN`（不�
   注：CFA 彩机的 drizzle 走 GPU 定点原子加，同配置重跑两次像素本身就有 ~1e-6 相对差
   （实测 mean|Δ|=9.8e-9~1.3e-8，rel 1.2e-6~2.0e-6），所以「开/关 trail_drop」的成品
   差（mean|Δ|=6.1e-9~1.4e-8，rel 0.9e-6~2.5e-6）与重跑噪声同量级——即零改动，但达不到 md5 逐字节相同。
+
+**回归修复（同一版本内）**：`--help` 在中文 Windows（GBK 控制台）直接崩——PARAMS 说明文本里混进了
+U+2212 真减号，argparse 的 `print_help` 往 GBK 流写时抛 `UnicodeEncodeError`。已把 `core/pws_params.py`
+说明里的 `−×≈→≤≥Δ…` 全换成 ASCII（`- x ~ -> <= >= D ...`），`core/*.py` 里剩下的 86 处 U+2212 也一并换掉；
+另在 `main.py` 的 `main()` 开头对 stdout/stderr 做 `reconfigure(errors='replace')`（保留控制台原编码，
+避免 GBK 下中文变乱码），以后再有编不出的字符只显示 `?`、不会中断。新增 `tests/test_cli_help.py`：
+用 `PYTHONIOENCODING=gbk` 跑子进程断言 `--cli --help` 返回 0 且输出含 `--no-trail-drop`。

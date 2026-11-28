@@ -4,7 +4,7 @@
 同一套统计权重下，把多帧的亚像素相位合成到一个更细的输出网格上。
 
 为什么只改阶段 C（见设计说明 7.4 节）：
-    · 统计层（谁参与、各占多少权重）由 PWS 决定：W[i,r] = C_i^(A·R_r)·S_i^(B(1−R_r))；
+    · 统计层（谁参与、各占多少权重）由 PWS 决定：W[i,r] = C_i^(A·R_r)·S_i^(B(1-R_r))；
     · 几何层（输入像元落到哪个输出像元、占多少面积）由 drizzle 决定：a[p→r]；
     · 两层相乘而不是互相烘焙。式 12 是本式在 a=δ（恒等映射）时的特例。
 
@@ -253,8 +253,8 @@ def _detect_stars(img, n: int = 240, bin_: int = 2) -> np.ndarray:
             _m &= (p < 0.90 * _pm)
     x, y, p = x[_m], y[_m], p[_m]
     o = np.argsort(p)[::-1][:n]
-    # 分箱图上第 i 块的中心对应原图 (i+0.5)·bin−0.5；少了这半步，检测点相对
-    # 质心(_centroid) 恒偏 −0.5px，正交帧之间会被放大成 1px 系统偏差
+    # 分箱图上第 i 块的中心对应原图 (i+0.5)·bin-0.5；少了这半步，检测点相对
+    # 质心(_centroid) 恒偏 -0.5px，正交帧之间会被放大成 1px 系统偏差
     # （θ≈180° 的帧因此整体错开 1px，叠出来就是双星/黑心）。
     return np.stack([(x[o] + 0.5) * bin_ - 0.5, (y[o] + 0.5) * bin_ - 0.5], axis=1)
 
@@ -273,7 +273,7 @@ def _rot_hist(sa: np.ndarray, sb: np.ndarray, nb: int = 720, tol: float = 1.0):
     """星点对长度谱 → 旋转角直方图（0.5° 格）
 
     sa 为参考帧星表、sb 为待测帧星表。若 ref = R(θ)·frame + u，则
-    ref 向量方向 = frame 向量方向 + θ，所以直方图峰值角 = −θ（下面取负）。
+    ref 向量方向 = frame 向量方向 + θ，所以直方图峰值角 = -θ（下面取负）。
     返回 (θ_deg, 票数, 峰值格索引, 各数组) —— 数组供下一步找平移用。
     """
     ia, ja, La, Ta = _pair_geo(sa)
@@ -305,7 +305,7 @@ def _rot_hist(sa: np.ndarray, sb: np.ndarray, nb: int = 720, tol: float = 1.0):
     den = a0 - 2 * a1 + a2
     dk = 0.5 * (a0 - a2) / den if abs(den) > 1e-9 else 0.0
     dk = float(np.clip(dk, -0.5, 0.5))
-    theta = -((k + dk) / nb * 360.0)      # 见上：峰值角 = −θ
+    theta = -((k + dk) / nb * 360.0)      # 见上：峰值角 = -θ
     return theta, float(votes[k]), nb, k, (ia, ja, La, Ta), (ib, jb, Lb, Tb, o)
 
 
@@ -1564,7 +1564,7 @@ def _axis_matrix(n_in: int, n_out: int, scale: float, shift: float,
                  pixfrac: float, offset: float) -> sparse.csr_matrix:
     """一维重叠矩阵 (n_out × n_in)：输入像元 j 的 drop 铺到输出像元 k
 
-    输入像元中心在输出坐标 X = (j + 0.5 − shift)·scale + offset
+    输入像元中心在输出坐标 X = (j + 0.5 - shift)·scale + offset
     drop 宽 P = pixfrac·scale（输出像元）；权重 = 重叠长度 / P ⇒ 逐列和为 1。
     """
     P = max(1e-6, float(pixfrac) * float(scale))
@@ -1618,8 +1618,8 @@ def splat(arr: np.ndarray, plan: Dict, i: int, dx: np.ndarray, dy: np.ndarray,
 def _native_band(fs, i: int, j0: int, j1: int, rot) -> np.ndarray:
     """取帧 i 在**已翻转坐标**下的第 j0..j1 行
 
-    180° 翻转后，翻转图的行 r 对应原图行 H−1−r、列 c 对应 W−1−c，
-    所以翻转坐标下的 [j0,j1) 在原图上是 [H−j1, H−j0) 再行列反序。
+    180° 翻转后，翻转图的行 r 对应原图行 H-1-r、列 c 对应 W-1-c，
+    所以翻转坐标下的 [j0,j1) 在原图上是 [H-j1, H-j0) 再行列反序。
     """
     if rot is None or not _is_rot180(rot[i]):
         return fs.strip(i, j0, j1)
@@ -1668,7 +1668,7 @@ def _band_work(Y0Y1):
 def _fast_scale(dev: np.ndarray, goodcol: np.ndarray, bh: int, W: int, block: int = 64) -> np.ndarray:
     """平均绝对偏差估 σ（MAD 的快路径）
 
-    |x−μ| 的期望是 σ·√(2/π) = 0.7979σ，所以 σ ≈ 1.2533·mean|x−μ|。
+    |x-μ| 的期望是 σ·√(2/π) = 0.7979σ，所以 σ ≈ 1.2533·mean|x-μ|。
     比 MAD（中位绝对偏差，需要排序）快 5~7 倍，抗差性略差：
     少数帧拖线会把均值抬高一点，阈值随之变松，属于"少剔"而不是"多啃"。
     """
@@ -1704,7 +1704,7 @@ def _block_mean2d(a: np.ndarray, bh: int, W: int, block: int = 64) -> np.ndarray
 def _winsor_scale(dev: np.ndarray, s_pix: np.ndarray, goodcol: np.ndarray,
                   bh: int, W: int, block: int = 64, k: float = 3.0,
                   st: int = 3) -> np.ndarray:
-    """winsorized 尺度估计：先粗估 σ，把 |x−μ| 截尾到 k·σ，再求均值
+    """winsorized 尺度估计：先粗估 σ，把 |x-μ| 截尾到 k·σ，再求均值
 
     PI 的 winsorized sigma clipping 就是这一步：直接对含离群值的样本求均值，
     均值会被"要剔的那条拖线"抬高、阈值变松（实测剔除率 1.16% → 0.77%）；
@@ -2036,7 +2036,7 @@ def stack_drizzle(fs, R_out: np.ndarray, C: np.ndarray, S: np.ndarray,
     """按输出行分带：每带对全部帧做 drizzle → 排异 → 带权合成
 
     与 stack_strip 的区别（统计上等价、几何上更细）：
-        · 排异在**输出网格**上做：信号项 m·R·(a−天空) 只有在输出分辨率下才
+        · 排异在**输出网格**上做：信号项 m·R·(a-天空) 只有在输出分辨率下才
           和 R 的 2σ 过渡口径一致；
         · 合成分母是 Σ W·c 而不是 mean_i(W)=1：c 自动处理 pixfrac 与边缘覆盖。
 
@@ -2270,7 +2270,7 @@ def _sharp_ref_shift(fs, idx, dx, dy, plan, pixfrac):
 
     参考像只用于定 R 的支撑轮廓（过渡沿 ~5.7px），0.5px 的整数移位误差
     不足以改变支撑边界；换来的是把「66 带 × k 帧散射」换成「k 次 roll + 一次中位」。
-    只在 |θ| < 0.5° 且 |k−1| < 0.005 时启用，否则退回散射路径。
+    只在 |θ| < 0.5° 且 |k-1| < 0.005 时启用，否则退回散射路径。
     """
     H, W = int(plan['H']), int(plan['W'])
     s0, ox, oy = float(plan['s']), float(plan['ox']), float(plan['oy'])

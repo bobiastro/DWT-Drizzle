@@ -162,7 +162,7 @@ def find_line(rate: np.ndarray, logf=print):
 
 def subtract_line(stack: np.ndarray, theta: float, rho: float, half: float = 1.5,
                   seg: int = 24, logf=print):
-    """沿检测到的直线做**加性模型扣除**：分段估计「线上 − 线外」的中位差，再从线上减去。
+    """沿检测到的直线做**加性模型扣除**：分段估计「线上 - 线外」的中位差，再从线上减去。
 
     只改线上 ±half 像素；线外一个字节不动。加性伪迹用减法才是物理正确的
     （替换/填洞会把噪声也改掉）。
@@ -1300,7 +1300,7 @@ def _map_check(img, sampler, nframes, logf, npt=12, half=64, srch=90):
 # 判据：真实加性共模线在**单帧**里也存在且符号一致；由采样/背景/噪声凑出来的
 # 直线在单帧里不存在（符号随机）。做法：等间隔取 n 帧 → 用 drizzle 的逆变换把
 # 画布上的 (θ, ρ) 映射回各帧坐标 → 每帧在 ±off1·w 的带内量
-# amp_j = median(on) − median(off)（on = ±wfac·w，off = off0..off1 倍 w）。
+# amp_j = median(on) - median(off)（on = ±wfac·w，off = off0..off1 倍 w）。
 #
 # 单位问题：帧与叠加的幅度单位不同（每帧 flux 标定 / drizzle 归一），所以判据用
 #   (a) 符号一致率 ≥ frac     —— 共模信号必须同号；随机结构约 0.5
@@ -1412,7 +1412,7 @@ def _line_amp_frame(img, th_f, rho_f, w_f, wfac=1.5, off0=4.0, off1=8.0,
                     search=8.0, K=8):
     """单帧：**一条带子，逐段各自对 δ**。一次 _strip，δ 只在掩膜上滑动。
 
-    返回 (amp, z, dlt)：amp = 各段「自身 δ 下 on−off」的中位；dlt = δ 的中位。
+    返回 (amp, z, dlt)：amp = 各段「自身 δ 下 on-off」的中位；dlt = δ 的中位。
     逐段允许 δ（画布残差沿弦变化，全局单 δ 会把 1 px 宽的带子糊掉）；
     由此带来的 look-elsewhere 由调用方的随机对照线标定。
     """

@@ -3,7 +3,7 @@
 实现《分区权重叠加法的原理与实现》所述算法。三类权重经一个连续分区场融合为
 逐像素权重，再做唯一一次加权平均（式 6、式 7）：
 
-    W[i,r] = C_i^(A·R_r) · S_i^(B·(1−R_r))         再逐像素归一 mean_i(W) = 1
+    W[i,r] = C_i^(A·R_r) · S_i^(B·(1-R_r))         再逐像素归一 mean_i(W) = 1
 
     C_i  帧清晰度权重（帧级标量）  = FWHM_中位 / FWHM_i        越大越锐   式(4)
     S_i  帧信噪比权重（帧级标量）  = σ_中位 / σ_i               越大越干净 式(5)
@@ -93,7 +93,7 @@ ENV_EPS = 16.0       # 分母噪声项（以 σ 为单位）：压住空白天�
                      #   12 组 568 帧全量标定：ε 由 8 增至 16，星点尾部余晖收紧
                      #   0.6%~36%（11/12 组），星核半径与天空噪声不变；再增至 24 收益
                      #   进入测量噪声带，故取 16。
-ENV_P = 1.0          # 形状幂；E 已是 exp(−2r/σ) 量级，1.0 即够，>1 收得更紧
+ENV_P = 1.0          # 形状幂；E 已是 exp(-2r/σ) 量级，1.0 即够，>1 收得更紧
 STAR_GROW = 0.0      # 星点锐帧区外扩（×σ_psf）：最亮星的外扩量，按星点亮度自适应，
                      #   暗星拿 STAR_GROW_FLOOR 的保底、亮星扩满。0 = 关闭（原行为）。
 STAR_GROW_LO_SNR = 20.0    # 自适应外扩的下端：局部峰值 < 该倍数×天空σ → 只拿保底量
@@ -104,14 +104,14 @@ STAR_GROW_FLOOR = 0.5      # 保底系数：拖线长度由风决定、与星点
 TRAIL_AP = 3.7             # 测拖线用的二阶矩口径 = 该倍数 × σ_psf（≈99.9% 的高斯能量）
 TRAIL_QUANTILE = 90.0      # 自动外扩取"逐帧拖线长度"的该百分位：瞄准最糊的那几帧
                            #   （漏进星点分区的正是它们；取中位会被大量好帧稀释）
-R_FLOOR = 0.0        # R 的全局下限：R_eff = R_FLOOR + (1−R_FLOOR)·R
+R_FLOOR = 0.0        # R 的全局下限：R_eff = R_FLOOR + (1-R_FLOOR)·R
 _RDEC = max(1, int(__import__('os').environ.get('DWT_RDEC', '2') or 2))  # R 场降采样倍率（1=全分辨率，2≈4× 提速）
                      #   用于抑制星周亮度平台（"亮—暗—亮"伪影环）。环的幅度取决于
                      #   两区有效 PSF 之差：加全局下限使空白天区也保留部分清晰度偏好，
                      #   糊帧在全图被压低 → 两区 PSF 差缩小 → 环变浅。代价是空白天区
                      #   等效帧数下降（信噪比）。0 = 关闭（朦胧区严格吃满信噪比）。
 R_WIN_MULT = 2.0     # 结构 RMS 的空间窗 = 该倍数 × σ_psf（过大将摊薄点源能量）
-REJ_K = 3.5          # 逐像素排异：|偏差| > κ·1.4826·MAD + m·R·(a_r−天空) 即剔除（a_r = 跨帧中位比较基准）。
+REJ_K = 3.5          # 逐像素排异：|偏差| > κ·1.4826·MAD + m·R·(a_r-天空) 即剔除（a_r = 跨帧中位比较基准）。
                      #   κ 以 σ 为单位（1.4826·MAD = σ 估计）；2 更严，1 会成批误排噪声尾
 _lsp_half = 0.5
 REJ_MAX_FRAC = 1 / 3  # 剔除比例上限：超额被剔帧数 > 该比例 × 总帧数 → 判为共有结构而非
@@ -122,14 +122,14 @@ N_STAR = 120         # 固定星表星数（测 C_i 用；中位数在 100 颗�
 REF_SHARP_N = max(1, int(__import__('os').environ.get('DWT_REF_K', '8') or 8))
                     # 参考像 = 最锐的这么多帧的等权中位（默认 k=8，DWT_REF_K 可覆盖）
 
-# 各阶段的并行进程上限（实际进程数还受"核数−1"与内存预算约束，见 plan_workers）
+# 各阶段的并行进程上限（实际进程数还受"核数-1"与内存预算约束，见 plan_workers）
 #   叠加：每进程持一条条带的临时量，内存随进程数倍增 → 上限保守
 #   读帧：受磁盘带宽约束，多开无益
 #   测星点：每帧仅取星点小窗（约 0.5 MiB），几乎不占内存 → 上限可放宽到核数量级
 CAP_WORKERS = 8
 CAP_FWHM = 12
 #   叠加（drizzle 分带）：内存带宽受限，实测 4/6/8/10 进程为 25.7/23.8/24.8/24.4s
-#   （M81 40 帧 1600² ×2，6 核以上机器），6 最划算；仍受"核数−2"约束
+#   （M81 40 帧 1600² ×2，6 核以上机器），6 最划算；仍受"核数-2"约束
 class _Skip(Exception):
     """内部信号：该 GPU 路径按配置跳过，不是失败，不写日志。"""
 
@@ -671,7 +671,7 @@ class FrameSet:
 
     天空加性平移（off_i）统一在**读出时减**，两种后端一致：
                memmap = 盘上即"曝光归一后"，off_i 读出时减。
-               两种后端给出的数值逐位一致：都只做 D − 常数。
+               两种后端给出的数值逐位一致：都只做 D - 常数。
     """
 
     def __init__(self, n: int, shape: Tuple[int, int], resident: bool,
@@ -1226,10 +1226,10 @@ def measure_fwhm_frame(mm: np.ndarray, i: int, off: np.ndarray,
                        search: int = 0):
     """从帧后端（memmap）直接取星点小窗量 FWHM 中位 —— **不物化整帧**
 
-    一帧 244 MiB，而 120 颗星的小窗合起来才 ~0.5 MiB。先 mm[i] − off 物化整帧
+    一帧 244 MiB，而 120 颗星的小窗合起来才 ~0.5 MiB。先 mm[i] - off 物化整帧
               再切片，等于为了 0.5 MiB 去读写 244 MiB（memmap 后端就是每帧从盘上
               重读 244 MiB）；直接取小窗后这一步几乎免费。
-    数值与 measure_fwhm(mm[i] − off, stars) 等价：两种写法都是"先做一次 float32
+    数值与 measure_fwhm(mm[i] - off, stars) 等价：两种写法都是"先做一次 float32
               减常数、再取同一片"，逐元素减法与切片顺序无关。
     """
     offi = np.float32(off[i])
@@ -1275,8 +1275,8 @@ def measure_flux_frame(mm, i, off, stars, th=0.0, kk=1.0, dx=0.0, dy=0.0,
     """在**本帧**的位置上测星点流量（定孔径、环带平面扣背景）。
 
     (x, y) 是 seed 帧的星表坐标，本帧里同一颗星在
-        X = kk*(cosθ·x − sinθ·y) − dx    Y = kk*(sinθ·x + cosθ·y) − dy
-    （与 drizzle 里 X = k·R·x + u、u = −dx 的约定一致）。
+        X = kk*(cosθ·x - sinθ·y) - dx    Y = kk*(sinθ·x + cosθ·y) - dy
+    （与 drizzle 里 X = k·R·x + u、u = -dx 的约定一致）。
     """
     rad = FLUX_R if r is None else float(r)
     _n, h, w = mm.shape
@@ -1298,8 +1298,8 @@ def measure_flux_frame(mm, i, off, stars, th=0.0, kk=1.0, dx=0.0, dy=0.0,
     inv = 1.0 / float(kk) if float(kk) else 1.0
     out = np.full(len(stars), np.nan, np.float64)
     for j, (x, y) in enumerate(stars):
-        # 星表在 seed(=参考) 帧上；本帧里那颗星在 (1/k)·R(−θ)·(q + d)，
-        # d 即 measure_shifts 给的 dx/dy（X = k·R·x − d 的逆）。
+        # 星表在 seed(=参考) 帧上；本帧里那颗星在 (1/k)·R(-θ)·(q + d)，
+        # d 即 measure_shifts 给的 dx/dy（X = k·R·x - d 的逆）。
         qx, qy = x + float(dx), y + float(dy)
         X = inv * (c * qx + s * qy)
         Y = inv * (-s * qx + c * qy)
@@ -1472,7 +1472,7 @@ def _trail_each(kut, stars: List[Tuple[int, int]], r_ap: float, half: int):
     再配合参考帧（最锐帧）的 λ1 就能反推拖线本身的长度。
 
     口径固定为 TRAIL_AP×σ_psf：逐帧用同一个口径，跨帧的 λ1 才可比。
-    方向用 (mx−my, 2·mxy) 的矢量和——它就是 2×PA 的方向，避免角度折叠。
+    方向用 (mx-my, 2·mxy) 的矢量和——它就是 2×PA 的方向，避免角度折叠。
     """
     yy, xx = np.mgrid[-half:half + 1, -half:half + 1]
     rr = np.hypot(xx, yy)
@@ -1543,7 +1543,7 @@ def _r_envelope(sref: np.ndarray, sigma_psf: float, env_win_mult: float = 2.0,
                 env_eps: float = 3.0, env_p: float = 1.0,
                 r_blur: float = 0.0, r_mode: str = 'max',
                 r_win: float = 0.0, r_k: float = 3.0) -> np.ndarray:
-    """R = **亮度归一包络**：E = (I−sky) / local_max(I−sky, 窗≈4σ_psf)
+    """R = **亮度归一包络**：E = (I-sky) / local_max(I-sky, 窗≈4σ_psf)
 
     包络规格由以下约束唯一确定 —— **R 必须在 ≲4σ_psf 内从 1 落到 0**：
         · 无亮度平台：过渡落在 2~4σ_psf 内则平台降幅回到基线，落到 5σ_psf 外就出现平台
@@ -1553,11 +1553,11 @@ def _r_envelope(sref: np.ndarray, sigma_psf: float, env_win_mult: float = 2.0,
       同一个阈值在不同目标上落到的 σ_psf 倍数会漂 → 换目标就得重标定，甚至锐化整个失效。
 
     E 的关键性质：对高斯星点，窗内极大就是峰值 I0，于是
-        E(r) = I(r)/I0 = exp(−r²/2σ²)（r 小于半个窗时）
-        更一般地 E(r) = I(r)/I(max(0, r−2σ)) = exp(−2r/σ + 2)
+        E(r) = I(r)/I0 = exp(-r²/2σ²)（r 小于半个窗时）
+        更一般地 E(r) = I(r)/I(max(0, r-2σ)) = exp(-2r/σ + 2)
       **只含 r/σ_psf，与峰值亮度无关** → 亮星暗星得到同一条径向曲线 → 换目标不漂。
       数值上：核心 1.0、2σ_psf 处 0.135、3σ_psf 处 0.011 → 过渡在 3σ_psf 内完成 ✓
-      空白天区：I−sky ≈ 噪声，local_max ≈ 3~4σ 的噪声极大 → E ≈ 0.2~0.3，
+      空白天区：I-sky ≈ 噪声，local_max ≈ 3~4σ 的噪声极大 → E ≈ 0.2~0.3，
         再被 env_eps·σ 项压到接近 0 → 朦胧区严格吃满信噪比 ✓
       平滑亮星云：local_max ≈ 自身 → E ≈ 1 → 该区退化为"全局清晰度加权"（经典做法）。
         这不是缺陷：那里 R 空间上近乎常数 → 无 λ' → 不产生平台/环，代价只是 N_eff。
@@ -1581,7 +1581,7 @@ def _r_envelope(sref: np.ndarray, sigma_psf: float, env_win_mult: float = 2.0,
             _E = np.power(_E, float(env_p))
         return _E, _loc, max(sig, 1e-30)
     if str(r_mode).lower() == 'ctn':
-        # 对比度-噪声（绝对判据）：R = clip((bp − 0.8σ) / ((k−0.8)σ), 0, 1)
+        # 对比度-噪声（绝对判据）：R = clip((bp - 0.8σ) / ((k-0.8)σ), 0, 1)
         # bp 为 r_win 窗的带通（局部均值扣除）；σ 是 bp 的全图稳健噪声。
         # 与 max/band 的区别：不再用"窗内极大"归一 ⇒ 暗弱纤维不会被旁边的星峰压成 0；
         # k 以"局部噪声倍数"给出，是跨目标可迁移的无量纲判据。
@@ -1624,7 +1624,7 @@ def _grow_support(R: np.ndarray, radius_px: float) -> np.ndarray:
     """把 R 的支撑沿径向向外平移 radius_px（形态学膨胀 + 高斯羽化）
 
     为什么是"平移"而不是"整体抬升"：R 的等值线（尤其是 0.5）当前贴在参考
-    星点上；对高斯星点，用半宽 h 的极大值滤波后 R_new(r) = R(r−h)，0.5 等值线
+    星点上；对高斯星点，用半宽 h 的极大值滤波后 R_new(r) = R(r-h)，0.5 等值线
     正好外移 h 像素，且径向曲线形状不变（不会把整片天空一起抬高）。
     h 之外立刻回到原值，故空白天区的信噪比不受影响；边界再用 σ=h/2 的高斯
     羽化，避免方形膨胀在过渡带留下台阶（星周「亮—暗—亮」环的来源之一）。
@@ -1648,9 +1648,9 @@ def _grow_support_adaptive(R: np.ndarray, grow_px: float, peak: np.ndarray,
     就是 g=3~4 时看到的星周低信噪/发暗区。物理上需要的只是：**把过渡圈推到
     "这颗星自己已经暗到看不见"的半径**，而那个半径随亮度增大。
 
-    映射：t = clip( (log10(峰高/天空σ) − log10(LO)) / (log10(HI) − log10(LO)), 0, 1 )
+    映射：t = clip( (log10(峰高/天空σ) - log10(LO)) / (log10(HI) - log10(LO)), 0, 1 )
         峰值 <LO(=20σ) → t=0；峰值 ≥HI(=1000σ) → t=1。
-        外扩量 h = grow_px · (FLOOR + (1−FLOOR)·t)：
+        外扩量 h = grow_px · (FLOOR + (1-FLOOR)·t)：
           · FLOOR 这部分是**保底**。拖线长度由风（赤道仪抖动）决定、与星点亮度无关，
             所以每颗星都要拿到足以盖住自身拖线的那部分；纯按亮度归零时实测中等亮星
             的伸长率从 0.10 退回 0.15，等于白做。
@@ -1815,7 +1815,7 @@ def build_r_field(sref: np.ndarray, sigma_psf: float,
         grow_mean = float(t[sub][core].mean()) * grow_px if bool(core.any()) else 0.0
         del loc
 
-    # 全局下限：R_eff = floor + (1−floor)·R。见 R_FLOOR 常量处的推导依据。
+    # 全局下限：R_eff = floor + (1-floor)·R。见 R_FLOOR 常量处的推导依据。
     if r_floor and r_floor > 0:
         f = min(float(r_floor), 0.95)
         R = f + (1.0 - f) * R
@@ -1843,11 +1843,11 @@ def build_r_field(sref: np.ndarray, sigma_psf: float,
 def strip_weights(C: np.ndarray, S: np.ndarray, R: np.ndarray,
                   A: float, B: float, T=None, fp: float = 0.0,
                   beta: float = 0.0, cap: float = 0.0) -> np.ndarray:
-    """W[i,r] = C_i^(A·R_r) · S_i^(B·(1−R_r))，并逐像素归一使 mean_i(W) = 1
+    """W[i,r] = C_i^(A·R_r) · S_i^(B·(1-R_r))，并逐像素归一使 mean_i(W) = 1
 
     融合式的形状选择依据（式 6、式 7）：
         · 幂律乘法 → 两端行为干净可解释：R=1 只看清晰度，R=0 只看信噪比
-        · 指数上线性插值（A·R 与 B·(1−R)）→ R 连续变化时 W 连续变化，无台阶、无拼接痕迹
+        · 指数上线性插值（A·R 与 B·(1-R)）→ R 连续变化时 W 连续变化，无台阶、无拼接痕迹
         · B=2 不是调出来的：加权平均方差最小 ⇔ W ∝ 1/σ² ⇔ S²（S = σ_中位/σ_i）
         · A 是唯一需要标定的数：它决定"细节区愿意用多少信噪比换解析力"
     逐像素归一 mean_i(W)=1 保证加权平均不改变总曝光量（成品背景水平与
@@ -1899,11 +1899,11 @@ def stack_strip(D: np.ndarray, W: np.ndarray, R: Optional[np.ndarray] = None,
     """排异 + 唯一一次加权平均：S = Σ W·D / Σ W
 
     核心思想：**豁免余量不靠任何经验常数或代理量，而是逐条带从数据里测出"真实分歧的上界"**：
-        m = median_i  P99_{R>0.5 像素}( |D_i−a_r| / (a_r−sky) )
+        m = median_i  P99_{R>0.5 像素}( |D_i-a_r| / (a_r-sky) )
     即每帧在细节像素上"偏差/信号"的 P99（伪迹只占极少数像素，动不了 P99），再跨帧取
     中位数（个别帧上的伪迹/坏像素动不了中位数）。m 即该条带由数据给出的真实视宁度分歧上界
     ——天然包含视场梯度、混星、PSF 形状误差等一切真实效应，换数据自动跟随，零移植成本。
-        阈值(r) = κ·1.4826·MAD(跨帧|偏差|) + m·R_r·(a_r−sky)     （a_r = 跨帧中位比较基准）
+        阈值(r) = κ·1.4826·MAD(跨帧|偏差|) + m·R_r·(a_r-sky)     （a_r = 跨帧中位比较基准）
         · 天空/朦胧区 R≈0 → 纯 κσ clipping（κ 以 σ 为单位，MAD·1.4826=σ 估计）；
           中位数基准对多帧伪迹汇合免疫（个别帧污染一处不拉走基准）。
         · 细节区：偏差 ≤ m·信号 的是真实分歧（按构造豁免，星点零损伤）；
@@ -2061,7 +2061,7 @@ _MEM: Dict[str, object] = {}      # 工作进程内：帧后端访问，由 _wor
 
 
 def plan_workers(per_worker_bytes: int, what: str = '', cap: int = CAP_WORKERS) -> int:
-    """进程数 = min(核数−1, cap, 可用内存 ÷ 每进程需求)
+    """进程数 = min(核数-1, cap, 可用内存 ÷ 每进程需求)
 
     cap 按阶段给（见 CAP_* 常数）：内存型阶段（叠加）受内存约束、cap 小；
                算力型阶段（测星点，只取星点小窗）几乎不占内存，cap 可放到核数级别。
@@ -2419,7 +2419,7 @@ def _ca_shift_axis(a: np.ndarray, s: float, axis: int) -> np.ndarray:
 
 
 def _ca_estimate(G: np.ndarray, R: np.ndarray, B: np.ndarray, log, n_star: int = 60):
-    """用亮星重心估 (R−G)、(B−G) 的亚像素偏移，返回 ((dyR,dxR),(dyB,dxB))。"""
+    """用亮星重心估 (R-G)、(B-G) 的亚像素偏移，返回 ((dyR,dxR),(dyB,dxB))。"""
     try:
         from scipy import ndimage
     except Exception:
@@ -2492,7 +2492,7 @@ def _find_cfa_ref(photos: Path) -> Optional[Path]:
 
 
 def _ca_from_fs(fs, pattern: str, log, n_star: int = 50):
-    """在帧组首帧上估 (R−G)、(B−G) 偏移：判断这套系统有没有明显色差。"""
+    """在帧组首帧上估 (R-G)、(B-G) 偏移：判断这套系统有没有明显色差。"""
     try:
         _src = np.asarray(fs.frame(0), np.float32)
         R = _cfa.plane(_src, pattern, 'R')
@@ -3276,7 +3276,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     # A 完全按用户填的走（彩机/黑白都不再自动改），选项栏下方给了建议值。
     # 但真 CFA 下 A>6 会让「最锐的那一帧」在逐像素上独占权重：实测用户 78 帧 B、
     # A=10 时单帧最大权重是均值的 409 倍，成品在小星周围出现 8.5%~28.6% 的
-    # 低于天空 −2σ 的像素（A=6 时 0.5%，A=4 时 0.3%）。这里对真 CFA 设上限 6，
+    # 低于天空 -2σ 的像素（A=6 时 0.5%，A=4 时 0.3%）。这里对真 CFA 设上限 6，
     # 并在日志里说明；要保留原值请设 DWT_A_KEEP=1。
     if _CFA.get('pattern') and A > 6.0 and os.environ.get('DWT_A_KEEP', '') != '1':
         log(f'[CFA] 清晰度 A 上限 6：你填的 {A:g} 会让最锐帧在逐像素上独占权重'
@@ -3461,7 +3461,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     # 为什么不是降权：strip_weights 逐像素归一 mean_i(W)=1，某个画布像素只有这一帧
     # 覆盖时（素材抖动到 ±2900 px，这种像素很多），分母只剩它自己，权重被整体约掉，
     # 拖尾照样原样印进成品。实测把 idx25 的 C 从 1.37993 压到 0.896952（份额 0.656%
-    # → 0.0096%，68×），沿线幅度只从 +2.97e-5 降到 +2.49e-5（−16%）；而整帧不参与
+    # → 0.0096%，68×），沿线幅度只从 +2.97e-5 降到 +2.49e-5（-16%）；而整帧不参与
     # 叠加时同一条线降到 +1.03e-6。所以这里按"帧"剔除，不做标量惩罚。
     _tdrop = np.zeros(n, bool)
     _trail_info = {}
@@ -3670,7 +3670,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
 
     # ---- 拖线长度：逐帧二阶矩，供 star_grow 自动取值 ----
     #   帧级 λ1（沿长轴的方差）减去参考帧（最锐 k 帧）的 λ1，剩下的就是拖线本身
-    #   贡献的方差；均匀拖线长度 L 满足 λ1−λ1_ref = L²/12。
+    #   贡献的方差；均匀拖线长度 L 满足 λ1-λ1_ref = L²/12。
     star_grow = 0.0
     t2 = time.perf_counter()
     if star_grow_pct > 0:
@@ -3831,7 +3831,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                 '2× 上采样约需 4 倍帧数；pixfrac 保持你填的 {0:g}'.format(drz_p))
     if _CFA.get('pattern') and not drz_on:
         # 彩机素材不走 drizzle 时，四个 CFA 相位只能按整像素落点，抖动信息全部丢失，
-        # 星点周围会留下低于天空的坑（实测用户 78 帧 B：28.6% 的小星有 −2σ 像素，
+        # 星点周围会留下低于天空的坑（实测用户 78 帧 B：28.6% 的小星有 -2σ 像素，
         # 同样参数开 drizzle 后降到 3%）。这里直接强制开启，并说明原因。
         drz_on = True
         log('[CFA] 彩机素材必须做 drizzle：已自动启用（1× 网格，pixfrac 按你填的）——'
