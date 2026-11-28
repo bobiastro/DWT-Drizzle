@@ -125,6 +125,47 @@ impl Plan {
         }
     }
 
+    /// Cut an `n x n` window out of this canvas, returning the canvas that maps
+    /// that window onto `0..n` plus the window's top-left corner.
+    ///
+    /// `--crop` is a property of the *output* raster, not of the input frames
+    /// (Python's `--frame` mode keeps the frames whole and slices the canvas
+    /// right before saving, `core/pws.py:5370`).  Every sample lands at
+    /// `plan.s * (...) + plan.ox`, so moving the origin by `-x0/-y0` and
+    /// shrinking the extent *is* "cut this rectangle out": the per-frame
+    /// geometry is untouched, samples that fall outside the window are simply
+    /// clipped, and the ones inside keep their sub-pixel phase exactly.
+    ///
+    /// The window is centred on `center` (canvas pixels, `(y, x)`) when given and
+    /// on the canvas centre otherwise, clamped into the canvas the way Python's
+    /// save-time slice does it (`max(0, min(c - n/2, dim - n))`).
+    pub fn crop_window(
+        &self,
+        center: Option<(usize, usize)>,
+        n: usize,
+    ) -> Result<(Plan, (usize, usize)), String> {
+        if n == 0 {
+            return Ok((*self, (0, 0)));
+        }
+        if n > self.w.min(self.h) {
+            return Err(format!("--crop {n} 超出输出画布 {}x{}，无法切片出图", self.w, self.h));
+        }
+        // Clamp with `saturating_sub`: a caller-supplied centre past the far edge
+        // must saturate there, and `usize as i64` would wrap through -1 instead.
+        let (ccy, ccx) = center.unwrap_or((self.h / 2, self.w / 2));
+        let half = n / 2;
+        let y0 = ccy.saturating_sub(half).min(self.h - n);
+        let x0 = ccx.saturating_sub(half).min(self.w - n);
+        let out = Plan {
+            s: self.s,
+            ox: self.ox - x0 as f32,
+            oy: self.oy - y0 as f32,
+            w: n,
+            h: n,
+        };
+        Ok((out, (y0, x0)))
+    }
+
     /// Factor between the canvas and [`Plan::coarsen`]'s grid for a canvas whose
     /// pitch is `pitch` input pixels: the coarsening that puts one input pixel on
     /// one cell.  Rounds to the nearest integer and refuses factors below 2, so

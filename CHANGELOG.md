@@ -1,3 +1,7 @@
+## 2.7.125-D
+- `--canvas-from`/`--frame` 与 `--crop` 可同时使用：crop 落在输出栅格上（`Plan::crop_window`，原点平移 + 尺寸切片），176° 翻转帧 800×800 corr 1.000000、FWHM 0.00%；去掉 crop 与 2.7.124-D 逐字节相同。
+- 修复 crop 窗口 clamp：`usize::MAX` 经 `as i64` 变 −1 使远角失效；改 `saturating_sub`。
+- GUI 新增 `--dump-pages <DIR>`：程序自行切页并截图（四页 + 关于），便于验收与取证。
 # 版本日志（DWT · Drizzle）
 
 按阶段记录，重点写“为什么改”和“改完的可验证结果”，细节见各自提交与 `docs/`。

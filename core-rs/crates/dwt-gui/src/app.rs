@@ -68,6 +68,85 @@ enum JobEvent {
     Done(Result<JobResult, String>),
 }
 
+// ───────────────────────── 自证模式（--dump-pages） ─────────────────────────
+
+/// 固定文件名，顺序与 [`DumpPages::tab`] 对应。
+const DUMP_NAMES: [&str; 5] = [
+    "01_common.png",
+    "02_advanced.png",
+    "03_eval.png",
+    "04_maps.png",
+    "05_about.png",
+];
+/// 每页先渲染这么多帧（第一帧布局、后两帧稳定），再请求截图。
+const DUMP_SETTLE_FRAMES: u32 = 3;
+/// 兜底：超过这个时间还没截完就直接失败退出，避免挂死。
+const DUMP_DEADLINE: Duration = Duration::from_secs(60);
+
+static DUMP_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// 解析 `--dump-pages <DIR>` / `--dump-pages=<DIR>`；不认识的其他参数原样忽略。
+pub fn parse_dump_pages(args: &[String]) -> Result<Option<PathBuf>, String> {
+    let mut dir: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--dump-pages" {
+            match args.get(i + 1) {
+                Some(v) => dir = Some(PathBuf::from(v)),
+                None => return Err("--dump-pages 后面缺少目录".into()),
+            }
+            i += 2;
+        } else if let Some(v) = a.strip_prefix("--dump-pages=") {
+            if v.is_empty() {
+                return Err("--dump-pages 后面缺少目录".into());
+            }
+            dir = Some(PathBuf::from(v));
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(dir)
+}
+
+/// 由 `main` 在 `run_native` 之前调用，把目标目录交给 [`DrizzleApp::new`]。
+pub fn set_dump_dir(dir: PathBuf) {
+    let _ = DUMP_DIR.set(dir);
+}
+
+struct DumpPages {
+    dir: PathBuf,
+    index: usize,
+    frames_on_page: u32,
+    requested: bool,
+    written: Vec<(String, [usize; 2], u64)>,
+    started: Instant,
+}
+
+impl DumpPages {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            index: 0,
+            frames_on_page: 0,
+            requested: false,
+            written: Vec::new(),
+            started: Instant::now(),
+        }
+    }
+
+    /// 第 `index` 张图对应的页面；「关于」叠在权重场那一页上。
+    fn tab(&self) -> Tab {
+        match self.index {
+            0 => Tab::Common,
+            1 => Tab::Advanced,
+            2 => Tab::Eval,
+            _ => Tab::Maps,
+        }
+    }
+}
+
 pub struct DrizzleApp {
     params: Params,
     tab: Tab,
@@ -106,6 +185,8 @@ pub struct DrizzleApp {
     exit_after_job: bool,
     exit_at: Option<Instant>,
     frames: u32,
+    /// `Some(..)` = 自证模式：不靠人点，自己切页截图然后退出。
+    dump: Option<DumpPages>,
 }
 
 impl DrizzleApp {
@@ -130,7 +211,12 @@ impl DrizzleApp {
                 "maps" | "权重场" => Tab::Maps,
                 _ => Tab::Common,
             },
-            license_open: std::env::var("DWT_NO_STARTUP_DIALOG").map(|v| v != "1").unwrap_or(true),
+            license_open: if DUMP_DIR.get().is_some() {
+                // 自证模式不要开机说明窗挡住页面
+                false
+            } else {
+                std::env::var("DWT_NO_STARTUP_DIALOG").map(|v| v != "1").unwrap_or(true)
+            },
             about_open: false,
             help_open: false,
             monitor_open: false,
@@ -168,6 +254,7 @@ impl DrizzleApp {
             exit_after_job: std::env::var("DWT_GUI_EXIT_AFTER_JOB").map(|v| v == "1").unwrap_or(false),
             exit_at: None,
             frames: 0,
+            dump: DUMP_DIR.get().cloned().map(DumpPages::new),
         };
         app.log.push(LogLine { text: format!("DWT · Drizzle {}  |  原生 Rust GUI", license::VERSION), kind: LogKind::Ok });
         app.log.push(LogLine { text: "分区加权叠加 · Drizzle 几何重采样".into(), kind: LogKind::Dim });
@@ -1287,11 +1374,100 @@ impl DrizzleApp {
             self.monitor_open = open;
         }
     }
+
+    /// 自证模式的一帧：收图 → 换页 → 请求下一张。
+    fn dump_tick(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.dump.take() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&d.dir);
+
+        // 1) 收上一帧请求的截图（eframe 在 paint 之后 read_pixels，下一帧作为事件送进来）
+        let shot = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(img) = shot {
+            if d.requested {
+                let name = DUMP_NAMES[d.index].to_string();
+                let path = d.dir.join(&name);
+                let [w, h] = img.size;
+                let raw: &[u8] = img.as_raw();
+                let bytes = raw.len() as u64;
+                if let Err(e) =
+                    image::save_buffer(&path, raw, w as u32, h as u32, image::ExtendedColorType::Rgba8)
+                {
+                    self.dump_fail(&d, format!("写 {} 失败：{e}", path.display()));
+                    return;
+                }
+                // 顺手自检：整幅图是否纯色（纯色说明没渲染出东西）
+                let uniform = img.pixels.windows(2).all(|p| p[0] == p[1]);
+                self.log.push(LogLine {
+                    text: format!(
+                        "[dump] {name}  {w}x{h}  {bytes} B{}",
+                        if uniform { "  ← 纯色！" } else { "" }
+                    ),
+                    kind: if uniform { LogKind::Err } else { LogKind::Ok },
+                });
+                d.written.push((name, [w, h], bytes));
+                d.index += 1;
+                d.frames_on_page = 0;
+                d.requested = false;
+            }
+        }
+
+        // 2) 五张都拿到 → 写报告，退出 0
+        if d.index >= DUMP_NAMES.len() {
+            dump_write_report(&d);
+            std::process::exit(0);
+        }
+
+        // 3) 换页（最后一页把「关于」弹窗叠上去）
+        self.tab = d.tab();
+        self.about_open = d.index == 4;
+        self.license_open = false;
+
+        // 4) 页面稳定若干帧后再请求截图
+        if !d.requested && d.frames_on_page >= DUMP_SETTLE_FRAMES {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            d.requested = true;
+        }
+        d.frames_on_page = d.frames_on_page.saturating_add(1);
+
+        if d.started.elapsed() > DUMP_DEADLINE {
+            self.dump_fail(&d, format!("超时（{:.1}s）", d.started.elapsed().as_secs_f32()));
+            return;
+        }
+
+        ctx.request_repaint();
+        self.dump = Some(d);
+    }
+
+    fn dump_fail(&mut self, d: &DumpPages, why: String) {
+        self.log.push(LogLine { text: format!("[dump] 失败：{why}"), kind: LogKind::Err });
+        dump_write_report(d);
+        std::process::exit(3);
+    }
+}
+
+fn dump_write_report(d: &DumpPages) {
+    let mut s = String::from("DWT · Drizzle 自证截图\n");
+    for (name, [w, h], bytes) in &d.written {
+        s.push_str(&format!("{name}\t{w}x{h}\t{bytes} B\n"));
+    }
+    s.push_str(&format!("elapsed\t{:.2} s\n", d.started.elapsed().as_secs_f32()));
+    let _ = std::fs::write(d.dir.join("_dump_report.txt"), s);
 }
 
 impl eframe::App for DrizzleApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frames += 1;
+        if self.dump.is_some() {
+            // 自证模式：自己切页、自己截图，不走人的点击
+            self.dump_tick(ctx);
+        }
         self.poll_job(ctx);
         if self.state == "运行中" {
             ctx.request_repaint_after(Duration::from_millis(120));

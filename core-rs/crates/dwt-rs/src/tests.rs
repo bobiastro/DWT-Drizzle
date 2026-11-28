@@ -366,3 +366,97 @@ fn gpu_matches_cpu_stack() {
     }
 }
 
+
+/// `--canvas-from F --crop N`: the crop is a window on the *output* raster, so it
+/// must be a pure translation of the grid origin — the reference's `N x N`
+/// rectangle lands on exactly `0..N`, and a 176°-flipped 1.02x frame keeps riding
+/// the same transform (nothing but `ox/oy/W/H` may change, or the stack goes
+/// soft/misplaced instead of just smaller).
+#[test]
+fn crop_window_maps_the_reference_rectangle_to_zero() {
+    // 2x master of a 2758x2204 frame — the shape `PWS_dwt-a20-max-4.xisf` has.
+    let plan = Plan { s: 1.0, ox: 0.0, oy: 0.0, w: 5516, h: 4408 };
+    let n = 800usize;
+    let (cp, (c0y, c0x)) = plan.crop_window(None, n).expect("800 fits in 5516x4408");
+    assert_eq!(
+        (c0x, c0y),
+        (5516 / 2 - n / 2, 4408 / 2 - n / 2),
+        "window is the canvas-centred one, like Python's `_ccx - _cn//2`"
+    );
+    assert_eq!((cp.s, cp.w, cp.h), (1.0, n, n), "only the extent changes");
+    assert_eq!(
+        (cp.ox, cp.oy),
+        (-(c0x as f32), -(c0y as f32)),
+        "origin shift = -crop corner, nothing else"
+    );
+
+    // Canvas point -> output coordinate: exactly `drizzle::scatter`'s cx/cy.
+    let to_out = |x: f32, y: f32| (cp.s * x + cp.ox, cp.s * y + cp.oy);
+    let corners = [
+        (c0x as f32, c0y as f32, (0.0f32, 0.0f32)),
+        (c0x as f32 + n as f32, c0y as f32, (n as f32, 0.0)),
+        (c0x as f32, c0y as f32 + n as f32, (0.0, n as f32)),
+        (c0x as f32 + n as f32, c0y as f32 + n as f32, (n as f32, n as f32)),
+    ];
+    for (cx, cy, want) in corners {
+        let (ox, oy) = to_out(cx, cy);
+        assert!(
+            (ox - want.0).abs() < 1e-3 && (oy - want.1).abs() < 1e-3,
+            "reference ({cx},{cy}) -> ({ox},{oy}), want {want:?}"
+        );
+        // ... and every corner stays inside the N x N raster (±1 px border).
+        assert!(
+            (-1.0..=n as f32 + 1.0).contains(&ox) && (-1.0..=n as f32 + 1.0).contains(&oy),
+            "corner ({ox},{oy}) escaped [-1, {}]",
+            n + 1
+        );
+    }
+    // A pixel just outside the window must fall outside the raster: the cut is a
+    // real cut, not a rescale of the whole canvas into N x N.
+    let (bxl, byl) = to_out(c0x as f32 - 1.0, c0y as f32);
+    assert!(bxl < 0.0 && byl.abs() < 1e-6, "left border leaked to {bxl}");
+    let (bxr, _) = to_out(c0x as f32 + n as f32 + 1.0, c0y as f32);
+    assert!(bxr > n as f32, "right border leaked to {bxr}");
+
+    // The frame geometry itself must be untouched: put a 176°-flipped, 1.02x
+    // frame on this canvas (frame = half the canvas, centred) and check that the
+    // window it must fill is still fully covered — no black corner introduced.
+    let (th, k) = (176.0f32.to_radians(), 1.02f32);
+    let (ct, st) = (th.cos(), th.sin());
+    let (fw, fh) = (plan.w as f32 / 2.0, plan.h as f32 / 2.0);
+    let mut sim = crate::register::Sim::identity();
+    sim.theta = 176.0;
+    sim.k = k;
+    sim.ux = plan.w as f32 / 2.0 - k * (ct * fw / 2.0 - st * fh / 2.0);
+    sim.uy = plan.h as f32 / 2.0 - k * (st * fw / 2.0 + ct * fh / 2.0);
+    // Frame -> canvas, and back (R^T is R^-1 for a rotation).
+    let to_canvas = |x: f32, y: f32| {
+        (k * (ct * x - st * y) + sim.ux, k * (st * x + ct * y) + sim.uy)
+    };
+    let to_frame = |cx: f32, cy: f32| {
+        let (a, b) = ((cx - sim.ux) / k, (cy - sim.uy) / k);
+        (ct * a + st * b, -st * a + ct * b)
+    };
+    for (cx, cy) in [(c0x as f32, c0y as f32), (c0x as f32 + n as f32, c0y as f32 + n as f32)] {
+        let (fx, fy) = to_frame(cx, cy);
+        assert!(
+            fx > 0.0 && fx < fw && fy > 0.0 && fy < fh,
+            "window corner ({cx},{cy}) falls outside the frame at ({fx},{fy})"
+        );
+        let (bx, by) = to_canvas(fx, fy);
+        assert!((bx - cx).abs() < 1e-2 && (by - cy).abs() < 1e-2, "round trip {bx},{by} vs {cx},{cy}");
+    }
+
+    // The window is clamped into the canvas and refuses to stick out.
+    let (cl, (cy0, cx0)) = plan.crop_window(Some((0, 0)), n).expect("corner centre");
+    assert_eq!((cx0, cy0), (0, 0));
+    assert_eq!((cl.ox, cl.oy), (0.0, 0.0));
+    // `usize::MAX` used to wrap to -1 through `usize as i64` and clamp to 0.
+    let (cr, (cy2, cx2)) = plan.crop_window(Some((usize::MAX, usize::MAX)), n).expect("far centre");
+    assert_eq!((cr.ox, cr.oy), (-((plan.w - n) as f32), -((plan.h - n) as f32)));
+    assert_eq!((cx2, cy2), (plan.w - n, plan.h - n));
+    assert!(plan.crop_window(None, plan.w + 1).is_err(), "crop bigger than the canvas must fail");
+    // `--crop 0` is the whole canvas, unchanged.
+    let (same, at) = plan.crop_window(None, 0).expect("crop 0");
+    assert_eq!((same.w, same.h, same.ox, same.oy, at), (plan.w, plan.h, 0.0, 0.0, (0, 0)));
+}

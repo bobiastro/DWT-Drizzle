@@ -522,8 +522,13 @@ const USAGE: &str = "dwt-rs --photos <dir> --out <dir> --tag t --limit N --crop 
 already-aligned input (--aligned 1 -- say so only when the frames are registered):
   Registration is the default (`--aligned 0`).  `--aligned 1` skips it and adds
   the frames at a fixed offset; use it only for input you know is aligned.
-  --crop N        cut an N x N window out of every frame; matches Python's crop
-                  path bit for bit.
+  --crop N        N > 0 keeps an N x N window.  On `--aligned 1` (1:1) input it
+                  cuts every frame, bit for bit the old path.  On a drizzled or
+                  `--canvas-from` product it cuts the *output* canvas instead:
+                  the frames stay whole, the window is centred on `--center`
+                  (default: the canvas centre) and the product is N x N — the
+                  same save-time slice Python's `--frame` mode does.
+                  `--crop 0` (the default) keeps the whole canvas.
 registration (the default; --register 1 is an explicit alias):
   --canvas-from F adopt the W/H of a reference stack; registration turns on
                   automatically.  Hard check, not a resize: the run aborts
@@ -534,10 +539,6 @@ registration (the default; --register 1 is an explicit alias):
   --ref-frame N   the frame that is the identity of the similarity chain.
   --drop-mul F    drizzle drop side in output pixels; defaults to 2.0 when
                   rotating (core/drizzle.py:1867) and 1.0 otherwise.
-  NOTE: --crop N (N > 0) plus registration is REFUSED on purpose, exit code 1
-  and no output file: Python's crop builds a shift bounding box plus a centre
-  crop, so a plain input-window crop would silently emit a different region.
-  Pass --canvas-from, or use --aligned 1.
   -V, --version   print the release string and exit.";
 
 
@@ -584,11 +585,41 @@ fn pick_filter(files: &mut Vec<PathBuf>, a: &Args) {
     }
 }
 
+/// `--crop N` is a window on the *output* raster whenever the product has one:
+/// a `--canvas-from` reference fixes the grid, and a registered/drizzled run
+/// builds a shift-bounding-box grid.  In those cases the frame pixels are what
+/// the canvas is built *from*, so cutting them first would leave the very region
+/// the crop asks for uncovered — Python's `--frame` mode says the same thing
+/// (`core/pws.py:3307`: 输入帧不裁，N×N 在保存时按画布坐标切).  Only the
+/// `--aligned 1` (already-registered, 1:1) product takes `--crop` on the input
+/// window, which keeps that path bit-identical.
+fn crop_on_output(a: &Args) -> bool {
+    if a.crop == 0 {
+        return false;
+    }
+    if a.canvas_from.is_some() {
+        return true;
+    }
+    let reg = match a.register {
+        Some(v) => v,
+        None => !a.aligned,
+    };
+    // `--aligned 1` on its own is Python's 1:1 path: the crop is a window on the
+    // frames (and `--drizzle-scale` then zooms that window), so keep it there.
+    reg || a.geom.is_some()
+}
+
 /// Python's `resolve_center()`: median centre of an extended source over eight
 /// frames spread across the *whole* list, before `--limit` truncates it.
 fn resolve_center(files: &[PathBuf], a: &Args) -> Result<Option<(usize, usize)>, String> {
     if a.crop == 0 {
         return Ok(None);
+    }
+    // An output-raster crop is centred on the *canvas*, so a centre guessed in
+    // frame pixels would land in the wrong place; only an explicit `--center`
+    // (already read as canvas pixels, as in Python) applies.
+    if crop_on_output(a) {
+        return Ok(a.center);
     }
     if let Some(c) = a.center {
         return Ok(Some(c));
@@ -1014,10 +1045,23 @@ fn run_pipeline(
     println!("[帧] 读 {:.2}s  曝光中位 {t_med}s  内部归一 {EXPTIME_REF}s", t_read);
 
     // ---- crop centre ------------------------------------------------------
+    // Two different crops share the flag.  On an already-aligned 1:1 product it
+    // is a window on every *input* frame (bit-for-bit the old path).  On a
+    // drizzled / `--canvas-from` product the canvas is built from whole frames
+    // and the window is cut out of the *output* raster at the very end, exactly
+    // like `crop_window` does below — so the frames must stay whole here.
     let (fh, fw) = (full[0].h, full[0].w);
-    let crop = if a.crop == 0 { 0 } else { a.crop.min(fh).min(fw) };
+    let crop_win = crop_on_output(a);
+    let crop = if crop_win || a.crop == 0 { 0 } else { a.crop.min(fh).min(fw) };
     let (cy, cx) = center.unwrap_or((fh / 2, fw / 2));
-    println!("[裁] 中心 ({cy},{cx})  窗口 {crop}x{crop}");
+    if crop_win {
+        println!(
+            "[裁] --crop {} 作用于输出栅格：输入帧整幅参与叠加，出图后按画布坐标切 {}x{}",
+            a.crop, a.crop, a.crop
+        );
+    } else {
+        println!("[裁] 中心 ({cy},{cx})  窗口 {crop}x{crop}");
+    }
 
     let (h, w) = if crop == 0 { (fh, fw) } else { (crop, crop) };
     let y0 = if crop == 0 { 0 } else { (cy as i64 - crop as i64 / 2).max(0).min((fh - crop) as i64) as usize };
@@ -1315,12 +1359,9 @@ fn run_pipeline(
         println!("[画布] --canvas-from 需要配准；已自动启用 --register 1");
         register = true;
     }
-    if a.crop > 0 && canvas.is_none() && register && std::env::var("DWT_RS_ALLOW_CROP_REG").is_err() {
-        return Err(format!(
-            "--crop {} 搭配配准（未给 --aligned 1）时，Python 的画布是「位移包围盒 + 中心裁剪」，本进程若只裁输入窗，输出区域与 Python 不同；请改用 --canvas-from <参考成品.xisf> 指定画布，或加 --aligned 1 走已对齐路径（该路径的裁剪与 Python 逐位一致）",
-            a.crop
-        ));
-    }
+    // A registered crop no longer needs a special case here: `crop_on_output`
+    // above decides *where* the window is taken, and the drz branch applies it to
+    // the output plan as a pure grid-origin translation (see `Plan::crop_window`).
     let mut sims: Vec<Sim> = if let Some(sh) = share {
         sh.sims.clone()
     } else {
@@ -2036,6 +2077,14 @@ fn run_pipeline(
 
     let mut cov_acc: Vec<f32> = Vec::new();
     let mut out_plan: Option<Plan> = None;
+    // `--crop` on a drizzled product: the *uncropped* canvas the plan was solved
+    // on, plus the window's top-left corner.  The R field lives on the
+    // accumulation grid, whose rows are indexed by input pixels, so the maps at
+    // the end reach the window by zooming to `plan_full` first and cutting the
+    // same rectangle (`crop_window` only translates the grid origin, it does not
+    // touch the frames).
+    let mut plan_full: Option<Plan> = None;
+    let mut win: Option<(usize, usize)> = None;
     let (stk, mut neff, rej_rate) = if let Some((img, nf)) = gpu_out {
         (img, nf, f32::NAN)
     } else if drz {
@@ -2080,6 +2129,31 @@ fn run_pipeline(
                 println!("[画布] 输出网格 = 参考 {}x{}（原点对齐参考像素）", cw, ch);
             }
         }
+        // `--crop N` on this canvas: keep only the N x N window Python slices out
+        // of the saved array (`core/pws.py:5370`), but express it as a grid-origin
+        // translation instead of a post-hoc array cut, so the accumulation grid,
+        // the coverage map and the diagnostics shrink with it in one step.
+        // `plan_full`/`win` remember the full canvas and the window so the R field
+        // (which stays on the frame grid) can be resampled and then cut identically.
+        let plan = if crop_win && share.is_none() {
+            let (cp, (wy, wx)) = plan.crop_window(center, a.crop)?;
+            println!(
+                "[裁剪] 输出画布 {}x{} → 切片 y {}..{}  x {}..{}（{}x{}）",
+                plan.w,
+                plan.h,
+                wy,
+                wy + cp.h,
+                wx,
+                wx + cp.w,
+                cp.w,
+                cp.h
+            );
+            plan_full = Some(plan);
+            win = Some((wy, wx));
+            cp
+        } else {
+            plan
+        };
         // The accumulation grid (see `grid_g` above): one input pixel per cell.
         // Everything that has to agree pixel for pixel — the rejection anchor, the
         // per-pixel scale, the R field and the coverage map — lives on this grid,
@@ -2497,15 +2571,35 @@ fn run_pipeline(
     // to the canvas at the very end (`core/pws.py:4289`,
     // `np.clip(ndimage.zoom(R,2,order=1)[:H,:W],0,1)`).  The accumulation grid
     // *is* that half grid, so resample here before the maps, the crop search and
-    // the shared-run export read it.
-    let rfield = if grid_g > 1 && (rfield.w != image.w || rfield.h != image.h) {
-        dwt_rs::drizzle::upsample_linear(
-            &rfield,
-            &Plan { s: 1.0, ox: 0.0, oy: 0.0, w: image.w, h: image.h },
-            grid_g,
-        )
-    } else {
-        rfield
+    // the shared-run export read it.  With `--crop` the R field still covers the
+    // whole grid (its rows are indexed by input pixels — cropping it first would
+    // shift every weight), so it goes through the *uncropped* canvas and is then
+    // cut with the same rectangle the stack took, as Python slices `R` together
+    // with `Stk` at save time (`core/pws.py:5377`).
+    let rfield = match (plan_full, win) {
+        (Some(pf0), Some((wy, wx))) => {
+            let full = if rfield.w == pf0.w && rfield.h == pf0.h {
+                rfield
+            } else if grid_g > 1 {
+                dwt_rs::drizzle::upsample_linear(&rfield, &pf0, grid_g)
+            } else {
+                rfield
+            };
+            if full.w >= wx + image.w && full.h >= wy + image.h {
+                full.crop(wx, wy, image.w, image.h)
+            } else {
+                full
+            }
+        }
+        _ => if grid_g > 1 && (rfield.w != image.w || rfield.h != image.h) {
+            dwt_rs::drizzle::upsample_linear(
+                &rfield,
+                &Plan { s: 1.0, ox: 0.0, oy: 0.0, w: image.w, h: image.h },
+                grid_g,
+            )
+        } else {
+            rfield
+        },
     };
     // Python writes the quarter-resolution maps and the weights table on every
     // run; the full-resolution copies are the `DWT_SAVE_AUX=1` extra.
