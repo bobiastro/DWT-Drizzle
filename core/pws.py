@@ -3457,6 +3457,35 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
     if _c_star and len(stars) > _c_star:
         _step = max(1, len(stars) // _c_star)
         _cs = stars[::_step][:_c_star]
+    # ---- 卫星拖尾：整帧剔除（放在 fmed/C 统计之前，让权重表也不含它）----
+    # 为什么不是降权：strip_weights 逐像素归一 mean_i(W)=1，某个画布像素只有这一帧
+    # 覆盖时（素材抖动到 ±2900 px，这种像素很多），分母只剩它自己，权重被整体约掉，
+    # 拖尾照样原样印进成品。实测把 idx25 的 C 从 1.37993 压到 0.896952（份额 0.656%
+    # → 0.0096%，68×），沿线幅度只从 +2.97e-5 降到 +2.49e-5（−16%）；而整帧不参与
+    # 叠加时同一条线降到 +1.03e-6。所以这里按"帧"剔除，不做标量惩罚。
+    _tdrop = np.zeros(n, bool)
+    _trail_info = {}
+    _td = bool(getattr(p, 'trail_drop', True))
+    _tp = float(getattr(p, 'trail_penalty', 1.0) or 0.0)
+    if _td:
+        t1c = time.perf_counter()
+        for i in range(n):
+            _check_cancel()
+            try:
+                _px, _ln = trail_pixels(fs.frame(i))
+            except Exception:
+                _px, _ln = 0, 0.0
+            if _ln > 0:
+                _tdrop[i] = True
+                _trail_info[i] = (_px, _ln)
+            _emit('查拖尾', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
+        if _tdrop.any():
+            log('[C] 卫星拖尾：剔除帧 '
+                + ' '.join(f'#{int(i)}（长 {_trail_info[i][1]:.0f}px）'
+                           for i in sorted(_trail_info))
+                + f'  参与 {int(n - _tdrop.sum())}/{n}  {time.perf_counter() - t1c:.1f}s')
+        else:
+            log(f'[C] 未检出卫星拖尾（{n} 帧全干净）  {time.perf_counter() - t1c:.1f}s')
     ini, ini_args = fs.reader
     nw = 0 if (not fs.parallelable or _no_parallel()) \
         else min(plan_workers(32 * 2 ** 20, '测星点', cap=CAP_FWHM), n)
@@ -3543,6 +3572,8 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             fwhms[i] = measure_fwhm_frame(fs.mm, i, fs.off, _cs,
                                          search=int(getattr(p, 'fwhm_search', 0) or 0))
             _emit('测星点', (i + 1) / max(n, 1), f'{i + 1}/{n} 帧')
+    if _tdrop.any():
+        fwhms[_tdrop] = np.nan          # 拖尾帧不进 fmed/C，也不进权重表
     ok = np.isfinite(fwhms)
     if not bool(ok.any()):
         log('[C] 所有帧的 FWHM 都没量出来（星点太少或拟合失败）→ 清晰度权重按 1.0 处理')
@@ -3554,20 +3585,17 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         f' {np.nanmin(fwhms):.2f}~{np.nanmax(fwhms):.2f}px  中位 {fmed:.2f}px  '
         f'{time.perf_counter() - t1:.1f}s')
     log(f'[C] 清晰度权重（FWHM_中位/FWHM_i）{C.min():.3f}~{C.max():.3f}')
-    order = np.argsort(fwhms)
+    order = np.argsort(np.where(np.isfinite(fwhms), fwhms, np.inf))
     log('[C] 最锐 3 帧 ' + '  '.join(
         f'#{int(i)}({fwhms[int(i)]:.2f}px)' for i in order[:3]))
     log('[C] 最糊 3 帧 ' + '  '.join(
         f'#{int(i)}({fwhms[int(i)]:.2f}px)' for i in order[-3:]))
 
-    # ---- 卫星拖尾惩罚：整帧含长直线结构时压低清晰度权重 ----
-    # C 经 C^A（A=20）放大后单帧能占到千分之几的权重，于是帧里那条 2–3 px 宽的
-    # 卫星拖尾会被当成"细节"叠进成品，在沿线上留一条假线（实测 2026-10-08 那帧
-    # C=1.38 时沿线 +2.6e-5）。逐帧 FWHM 中位对这种帧并不敏感——拖尾很少正好穿过
-    # 星点小窗（实测最近小窗中心距拖尾 49 px），所以问题不在 FWHM 而在权重：
-    # 有直线结构的帧数据本身被污染，必须单独降权，而不是让它的"锐"去换权重。
-    _tp = float(getattr(p, 'trail_penalty', 0.65) or 0.0)
-    if 0.0 < _tp < 0.999:
+    # ---- 卫星拖尾惩罚（退路，默认关）：trail_drop=False 且 trail_penalty<1 时才走 ----
+    # 保留是因为有些素材里拖尾只擦过边缘、整帧剔除代价太大；但要知道它的局限：
+    # 某像素只有这一帧覆盖时，逐像素归一 mean_i(W)=1 会把标量权重整体约掉，
+    # 沿线照样留痕（实测只能压掉 16%）。能剔除就剔除。
+    if (not _td) and 0.0 < _tp < 0.999:
         t1c = time.perf_counter()
         _hit = []
         for i in range(n):
@@ -3584,7 +3612,7 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             for _i, _px, _ln in _hit:
                 _mul[_i] = _tp
             C = C * _mul
-            log(f'[C] 卫星拖尾惩罚 {len(_hit)} 帧 ×{_tp:.2f}（检出长直线结构）  '
+            log(f'[C] 卫星拖尾惩罚 {len(_hit)} 帧 ×{_tp:.2f}（检出长直线结构，未剔除）  '
                 f'{time.perf_counter() - t1c:.1f}s')
             for _i, _px, _ln in sorted(_hit, key=lambda r: -r[2])[:3]:
                 log(f'[C] 拖尾帧 #{int(_i)} 长 {_ln:.0f}px / {_px} 像素  '
@@ -3907,6 +3935,28 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
                         log('[缓存] 保存失败（不影响本次叠加，下次仍会重测）')
                 except Exception as _e:
                     log(f'[缓存] 写入失败（不影响本次）：{_e}')
+        # ---- 卫星拖尾帧整帧剔除：直接从配准结果里划掉（keep / dx / dy / n_keep 一起改）----
+        if _tdrop.any():
+            _kp = np.asarray(sh['keep'], bool).copy()
+            _ncut = 0
+            for _i in np.nonzero(_tdrop)[0]:
+                if _i < len(_kp) and bool(_kp[_i]):
+                    _kp[_i] = False
+                    _ncut += 1
+                try:
+                    sh['dx'][_i] = np.nan
+                    sh['dy'][_i] = np.nan
+                except Exception:
+                    pass
+                if 'theta' in sh:
+                    try:
+                        sh['theta'][_i] = np.nan
+                    except Exception:
+                        pass
+            sh['keep'] = _kp
+            sh['n_keep'] = int(np.count_nonzero(_kp))
+            log(f'[筛选] 卫星拖尾帧不参与叠加：{_ncut}/{n} 帧  '
+                f'（#{" #".join(str(int(i)) for i in np.nonzero(_tdrop)[0])}）')
         _drop = [int(i) for i in np.nonzero(~np.asarray(sh['keep'], bool))[0]]
         if _drop:
             log(f'  [叠加] 未参与的帧索引：{_drop[:40]}'
@@ -3943,9 +3993,11 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
         _excluded_rows = []
         for _i in range(n):
             _why = []
+            if _tdrop[_i]:
+                _why.append('卫星拖尾（长 %.0fpx）' % _trail_info.get(_i, (0, 0.0))[1])
             if not _reg_ok[_i]:
                 _why.append('配准失败（星点对不上或全星验证未过）')
-            if _fm > 0 and not (fwhms[_i] <= _fm):
+            if _fm > 0 and np.isfinite(fwhms[_i]) and not (fwhms[_i] <= _fm):
                 _why.append('单帧 FWHM %.2fpx > 上限 %.2fpx' % (fwhms[_i], _fm))
             if _why:
                 _excluded_rows.append({'idx': int(_i),
@@ -5381,8 +5433,12 @@ def _run_group(frames: List[Path], sources: List[Path], p: PwsParams,
             if cov_map is not None:
                 np.save(out_dir / f'{stem}_ncov.npy', np.asarray(cov_map, np.float32))
             np.save(out_dir / f'{stem}_R.npy', R)
+        _wt = np.arange(n)
+        if _tdrop.any():
+            _wt = _wt[~_tdrop]
+            log(f'[输出] 权重表不含卫星拖尾帧（{len(_wt)}/{n} 行）')
         np.savetxt(out_dir / f'{stem}_weights.txt',
-                   np.column_stack([np.arange(n), fwhms, C, sig_out, S]),
+                   np.column_stack([_wt, fwhms[_wt], C[_wt], sig_out[_wt], S[_wt]]),
                    header='idx fwhm_px C_sharp sigma S_snr', comments='# ', fmt='%.6g')
         log(f'[输出] 逐帧权重表 {stem}_weights.txt / R 场与 N_eff 的 1/4 分辨率版 '
             f'{stem}_R_q4.npy、{stem}_neff_q4.npy'
